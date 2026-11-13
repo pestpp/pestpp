@@ -1438,7 +1438,7 @@ def tenpar_subset_how_test():
     pst.pestpp_options["ies_obs_en"] = "pest_restart.obs+noise.csv"
     pst.control_data.noptmax = 1
     means = []
-    for how in ["first","last","random","phi_based"]:
+    for how in ["first","last","random","phi_based","strat_random"]:
         pst.pestpp_options["ies_subset_how"] = how
         pst_file = "pest_{0}.pst".format(how)
         pst.write(os.path.join(test_d,pst_file))
@@ -1452,7 +1452,7 @@ def tenpar_subset_how_test():
 
     means = []
     pst.pestpp_options["ies_subset_size"] = 2
-    for how in ["first", "last", "random", "phi_based"]:
+    for how in ["first", "last", "random", "phi_based", "strat_random"]:
         pst.pestpp_options["ies_subset_how"] = how
         pst_file = "pest_{0}.pst".format(how)
         pst.write(os.path.join(test_d, pst_file))
@@ -1466,7 +1466,7 @@ def tenpar_subset_how_test():
 
     means = []
     pst.pestpp_options["ies_subset_size"] = num_reals
-    for how in ["first", "last", "random", "phi_based"]:
+    for how in ["first", "last", "random", "phi_based", "strat_random"]:
         pst.pestpp_options["ies_subset_how"] = how
         pst_file = "pest_{0}.pst".format(how)
         pst.write(os.path.join(test_d, pst_file))
