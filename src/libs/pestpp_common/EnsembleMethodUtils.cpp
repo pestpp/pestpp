@@ -5490,10 +5490,10 @@ void EnsembleMethod::sanity_checks()
     //}
 
     string how = pest_scenario.get_pestpp_options().get_ies_subset_how();
-    if ((how != "FIRST") && (how != "LAST") && (how != "RANDOM") && (how != "PHI_BASED"))
+    if ((how != "FIRST") && (how != "LAST") && (how != "RANDOM") && (how != "PHI_BASED") && (how != "STRAT_RANDOM"))
     {
         ss.str("");
-        ss << "'subset_how' is '" << how << "' but should be 'FIRST','LAST','RANDOM','PHI_BASED'";
+        ss << "'subset_how' is '" << how << "' but should be 'FIRST','LAST','RANDOM','PHI_BASED','STRAT_RANDOM'";
         errors.push_back(ss.str());
     }
 
@@ -11533,12 +11533,13 @@ vector<int> EnsembleMethod::get_subset_idxs(int size, int nreal_subset)
 			throw_em_error("max iterations exceeded when trying to find random subset idxs");
 
 	}
-	else if (how == "PHI_BASED")
+	else if ((how == "PHI_BASED") || (how == "STRAT_RANDOM"))
 	{
 		//stratified selection over the composite phi ranking: rank all realizations by phi,
-		//split the ranking into nreal_subset strata of (nearly) equal count, and take the
-		//middle realization of each stratum. If the base realization is present (added
-		//above), it stands for its own stratum, so the stratum that contains it is skipped.
+		//split the ranking into nreal_subset strata of (nearly) equal count, and take one
+		//realization from each stratum: the middle one for PHI_BASED, a random one for
+		//STRAT_RANDOM. If the base realization is present (added above), it stands for its
+		//own stratum, so the stratum that contains it is skipped.
 		//The phi map is keyed by obs ensemble realization name, so phi is looked up by name
 		//for each row: iterating the map gives name order, not row order. pe and oe rows are
 		//aligned by position, so the row index is valid for both.
@@ -11569,7 +11570,14 @@ vector<int> EnsembleMethod::get_subset_idxs(int size, int nreal_subset)
 			}
 			if (has_base)
 				continue;
-			pos = lo + (hi - lo - 1) / 2;
+			//PHI_BASED: the middle of the stratum. STRAT_RANDOM: one draw from the subset
+			//stream per stratum, low phi to high phi. uniform_int_draws uses integer
+			//arithmetic only (no std:: distribution), so the same random_seed gives the
+			//same subset on every platform.
+			if (how == "PHI_BASED")
+				pos = lo + (hi - lo - 1) / 2;
+			else
+				pos = lo + uniform_int_draws(1, 0, hi - lo - 1, subset_rand_gen)[0];
 			subset_idxs.push_back(phis[pos].second);
 		}
 	}
