@@ -11535,59 +11535,42 @@ vector<int> EnsembleMethod::get_subset_idxs(int size, int nreal_subset)
 	}
 	else if (how == "PHI_BASED")
 	{
-		//sidx needs to be index of realization, not realization number
-		vector<pair<double, int>> phis;
-		//vector<int> sidx;
-		int step;
-		int idx;
+		//stratified selection over the composite phi ranking: rank all realizations by phi,
+		//split the ranking into nreal_subset strata of (nearly) equal count, and take the
+		//middle realization of each stratum. If the base realization is present (added
+		//above), it stands for its own stratum, so the stratum that contains it is skipped.
+		//The phi map is keyed by obs ensemble realization name, so phi is looked up by name
+		//for each row: iterating the map gives name order, not row order. pe and oe rows are
+		//aligned by position, so the row index is valid for both.
 		L2PhiHandler::phiType pt = L2PhiHandler::phiType::COMPOSITE;
 		map<string, double>* phi_map = ph.get_phi_map_ptr(pt);
-		map<string, double>::iterator pi = phi_map->begin(), end = phi_map->end();
-
-		int i = 0;
-		for (; pi != end; ++pi)
-		{
-			phis.push_back(make_pair(pi->second, i)); //phival,idx?
-			++i;
-		}
+		vector<string> oe_names = oe.get_real_names();
+		vector<pair<double, int>> phis; //(phi, row index)
+		for (int i = 0; i < size; i++)
+			phis.push_back(make_pair(phi_map->at(oe_names.at(i)), i));
+		//sort by phi; equal phi values keep row order
 		sort(phis.begin(), phis.end());
 
-		//include idx for lowest and highest phi reals
-		if (subset_idxs.size() < nreal_subset)
+		int base_idx = -1;
+		if (bidx != pe_names.end())
+			base_idx = bidx - pe_names.begin();
+		int lo, hi, pos;
+		bool has_base;
+		for (int s = 0; s < nreal_subset; s++)
 		{
-			for (const auto& phi : phis)
+			//stratum s holds the ranking positions lo to hi-1
+			lo = (s * size) / nreal_subset;
+			hi = ((s + 1) * size) / nreal_subset;
+			has_base = false;
+			for (int j = lo; j < hi; j++)
 			{
-				if (find(subset_idxs.begin(), subset_idxs.end(), phi.second) == subset_idxs.end())
-				{
-					subset_idxs.push_back(phi.second);
-					break;
-				}
+				if (phis[j].second == base_idx)
+					has_base = true;
 			}
-		}
-		if (subset_idxs.size() < nreal_subset)
-		{
-			for (int i = phis.size() - 1; i >= 0; i--)
-			{
-				if (find(subset_idxs.begin(), subset_idxs.end(), phis[i].second) == subset_idxs.end())
-				{
-					subset_idxs.push_back(phis[i].second);
-					break;
-				}
-			}
-		}
-
-
-		step = (phis.size() - 1) / nreal_subset;
-
-		for (i = 1; i < nreal_subset; ++i)
-		{
-			//add higher phis first
-			idx = phis.size() - (i * step);
-			if ((subset_idxs.size() < nreal_subset) && (find(subset_idxs.begin(), subset_idxs.end(), phis[idx].second) == subset_idxs.end()))
-			{
-				subset_idxs.push_back(phis[idx].second);
-
-			}
+			if (has_base)
+				continue;
+			pos = lo + (hi - lo - 1) / 2;
+			subset_idxs.push_back(phis[pos].second);
 		}
 	}
 	else
