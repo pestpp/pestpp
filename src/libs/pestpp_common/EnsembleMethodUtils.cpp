@@ -5676,6 +5676,37 @@ void EnsembleMethod::sanity_checks()
     //     errors.push_back("multimodal alpha < 0.001");
     // }
 
+    {
+        bool any_sn = false;
+        for (auto f : ppo->get_ies_reinflate_structnoise_frac())
+        {
+            if (f < 0.0)
+                errors.push_back("ies_reinflate_structnoise_frac entry " + to_string(f) + " must be >= 0.0");
+            else if (f > 1.0)
+                warnings.push_back("ies_reinflate_structnoise_frac entry " + to_string(f) + " > 1.0, more structural noise than the residuals carry...user beware!");
+            if (f > 0.0)
+                any_sn = true;
+        }
+        bool reinflating = false;
+        for (auto n : ppo->get_ies_n_iter_reinflate())
+            if (n != 0) reinflating = true;
+        if ((any_sn) && (!reinflating))
+            warnings.push_back("ies_reinflate_structnoise_frac > 0 but reinflation is off (ies_n_iter_reinflate = 0), no structural noise will be added");
+        if ((ppo->get_ies_structnoise_deweight()) && (!any_sn))
+            warnings.push_back("ies_structnoise_deweight is true but every ies_reinflate_structnoise_frac entry is 0.0, weights will not be changed");
+        if ((any_sn) && (ppo->get_ies_phi_fractions_file().size() > 0))
+            warnings.push_back("ies_phi_factor_file with ies_reinflate_structnoise_frac: the phi factors are applied to the prior weights only, "
+                               "never again at a reinflation (that would count the structure twice). the structural de-weighting starts from the phi-factor weights");
+        if ((any_sn) && (ppo->get_ies_structnoise_deweight()))
+        {
+            bool esmda = ppo->get_ies_use_mda();
+            for (auto& sv : ppo->get_ies_reinflate_solver())
+                if (sv == "esmda") esmda = true;
+            if (esmda)
+                warnings.push_back("ies_structnoise_deweight has no effect on the esmda solve, which doesnt use the weights - only the structural noise draws reach it");
+        }
+    }
+
     for (auto& fac : ppo->get_ies_reinflate_factor())
     {
         if (fac <= 0.0)
@@ -7955,29 +7986,39 @@ void EnsembleMethod::adjust_weights(bool save) {
     }
 
     if (save) {
-        ss.str("");
-        ss << file_manager.get_base_filename() << "." << iter;
-        if (pest_scenario.get_pestpp_options().get_save_dense()) {
-            ss << ".adjusted.weights" << dense_file_ext;
-            weights.to_dense(ss.str());
-        } else if (pest_scenario.get_pestpp_options().get_save_binary()) {
-            ss << ".adjusted.weights.jcb";
-            weights.to_binary(ss.str());
-        } else {
-            ss << ".adjusted.weights.csv";
-            weights.to_csv(ss.str());
-        }
-        message(1, "saved adjusted weight ensemble to ", ss.str());
-
-        map<string, double> base_weights = weights.get_real_map(BASE_REAL_NAME, true);
-        ss.str("");
-        ss << file_manager.get_base_filename()  << "." << iter << ".adjusted.obs_data.csv";
-        ofstream f_obs(ss.str());
-        if (f_obs.bad())
-            throw_em_error("error opening: " + ss.str());
-        output_file_writer.scenario_obs_csv(f_obs, base_weights);
-        f_obs.close();
+        save_adjusted_weights();
     }
+}
+
+/**
+ * @brief Save the current weight ensemble and obs data as case.N.adjusted.weights / .obs_data.csv.
+ *
+ * used by the phi factor adjustment and by the structural noise de-weighting
+ */
+void EnsembleMethod::save_adjusted_weights()
+{
+    stringstream ss;
+    ss << file_manager.get_base_filename() << "." << iter;
+    if (pest_scenario.get_pestpp_options().get_save_dense()) {
+        ss << ".adjusted.weights" << dense_file_ext;
+        weights.to_dense(ss.str());
+    } else if (pest_scenario.get_pestpp_options().get_save_binary()) {
+        ss << ".adjusted.weights.jcb";
+        weights.to_binary(ss.str());
+    } else {
+        ss << ".adjusted.weights.csv";
+        weights.to_csv(ss.str());
+    }
+    message(1, "saved adjusted weight ensemble to ", ss.str());
+
+    map<string, double> base_weights = weights.get_real_map(BASE_REAL_NAME, true);
+    ss.str("");
+    ss << file_manager.get_base_filename()  << "." << iter << ".adjusted.obs_data.csv";
+    ofstream f_obs(ss.str());
+    if (f_obs.bad())
+        throw_em_error("error opening: " + ss.str());
+    output_file_writer.scenario_obs_csv(f_obs, base_weights);
+    f_obs.close();
 }
 
 
@@ -9723,6 +9764,11 @@ ReinflationSchedule::ReinflationSchedule(Pest& pest_scenario)
 	reinflate_mm_alpha = pest_scenario.get_pestpp_options().get_ies_reinflate_multimodal_alpha();
 	if (reinflate_mm_alpha.size() > 0)
 		current_mm_alpha = reinflate_mm_alpha[0];
+	// structural noise fraction is walked like factor: entry 0 is used at the first
+	// reinflation, entry 1 at the second, last entry held
+	reinflate_sn_frac = pest_scenario.get_pestpp_options().get_ies_reinflate_structnoise_frac();
+	if (reinflate_sn_frac.size() > 0)
+		current_sn_frac = reinflate_sn_frac[0];
 }
 
 /**
@@ -9745,6 +9791,8 @@ void ReinflationSchedule::advance()
 		current_solver = reinflate_solver[idx];
 	if ((int)reinflate_mm_alpha.size() > idx)
 		current_mm_alpha = reinflate_mm_alpha[idx];
+	if ((int)reinflate_sn_frac.size() > idx)
+		current_sn_frac = reinflate_sn_frac[idx];
 }
 
 /**
@@ -9786,7 +9834,7 @@ void EnsembleMethod::end_iteration(int cycle)
 }
 
 void EnsembleMethod::reinflate_par_ensemble(double reinflate_factor,int reinflate_num_reals,
-                                            int center_on_min_phi){
+                                            int center_on_min_phi, double structnoise_frac){
 
     // negative == defer to ies_n_iter_reinflate, which is what the shipped loop passes
     bool use_min_phi_real = (center_on_min_phi < 0) ? get_reinflate_to_minphi_real()
@@ -9918,12 +9966,25 @@ void EnsembleMethod::reinflate_par_ensemble(double reinflate_factor,int reinflat
     ss << "iteration:" << iter;
     vector<int> temp;
     ofstream& frec = file_manager.rec_ofstream();
+    // with structural noise in play, report the ensemble as it stands - the noise and weights
+    // it was fitted with - before they are reset, so it can be set against the reinflation
+    // phi report after
+    if ((structnoise_frac > 0.0) || (sn_captured))
+    {
+        ph.update(oe, pe, weights);
+        message(0, "phi report before the reinflation noise and weight reset:");
+        ph.report(true);
+    }
+    // the residuals come from oe, so this has to happen before oe is reset below
+    apply_structural_noise(structnoise_frac);
     oe.reserve(oebase_real_names,oe.get_var_names());
     weights = weights_base;
     for (auto& oname : oe.get_var_names())
     {
         pest_scenario.get_observation_info_ptr()->get_observation_rec_ptr_4_mod(oname)->weight = org_obs_info.get_weight(oname);
     }
+    // after the restore just above, so it always starts from the user's weights
+    apply_structural_deweight(structnoise_frac);
     run_ensemble_util(performance_log,frec,new_pe,oe,run_mgr_ptr,false,temp,NetPackage::NULL_DA_CYCLE, ss.str());
     pe = new_pe;
     new_pe = ParameterEnsemble();
@@ -9948,6 +10009,240 @@ void EnsembleMethod::reinflate_par_ensemble(double reinflate_factor,int reinflat
     message(1,"iter = ies_n_iter_reinflate, resetting lambda to ",last_best_lam);
     consec_bad_lambda_cycles = 0;
 
+}
+
+/**
+ * @brief Add structural noise from the irreducible residuals to the noise realizations.
+ *
+ * at the first call with frac > 0, the actual residuals of the current ensemble are captured
+ * (observed minus simulated, active nz obs, not centred - the shared part is the bias that
+ * should become variance), along with a copy of the user's noise and one column of standard
+ * normals per noise realization.  all of that is frozen for the rest of the run.
+ *
+ * every call then rebuilds oe_base from the user's noise:
+ *   S       = coef^T R / sqrt(Ne)              (one row per realization, plain combinations)
+ *   oe_base = user noise + sqrt(frac) * S       (base realization skipped)
+ * and clamps to the obs bounds.  the draws' covariance is R^T R / Ne.  since the coefficients
+ * are zero mean the targets spread symmetrically around the observed values, and since each
+ * obs only combines its own residuals the units drop out - no sigma or weight scaling.
+ *
+ * frac <= 0 before anything was captured does nothing at all (no random numbers are used),
+ * so a run with every entry 0 is unchanged.  frac <= 0 after the capture puts the user's
+ * noise back for that cycle.
+ */
+void EnsembleMethod::apply_structural_noise(double frac)
+{
+    if ((frac <= 0.0) && (!sn_captured))
+        return;
+    ofstream& frec = file_manager.rec_ofstream();
+    vector<string> rnames = oe_base.get_real_names();
+    vector<string> vnames = oe_base.get_var_names();
+    Eigen::MatrixXd* reals = oe_base.get_eigen_ptr_4_mod();
+    int ne;
+    if (!sn_captured)
+    {
+        message(0, "capturing irreducible residuals for structural noise");
+        performance_log->log_event("capturing irreducible residuals for structural noise");
+        // get_actual_obs_resid() is simulated minus observed over oe_base's obs (the active
+        // nz obs), with satisfied inequality obs at zero.  flip it to observed minus simulated
+        sn_resid = -1.0 * ph.get_actual_obs_resid(oe);
+        sn_obs_names = vnames;
+        ne = sn_resid.rows();
+        if (ne < 2)
+            throw_em_error("structural noise: need at least 2 realizations to capture residuals");
+        sn_s2 = sn_resid.array().square().colwise().sum().transpose() / static_cast<double>(ne);
+        sn_meas.clear();
+        for (int i = 0; i < rnames.size(); i++)
+            sn_meas[rnames[i]] = reals->row(i).transpose();
+        sn_meas_names = vnames;
+        sn_coef.clear();
+        for (auto& rname : rnames)
+        {
+            if (rname == BASE_REAL_NAME)
+                continue;
+            Eigen::VectorXd c(ne);
+            for (int j = 0; j < ne; j++)
+                c[j] = draw_standard_normal(rand_gen);
+            sn_coef[rname] = c;
+        }
+        sn_captured = true;
+        frec << "...structural noise: captured residuals of " << ne << " realizations and "
+             << sn_obs_names.size() << " observations" << endl;
+        frec << "...structural noise: mean irreducible residual variance over observations: "
+             << sn_s2.mean() << ", max: " << sn_s2.maxCoeff() << endl;
+        frec << "...structural noise: note the measured phi will jump from here on, since the" << endl;
+        frec << "   noisy targets now carry the structural draws as well as the measurement noise" << endl;
+    }
+    ne = sn_resid.rows();
+    double sfac = sqrt(max(frac, 0.0) / static_cast<double>(ne));
+    message(1, "structural noise fraction for this reinflation:", frac);
+    frec << "...structural noise: fraction " << frac << " applied to " << rnames.size()
+         << " noise realizations (residuals " << ne << " x " << sn_obs_names.size() << ")" << endl;
+
+    // line up the columns by name, since oe_base can lose obs after the capture
+    map<string, int> rcol, mcol;
+    for (int k = 0; k < sn_obs_names.size(); k++)
+        rcol[sn_obs_names[k]] = k;
+    for (int k = 0; k < sn_meas_names.size(); k++)
+        mcol[sn_meas_names[k]] = k;
+    vector<int> meas_idx(vnames.size(), -1), r_idx(vnames.size(), -1);
+    for (int j = 0; j < vnames.size(); j++)
+    {
+        if (auto it = mcol.find(vnames[j]); it != mcol.end())
+            meas_idx[j] = it->second;
+        if (auto it = rcol.find(vnames[j]); it != rcol.end())
+            r_idx[j] = it->second;
+    }
+
+    int nnew = 0;
+    for (int i = 0; i < rnames.size(); i++)
+    {
+        const string& rname = rnames[i];
+        // start from the user's noise every time, so nothing piles up
+        auto mit = sn_meas.find(rname);
+        if (mit == sn_meas.end())
+            mit = sn_meas.emplace(rname, reals->row(i).transpose()).first;
+        for (int j = 0; j < vnames.size(); j++)
+            if (meas_idx[j] >= 0)
+                (*reals)(i, j) = mit->second[meas_idx[j]];
+        if ((rname == BASE_REAL_NAME) || (frac <= 0.0))
+            continue;
+        // realizations that turn up after the capture get their own new coefficients
+        auto cit = sn_coef.find(rname);
+        if (cit == sn_coef.end())
+        {
+            Eigen::VectorXd c(ne);
+            for (int j = 0; j < ne; j++)
+                c[j] = draw_standard_normal(rand_gen);
+            cit = sn_coef.emplace(rname, c).first;
+            nnew++;
+        }
+        Eigen::RowVectorXd srow = sfac * (cit->second.transpose() * sn_resid);
+        for (int j = 0; j < vnames.size(); j++)
+            if (r_idx[j] >= 0)
+                (*reals)(i, j) += srow[r_idx[j]];
+    }
+    if (nnew > 0)
+        frec << "...structural noise: drew coefficients for " << nnew << " new realizations" << endl;
+    // rebuilt from scratch above, so the clamp never stacks
+    int nclamp = oe_base.enforce_obs_bounds(frec, false, sn_obs_names);
+    if (nclamp > 0)
+        message(1, "structural noise: values clamped to obs bounds:", nclamp);
+
+    // save the rebuilt noise realizations so they can be checked against case.obs+noise
+    stringstream ss;
+    ss << file_manager.get_base_filename() << "." << iter;
+    if (pest_scenario.get_pestpp_options().get_save_dense())
+    {
+        ss << ".obs+noise" << dense_file_ext;
+        oe_base.to_dense(ss.str());
+    }
+    else if (pest_scenario.get_pestpp_options().get_save_binary())
+    {
+        ss << ".obs+noise.jcb";
+        oe_base.to_binary(ss.str());
+    }
+    else
+    {
+        ss << ".obs+noise.csv";
+        oe_base.to_csv(ss.str());
+    }
+    message(1, "saved obs+noise ensemble with structural noise to ", ss.str());
+}
+
+/**
+ * @brief Lower each obs weight by its irreducible residual variance (ies_structnoise_deweight).
+ *
+ * called right after reinflation has put the weight ensemble back to weights_base and the
+ * control file weights back to org_obs_info, so it always starts from the user's weights and
+ * nothing accumulates.  row by row, each realization from its own original weight:
+ *   w' = 1 / sqrt( w^-2 + frac * s2 )
+ * where s2 is the mean over realizations of the captured R^2 for that obs.  w' <= w always,
+ * w' == w where s2 or frac is 0, and zero weights stay zero.  nothing goes to the solver - it
+ * just sees an ordinary weight ensemble.  this is the diagonal version: each obs is discounted
+ * by its own variance, not along the shapes of the residuals across obs.
+ */
+void EnsembleMethod::apply_structural_deweight(double frac)
+{
+    if (!pest_scenario.get_pestpp_options().get_ies_structnoise_deweight())
+        return;
+    if ((!sn_captured) || (frac <= 0.0))
+    {
+        if (sn_captured)
+            message(1, "structural noise fraction is 0, using the user's weights for this cycle");
+        return;
+    }
+    ofstream& frec = file_manager.rec_ofstream();
+    message(1, "lowering weights by the irreducible residual variance, fraction:", frac);
+    map<string, double> s2_map;
+    for (int k = 0; k < sn_obs_names.size(); k++)
+        s2_map[sn_obs_names[k]] = sn_s2[k];
+
+    // the weight ensemble, row by row from its own originals
+    vector<string> wnames = weights.get_var_names();
+    Eigen::MatrixXd* w = weights.get_eigen_ptr_4_mod();
+    // per group: sum, count, min and max of w'/w over the weight ensemble, and how many obs
+    // had their control file weight cut by more than half
+    map<string, double> g_sum, g_min, g_max;
+    map<string, int> g_count, g_nobs, g_halved;
+    double wv, wn, ratio;
+    for (int j = 0; j < wnames.size(); j++)
+    {
+        auto it = s2_map.find(wnames[j]);
+        if (it == s2_map.end())
+            continue;
+        string g = org_obs_info.get_group(wnames[j]);
+        if (g_count.find(g) == g_count.end())
+        {
+            g_sum[g] = 0.0; g_count[g] = 0; g_nobs[g] = 0; g_halved[g] = 0;
+            g_min[g] = numeric_limits<double>::max();
+            g_max[g] = numeric_limits<double>::lowest();
+        }
+        g_nobs[g]++;
+        for (int i = 0; i < w->rows(); i++)
+        {
+            wv = (*w)(i, j);
+            if (wv <= 0.0)
+                continue;
+            // s2 = 0 leaves the weight exactly as it was (1/sqrt(w^-2) is not bit-exact)
+            wn = (it->second > 0.0) ? 1.0 / sqrt((1.0 / (wv * wv)) + (frac * it->second)) : wv;
+            (*w)(i, j) = wn;
+            ratio = wn / wv;
+            g_sum[g] += ratio;
+            g_count[g]++;
+            g_min[g] = min(g_min[g], ratio);
+            g_max[g] = max(g_max[g], ratio);
+        }
+    }
+
+    // the control file weights, the same way, from org_obs_info
+    ObservationInfo* oi = pest_scenario.get_observation_info_ptr();
+    for (auto& s2 : s2_map)
+    {
+        wv = org_obs_info.get_weight(s2.first);
+        if ((wv <= 0.0) || (s2.second <= 0.0))
+            continue;
+        wn = 1.0 / sqrt((1.0 / (wv * wv)) + (frac * s2.second));
+        oi->get_observation_rec_ptr_4_mod(s2.first)->weight = wn;
+        if (wn / wv < 0.5)
+            g_halved[org_obs_info.get_group(s2.first)]++;
+    }
+
+    frec << "...structural noise de-weighting: fraction " << frac << ", weight ratio w'/w by group" << endl;
+    frec << "      (mean/min/max over the weight ensemble, obs cut by more than half in the control file weights)" << endl;
+    frec << "      " << setw(20) << left << "group" << right << setw(8) << "nobs" << setw(12) << "mean"
+         << setw(12) << "min" << setw(12) << "max" << setw(10) << "halved" << endl;
+    for (auto& gc : g_count)
+    {
+        const string& g = gc.first;
+        frec << "      " << setw(20) << left << g << right << setw(8) << g_nobs[g];
+        if (gc.second > 0)
+            frec << setw(12) << g_sum[g] / gc.second << setw(12) << g_min[g] << setw(12) << g_max[g];
+        else
+            frec << setw(12) << "-" << setw(12) << "-" << setw(12) << "-";
+        frec << setw(10) << g_halved[g] << endl;
+    }
+    save_adjusted_weights();
 }
 
 void EnsembleMethod::remove_external_pe_filenames(vector<string>& pe_filenames)

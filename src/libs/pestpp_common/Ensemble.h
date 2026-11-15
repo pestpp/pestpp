@@ -345,6 +345,11 @@ public:
 
 	void draw(int num_reals, Covariance &cov, PerformanceLog *plog, int level, ofstream& frec);
 	void initialize_without_noise(int num_reals);
+	// clamp realizations to the 'lower_bound' / 'upper_bound' columns of the external obs data.
+	// names limits which columns are clamped (empty == all).  report lists every bounded obs
+	// and its bounds; a summary of what was clamped is always written when anything was.
+	// returns the number of values clamped.
+	int enforce_obs_bounds(ofstream& frec, bool report, const vector<string>& names=vector<string>());
 };
 
 

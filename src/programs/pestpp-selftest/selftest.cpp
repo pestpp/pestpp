@@ -88,6 +88,26 @@ struct IesWeightProbe : public IterEnsembleSmoother
     }
 };
 
+// the structural noise state an ies run holds, read straight out of the object
+struct StructNoiseProbe : public IterEnsembleSmoother
+{
+    using IterEnsembleSmoother::IterEnsembleSmoother;
+    ObservationEnsemble& noise() { return oe_base; }
+    ObservationEnsemble& sim() { return oe; }
+    bool captured() const { return sn_captured; }
+    const Eigen::MatrixXd& resid() const { return sn_resid; }
+    const vector<string>& resid_obs() const { return sn_obs_names; }
+    const map<string, Eigen::VectorXd>& coef() const { return sn_coef; }
+    const Eigen::VectorXd& s2() const { return sn_s2; }
+    ObservationEnsemble& wts() { return weights; }
+    ObservationEnsemble& wts_base() { return weights_base; }
+    ObservationInfo& org_info() { return org_obs_info; }
+    int cur_iter() const { return iter; }
+    // the ies loop bumps the iteration count before each reinflation; a test calling
+    // reinflate_par_ensemble() directly has to do the same or every save lands on one name
+    void bump_iter() { iter++; }
+};
+
 // a run manager that runs the "model" in the test itself, so a whole ies startup can be
 // driven without an executable, template or instruction file
 struct InProcessRunManager : public RunManagerAbstract
@@ -357,6 +377,654 @@ static void test_reinflate_multimodal_alpha_schedule()
         rs.advance();
         CHK(rs.get_multimodal_alpha() == 1.0, "the last entry is held once the list runs out");
         CHK(rs.get_n_iter() == 2, "the other lists still walk as before");
+    }
+}
+
+static void test_reinflate_structnoise_frac_schedule()
+{
+    cout << "[ies_reinflate_structnoise_frac: one fraction per reinflation, last one held]" << endl;
+    Pest p; p.set_defaults();
+    PestppOptions* o = p.get_pestpp_options_ptr();
+    CHK((o->get_ies_reinflate_structnoise_frac() == vector<double>{0.0}), "default is {0.0} (off)");
+    CHK(!o->get_ies_structnoise_deweight(), "deweight defaults to false");
+    CHK(!o->is_init_only("IES_REINFLATE_STRUCTNOISE_FRAC"), "the schedule is live, like the other reinflation lists");
+    {
+        ReinflationSchedule rs(p);
+        CHK(rs.get_structnoise_frac() == 0.0, "default: frac 0 at the first reinflation");
+        rs.advance();
+        CHK(rs.get_structnoise_frac() == 0.0, "default: still 0 after a reinflation");
+    }
+
+    // walked like ies_reinflate_factor: entry 0 is used at the first reinflation, entry 1 at
+    // the second, last entry held
+    o->set_option("IES_N_ITER_REINFLATE", "2");
+    o->set_option("IES_REINFLATE_STRUCTNOISE_FRAC", "0.1,1.0");
+    CHK((o->get_ies_reinflate_structnoise_frac() == vector<double>{0.1, 1.0}), "list parsed in order");
+    o->set_option("IES_STRUCTNOISE_DEWEIGHT", "true");
+    CHK(o->get_ies_structnoise_deweight(), "deweight set");
+    {
+        ReinflationSchedule rs(p);
+        CHK(rs.get_structnoise_frac() == 0.1, "first reinflation uses entry 0");
+        rs.advance();
+        CHK(rs.get_structnoise_frac() == 1.0, "second reinflation uses entry 1");
+        rs.advance();
+        CHK(rs.get_structnoise_frac() == 1.0, "the last entry is held once the list runs out");
+        CHK(rs.get_n_iter() == 2, "the other lists still walk as before");
+    }
+}
+
+static void test_structnoise_draws()
+{
+    cout << "[structural noise: capture, draws, rebuild and bound clamp at reinflation]" << endl;
+    // two pars, and obs the model cannot fit: o1 = p1 observed at 0, o2 = p1 observed at 2,
+    // so whatever p1 is, the pair carries an irreducible residual.  o3 = p2 at 0.5 is
+    // fittable.  o4 = p1 observed at 0.05 with a lower_bound of 0, so the structural draws
+    // around it go negative and get clamped
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p1);
+        obs.update_rec("O3", p2);
+        obs.update_rec("O4", p1);
+    };
+    string name = "selftest_structnoise";
+    {
+        ofstream f(name + ".obs_data.csv");
+        f << "obsnme,obsval,weight,obgnme,lower_bound" << endl
+          << "o1,0.0,10.0,g1," << endl
+          << "o2,2.0,10.0,g1," << endl
+          << "o3,0.5,10.0,g2," << endl
+          << "o4,0.05,10.0,g2,0.0" << endl;
+    }
+    {
+        ofstream f(name + ".pst");
+        f << "pcf" << endl
+          << "* control data" << endl
+          << "restart estimation" << endl
+          << "2 4 1 0 2" << endl
+          << "1 1 single point 1 0 0" << endl
+          << "5.0 2.0 0.3 0.03 10" << endl
+          << "5.0 5.0 0.001" << endl
+          << "0.1" << endl
+          << "1 0.01 3 3 0.01 3" << endl
+          << "0 0 0" << endl
+          << "* parameter groups" << endl
+          << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+          << "* parameter data" << endl
+          << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "* observation groups" << endl
+          << "g1" << endl
+          << "g2" << endl
+          << "* observation data external" << endl
+          << name << ".obs_data.csv" << endl
+          << "* model command line" << endl
+          << "echo" << endl
+          << "* model input/output" << endl
+          << "x.tpl x.dat" << endl
+          << "y.ins y.dat" << endl
+          << "++ies_num_reals(200)" << endl
+          << "++ies_n_iter_reinflate(1)" << endl;
+    }
+    stringstream cap;
+    streambuf* old = cout.rdbuf(cap.rdbuf());
+    string where = "startup";
+    try
+    {
+        ofstream flog(name + "_perf.log");
+        PerformanceLog pfm(flog);
+        FileManager fm(name);
+        ofstream& frec = fm.open_ofile_ext("rec");
+        Pest p;
+        {
+            ifstream fin(name + ".pst");
+            p.process_ctl_file(fin, name + ".pst", frec);
+        }
+        p.check_inputs(frec);
+        OutputFileWriter ofw(fm, p);
+        p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+        InProcessRunManager rm(name + ".rns", model);
+        rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+        StructNoiseProbe ies(p, fm, ofw, &pfm, &rm);
+        ies.initialize();
+
+        const vector<string> rnames = ies.noise().get_real_names();
+        const vector<string> vnames = ies.noise().get_var_names();
+        const Eigen::MatrixXd n0 = *ies.noise().get_eigen_ptr();
+        map<string, int> vmap;
+        for (int j = 0; j < vnames.size(); j++)
+            vmap[vnames[j]] = j;
+
+        // frac = 0 before any capture: nothing touched
+        where = "reinflation with frac 0";
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+        bool same0 = (*ies.noise().get_eigen_ptr() - n0).cwiseAbs().maxCoeff() == 0.0;
+        bool cap0 = ies.captured();
+
+        // the residuals the capture should see: observed minus simulated, from the sims
+        // as they stand going into the first frac > 0 reinflation
+        ObservationEnsemble sim_before = ies.sim();
+        Observations ctl_obs = p.get_ctl_observations();
+
+        where = "reinflation with frac 1";
+        ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
+        const Eigen::MatrixXd n1 = *ies.noise().get_eigen_ptr();
+        bool cap1 = ies.captured();
+        Eigen::MatrixXd R = ies.resid();
+        vector<string> robs = ies.resid_obs();
+        auto coef = ies.coef();
+
+        where = "second reinflation with frac 1";
+        ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
+        const Eigen::MatrixXd n2 = *ies.noise().get_eigen_ptr();
+
+        where = "reinflation with frac 0.25";
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.25);
+        const Eigen::MatrixXd n3 = *ies.noise().get_eigen_ptr();
+
+        where = "reinflation with frac 0 after the capture";
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+        const Eigen::MatrixXd n4 = *ies.noise().get_eigen_ptr();
+        cout.rdbuf(old);
+
+        CHK(same0, "frac 0 before any capture: the noise realizations are untouched");
+        CHK(!cap0, "frac 0 before any capture: nothing captured");
+        CHK(cap1, "frac 1: residuals captured at the first reinflation with frac > 0");
+        CHK(R.rows() == sim_before.shape().first && R.cols() == vnames.size(),
+            "R is (realizations of oe) x (active nz obs)");
+
+        // R is observed minus simulated, not centred
+        double rerr = 0.0;
+        {
+            Eigen::MatrixXd sv = sim_before.get_eigen(vector<string>(), robs);
+            for (int i = 0; i < R.rows(); i++)
+                for (int k = 0; k < robs.size(); k++)
+                    rerr = max(rerr, abs(R(i, k) - (ctl_obs.get_rec(robs[k]) - sv(i, k))));
+        }
+        CHK(rerr < 1.0e-10, "R is observed minus simulated, uncentred (max err " + to_string(rerr) + ")");
+
+        // the draws: oe_base - user noise == sqrt(frac) * coef^T R / sqrt(Ne), base untouched
+        int ne = R.rows();
+        int o4 = vmap.at("O4");
+        double ferr1 = 0.0, ferr3 = 0.0, base_change = 0.0;
+        int n_rows_checked = 0, n_coef_missing = 0;
+        vector<double> s_mean(robs.size(), 0.0), s_var(robs.size(), 0.0);
+        for (int i = 0; i < rnames.size(); i++)
+        {
+            if (rnames[i] == BASE_REAL_NAME)
+            {
+                base_change = max(base_change, (n1.row(i) - n0.row(i)).cwiseAbs().maxCoeff());
+                continue;
+            }
+            auto cit = coef.find(rnames[i]);
+            if (cit == coef.end()) { n_coef_missing++; continue; }
+            Eigen::RowVectorXd srow = (cit->second.transpose() * R) / sqrt(double(ne));
+            for (int k = 0; k < robs.size(); k++)
+            {
+                int j = vmap.at(robs[k]);
+                s_mean[k] += srow[k];
+                s_var[k] += srow[k] * srow[k];
+                if (j == o4)
+                    continue;   // clamped, checked below
+                ferr1 = max(ferr1, abs(n1(i, j) - (n0(i, j) + srow[k])));
+                ferr3 = max(ferr3, abs(n3(i, j) - (n0(i, j) + 0.5 * srow[k])));
+            }
+            n_rows_checked++;
+        }
+        CHK(n_coef_missing == 0, "every non-base noise realization has a coefficient column");
+        CHK(base_change == 0.0, "the base realization is left noise-free");
+        CHK(ferr1 < 1.0e-10, "frac 1: oe_base = user noise + coef^T R / sqrt(Ne) (max err " + to_string(ferr1) + ")");
+        CHK(ferr3 < 1.0e-10, "frac 0.25: oe_base = user noise + 0.5 * the same draws (max err " + to_string(ferr3) + ")");
+        CHK((n2 - n1).cwiseAbs().maxCoeff() == 0.0, "a second reinflation at the same frac leaves oe_base unchanged");
+        CHK((n4 - n0).cwiseAbs().maxCoeff() == 0.0, "frac 0 after the capture puts the user's noise back exactly");
+
+        // symmetric and the right size: mean near 0, variance near diag(R^T R) / Ne
+        bool sym_ok = true, size_ok = true;
+        stringstream ss;
+        for (int k = 0; k < robs.size(); k++)
+        {
+            double m = s_mean[k] / n_rows_checked;
+            double v = s_var[k] / n_rows_checked - m * m;
+            double target = R.col(k).squaredNorm() / ne;
+            if (abs(m) > 0.3 * sqrt(target)) sym_ok = false;
+            if ((v < 0.6 * target) || (v > 1.5 * target)) size_ok = false;
+            ss << robs[k] << " mean " << m << " var " << v << " target " << target << "; ";
+        }
+        CHK(sym_ok, "draws are centred on zero: " + ss.str());
+        CHK(size_ok, "draw variance matches diag(R^T R)/Ne: " + ss.str());
+
+        // the bound clamp: o4 never below 0, and it actually bit
+        int nclamped = 0;
+        double o4_min = 1.0e30;
+        for (int i = 0; i < rnames.size(); i++)
+        {
+            o4_min = min(o4_min, n1(i, o4));
+            if (n1(i, o4) == 0.0 && n0(i, o4) != 0.0)
+                nclamped++;
+        }
+        CHK(o4_min >= 0.0, "o4 (lower_bound 0) is never below 0 after the draws (min " + to_string(o4_min) + ")");
+        CHK(nclamped > 0, "the clamp actually bit on o4 (" + to_string(nclamped) + " values)");
+    }
+    catch (const exception& e)
+    {
+        cout.rdbuf(old);
+        CHK(false, name + ": threw during " + where + ": " + e.what());
+    }
+}
+
+static void test_structnoise_deweight()
+{
+    cout << "[structural noise de-weighting: w' = 1/sqrt(w^-2 + frac s2), row by row from weights_base]" << endl;
+    // o1/o2 can't both be fitted (same p1, observed at 0 and 2).  o3 = p2 is fittable.  o4 =
+    // p2 is a less-than obs at 100 that is always satisfied, so its actual residual - and s2 -
+    // is exactly 0 and its weight must not move
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p1);
+        obs.update_rec("O3", p2);
+        obs.update_rec("O4", p2);
+    };
+    string name = "selftest_structnoise_dw";
+    // clear saves from an earlier run so the file checks below only see this one
+    for (int i = 0; i < 20; i++)
+    {
+        remove((name + "." + to_string(i) + ".adjusted.weights.csv").c_str());
+        remove((name + "." + to_string(i) + ".adjusted.obs_data.csv").c_str());
+    }
+    {
+        ofstream f(name + ".pst");
+        f << "pcf" << endl
+          << "* control data" << endl
+          << "restart estimation" << endl
+          << "2 4 2 0 3" << endl
+          << "1 1 single point 1 0 0" << endl
+          << "5.0 2.0 0.3 0.03 10" << endl
+          << "5.0 5.0 0.001" << endl
+          << "0.1" << endl
+          << "1 0.01 3 3 0.01 3" << endl
+          << "0 0 0" << endl
+          << "* parameter groups" << endl
+          << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+          << "* parameter data" << endl
+          << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "* observation groups" << endl
+          << "g1" << endl
+          << "g2" << endl
+          << "less_g3" << endl
+          << "* observation data" << endl
+          << "o1 0.0 10.0 g1" << endl
+          << "o2 2.0 10.0 g1" << endl
+          << "o3 0.5 2.0 g2" << endl
+          << "o4 100.0 10.0 less_g3" << endl
+          << "* model command line" << endl
+          << "echo" << endl
+          << "* model input/output" << endl
+          << "x.tpl x.dat" << endl
+          << "y.ins y.dat" << endl
+          << "++ies_num_reals(30)" << endl
+          << "++ies_n_iter_reinflate(1)" << endl
+          << "++ies_structnoise_deweight(true)" << endl;
+    }
+    stringstream cap;
+    streambuf* old = cout.rdbuf(cap.rdbuf());
+    string where = "startup";
+    try
+    {
+        ofstream flog(name + "_perf.log");
+        PerformanceLog pfm(flog);
+        FileManager fm(name);
+        ofstream& frec = fm.open_ofile_ext("rec");
+        Pest p;
+        {
+            ifstream fin(name + ".pst");
+            p.process_ctl_file(fin, name + ".pst", frec);
+        }
+        p.check_inputs(frec);
+        OutputFileWriter ofw(fm, p);
+        p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+        InProcessRunManager rm(name + ".rns", model);
+        rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+        StructNoiseProbe ies(p, fm, ofw, &pfm, &rm);
+        ies.initialize();
+
+        // give every realization its own weights, as a weight ensemble or phi factors by
+        // realization would.  the restore at reinflation reads weights_base
+        {
+            Eigen::MatrixXd* wb = ies.wts_base().get_eigen_ptr_4_mod();
+            for (int i = 0; i < wb->rows(); i++)
+                wb->row(i) *= (1.0 + 0.05 * i);
+        }
+        const Eigen::MatrixXd wb = *ies.wts_base().get_eigen_ptr();
+        const vector<string> wvars = ies.wts_base().get_var_names();
+        const vector<string> wreals = ies.wts_base().get_real_names();
+
+        // the adjusted weight ensemble each reinflation leaves, the control file weights, and
+        // the files it saved
+        struct Snap { Eigen::MatrixXd w; vector<string> rnames; map<string, double> ctl; int iter; };
+        auto snap = [&]()
+        {
+            Snap sn;
+            sn.w = *ies.wts().get_eigen_ptr();
+            sn.rnames = ies.wts().get_real_names();
+            for (auto& o : wvars)
+                sn.ctl[o] = p.get_observation_info_ptr()->get_weight(o);
+            sn.iter = ies.cur_iter();
+            return sn;
+        };
+        where = "reinflation with frac 1";
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
+        Snap s1 = snap();
+        Eigen::VectorXd s2 = ies.s2();
+        Eigen::MatrixXd R = ies.resid();
+        vector<string> robs = ies.resid_obs();
+        where = "reinflation with frac 0.25";
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.25);
+        Snap s3 = snap();
+        where = "reinflation with frac 0";
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+        Snap s0 = snap();
+        cout.rdbuf(old);
+
+        map<string, double> s2_map;
+        for (int k = 0; k < robs.size(); k++)
+            s2_map[robs[k]] = s2[k];
+        double s2err = 0.0;
+        for (int k = 0; k < robs.size(); k++)
+            s2err = max(s2err, abs(s2[k] - R.col(k).squaredNorm() / R.rows()));
+        CHK(s2err < 1.0e-12, "s2 is the uncentred mean of R^2 over realizations");
+        CHK(s2_map.at("O4") == 0.0, "the satisfied less-than obs has s2 exactly 0");
+        CHK(s2_map.at("O1") > 0.5 && s2_map.at("O2") > 0.5, "the obs the model can't fit have a large s2");
+
+        // check one snapshot against the formula, row by row from weights_base
+        auto check = [&](const Snap& sn, double frac, const string& tag)
+        {
+            double ferr = 0.0, over = 0.0, s2zero = 0.0;
+            map<string, int> wb_rmap;
+            for (int i = 0; i < wreals.size(); i++)
+                wb_rmap[wreals[i]] = i;
+            for (int i = 0; i < sn.rnames.size(); i++)
+            {
+                int ib = wb_rmap.at(sn.rnames[i]);
+                for (int j = 0; j < wvars.size(); j++)
+                {
+                    double w0 = wb(ib, j), w1 = sn.w(i, j);
+                    double expect = (frac > 0.0) ? 1.0 / sqrt(1.0 / (w0 * w0) + frac * s2_map.at(wvars[j])) : w0;
+                    ferr = max(ferr, abs(w1 - expect) / w0);
+                    over = max(over, w1 - w0);
+                    if (s2_map.at(wvars[j]) == 0.0)
+                        s2zero = max(s2zero, abs(w1 - w0));
+                }
+            }
+            CHK(ferr < 1.0e-12, tag + ": weight ensemble matches 1/sqrt(w^-2 + frac s2) (max rel err " + to_string(ferr) + ")");
+            CHK(over <= 0.0, tag + ": no weight above its own original in weights_base");
+            CHK(s2zero == 0.0, tag + ": weight unchanged where s2 = 0");
+            double cerr = 0.0;
+            for (auto& o : wvars)
+            {
+                double w0 = ies.org_info().get_weight(o);
+                double expect = (frac > 0.0) ? 1.0 / sqrt(1.0 / (w0 * w0) + frac * s2_map.at(o)) : w0;
+                cerr = max(cerr, abs(sn.ctl.at(o) - expect) / w0);
+            }
+            CHK(cerr < 1.0e-12, tag + ": control file weights match the formula from org_obs_info");
+        };
+        check(s1, 1.0, "frac 1");
+        check(s3, 0.25, "frac 0.25 after frac 1 (rebuilt from weights_base, not compounded)");
+        check(s0, 0.0, "frac 0 after the capture");
+
+        // the rows stay distinct, each adjusted from its own original
+        bool distinct = true;
+        int jo1 = distance(wvars.begin(), find(wvars.begin(), wvars.end(), string("O1")));
+        for (int i = 1; i < s1.w.rows(); i++)
+            if (s1.w(i, jo1) == s1.w(i - 1, jo1)) distinct = false;
+        CHK(distinct, "frac 1: rows of the weight ensemble stay distinct");
+        CHK(s1.w(s1.w.rows() - 1, jo1) / s1.w(0, jo1) < wb(wb.rows() - 1, jo1) / wb(0, jo1),
+            "frac 1: a large structural variance pulls the realizations' weights toward each other");
+
+        // the saved files match what was used
+        for (auto pr : vector<pair<Snap*, string>>{{&s1, "frac 1"}, {&s3, "frac 0.25"}})
+        {
+            string wcsv = name + "." + to_string(pr.first->iter) + ".adjusted.weights.csv";
+            string ocsv = name + "." + to_string(pr.first->iter) + ".adjusted.obs_data.csv";
+            ObservationEnsemble saved(&p);
+            bool ok = true;
+            double serr = 0.0;
+            try { saved.from_csv(wcsv); }
+            catch (...) { ok = false; }
+            CHK(ok, pr.second + ": saved " + wcsv);
+            if (ok)
+            {
+                Eigen::MatrixXd sv = saved.get_eigen(pr.first->rnames, wvars);
+                serr = ((sv - pr.first->w).array().abs() / pr.first->w.array().abs().max(1.0e-30)).maxCoeff();
+                CHK(serr < 1.0e-5, pr.second + ": saved weight ensemble matches what was used (max rel err " + to_string(serr) + ")");
+            }
+            ifstream fo(ocsv);
+            CHK(fo.good(), pr.second + ": saved " + ocsv);
+        }
+        // nothing saved when frac is 0
+        ifstream f0(name + "." + to_string(s0.iter) + ".adjusted.weights.csv");
+        CHK(!f0.good(), "frac 0: no adjusted weights file written");
+    }
+    catch (const exception& e)
+    {
+        cout.rdbuf(old);
+        CHK(false, name + ": threw during " + where + ": " + e.what());
+    }
+}
+
+static void test_structnoise_phi_factors()
+{
+    cout << "[structural noise with phi factors: phi factors on the prior only, de-weighting on top of them]" << endl;
+    // phi factors change the weights once, on the prior, and startup then takes weights_base
+    // and org_obs_info from those.  with structural noise on, they must not be re-run at a
+    // reinflation (that would count the structure twice), and the de-weighting has to start
+    // from the phi-factor weights, not from the control file ones.  two cases - one set of
+    // factors for everyone, and a table by realization (each row its own weights)
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p1);
+        obs.update_rec("O3", p2);
+        obs.update_rec("O4", p2);
+    };
+    int nreals = 30;
+    for (string kind : {"single", "by_real"})
+    {
+        string name = "selftest_structnoise_pf_" + kind;
+        {
+            ofstream f(name + ".phifac.csv");
+            if (kind == "single")
+                f << "g1,0.3" << endl << "g2,0.7" << endl;
+            else
+            {
+                f << "real,g1,g2" << endl;
+                for (int i = 0; i < nreals + 1; i++)
+                {
+                    double g1 = 0.1 + 0.8 * i / double(nreals);
+                    f << "r" << i << "," << g1 << "," << 1.0 - g1 << endl;
+                }
+            }
+        }
+        {
+            ofstream f(name + ".pst");
+            f << "pcf" << endl
+              << "* control data" << endl
+              << "restart estimation" << endl
+              << "2 4 2 0 2" << endl
+              << "1 1 single point 1 0 0" << endl
+              << "5.0 2.0 0.3 0.03 10" << endl
+              << "5.0 5.0 0.001" << endl
+              << "0.1" << endl
+              << "1 0.01 3 3 0.01 3" << endl
+              << "0 0 0" << endl
+              << "* parameter groups" << endl
+              << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+              << "* parameter data" << endl
+              << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+              << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+              << "* observation groups" << endl
+              << "g1" << endl
+              << "g2" << endl
+              << "* observation data" << endl
+              << "o1 0.0 10.0 g1" << endl
+              << "o2 2.0 10.0 g1" << endl
+              << "o3 0.5 2.0 g2" << endl
+              << "o4 1.5 2.0 g2" << endl
+              << "* model command line" << endl
+              << "echo" << endl
+              << "* model input/output" << endl
+              << "x.tpl x.dat" << endl
+              << "y.ins y.dat" << endl
+              << "++ies_num_reals(" << nreals << ")" << endl
+              << "++ies_n_iter_reinflate(1)" << endl
+              << "++ies_reinflate_structnoise_frac(1.0,0.0)" << endl
+              << "++ies_structnoise_deweight(true)" << endl
+              << "++ies_phi_factor_file(" << name << ".phifac.csv)" << endl;
+            if (kind == "by_real")
+                f << "++ies_phi_factors_by_real(true)" << endl;
+        }
+        stringstream cap;
+        streambuf* old = cout.rdbuf(cap.rdbuf());
+        string where = "startup";
+        try
+        {
+            ofstream flog(name + "_perf.log");
+            PerformanceLog pfm(flog);
+            FileManager fm(name);
+            ofstream& frec = fm.open_ofile_ext("rec");
+            Pest p;
+            {
+                ifstream fin(name + ".pst");
+                p.process_ctl_file(fin, name + ".pst", frec);
+            }
+            p.check_inputs(frec);
+            OutputFileWriter ofw(fm, p);
+            p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+            InProcessRunManager rm(name + ".rns", model);
+            rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+            StructNoiseProbe ies(p, fm, ofw, &pfm, &rm);
+            ies.initialize();
+
+            // what startup ended with - the phi factor weights
+            const Eigen::MatrixXd w_init = *ies.wts().get_eigen_ptr();
+            const Eigen::MatrixXd wb = *ies.wts_base().get_eigen_ptr();
+            const vector<string> wvars = ies.wts_base().get_var_names();
+            const vector<string> wreals = ies.wts_base().get_real_names();
+            const vector<string> ireals = ies.wts().get_real_names();
+            map<string, double> ctl0;
+            for (auto& o : wvars)
+                ctl0[o] = p.get_observation_info_ptr()->get_weight(o);
+
+            where = "reinflation with frac 1";
+            ies.bump_iter();
+            ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
+            const Eigen::MatrixXd w1 = *ies.wts().get_eigen_ptr();
+            const vector<string> r1 = ies.wts().get_real_names();
+            map<string, double> ctl1;
+            for (auto& o : wvars)
+                ctl1[o] = p.get_observation_info_ptr()->get_weight(o);
+            Eigen::VectorXd s2 = ies.s2();
+            vector<string> robs = ies.resid_obs();
+
+            where = "reinflation with frac 0";
+            ies.bump_iter();
+            ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+            const Eigen::MatrixXd w0 = *ies.wts().get_eigen_ptr();
+            const vector<string> r0 = ies.wts().get_real_names();
+            map<string, double> ctl2;
+            for (auto& o : wvars)
+                ctl2[o] = p.get_observation_info_ptr()->get_weight(o);
+            cout.rdbuf(old);
+
+            map<string, double> s2_map;
+            for (int k = 0; k < robs.size(); k++)
+                s2_map[robs[k]] = s2[k];
+            map<string, int> wb_rmap, wi_rmap;
+            for (int i = 0; i < wreals.size(); i++)
+                wb_rmap[wreals[i]] = i;
+            for (int i = 0; i < ireals.size(); i++)
+                wi_rmap[ireals[i]] = i;
+
+            // startup: the phi factors changed the weights, and weights_base / org_obs_info hold
+            // the changed ones
+            // (by realization, the phi factors only scale rows of the weight ensemble - the
+            // control file weights are left as they were)
+            double moved = 0.0, ens_moved = 0.0, base_vs_init = 0.0, org_vs_ctl = 0.0;
+            for (int j = 0; j < wvars.size(); j++)
+            {
+                double pst_w = (wvars[j] == "O1" || wvars[j] == "O2") ? 10.0 : 2.0;
+                moved = max(moved, abs(ctl0[wvars[j]] - pst_w));
+                org_vs_ctl = max(org_vs_ctl, abs(ies.org_info().get_weight(wvars[j]) - ctl0[wvars[j]]));
+                for (auto& ri : wi_rmap)
+                {
+                    base_vs_init = max(base_vs_init, abs(wb(wb_rmap.at(ri.first), j) - w_init(ri.second, j)));
+                    ens_moved = max(ens_moved, abs(w_init(ri.second, j) - pst_w));
+                }
+            }
+            CHK(ens_moved > 1.0e-6, kind + ": the phi factors changed the weight ensemble at startup");
+            if (kind == "single")
+                CHK(moved > 1.0e-6, kind + ": the phi factors changed the control file weights at startup");
+            else
+                CHK(moved == 0.0, kind + ": phi factors by realization leave the control file weights alone");
+            CHK(base_vs_init == 0.0, kind + ": weights_base is the phi-factor weight ensemble");
+            CHK(org_vs_ctl == 0.0, kind + ": org_obs_info is the phi-factor control file weights");
+            if (kind == "by_real")
+            {
+                int jo1 = distance(wvars.begin(), find(wvars.begin(), wvars.end(), string("O1")));
+                set<double> uniq;
+                for (int i = 0; i < wb.rows(); i++)
+                    uniq.insert(wb(i, jo1));
+                CHK(uniq.size() > wb.rows() / 2, kind + ": each realization has its own phi-factor weights (" +
+                    to_string(uniq.size()) + " distinct of " + to_string(wb.rows()) + ")");
+            }
+
+            // frac 1: de-weighting from the phi-factor weights, row by row, never above them
+            double ferr = 0.0, over = 0.0, cerr = 0.0, cover = 0.0;
+            for (int i = 0; i < r1.size(); i++)
+            {
+                int ib = wb_rmap.at(r1[i]);
+                for (int j = 0; j < wvars.size(); j++)
+                {
+                    double b = wb(ib, j);
+                    double expect = 1.0 / sqrt(1.0 / (b * b) + s2_map.at(wvars[j]));
+                    ferr = max(ferr, abs(w1(i, j) - expect) / b);
+                    over = max(over, w1(i, j) - b);
+                }
+            }
+            for (auto& o : wvars)
+            {
+                double b = ctl0[o];
+                cerr = max(cerr, abs(ctl1[o] - 1.0 / sqrt(1.0 / (b * b) + s2_map.at(o))) / b);
+                cover = max(cover, ctl1[o] - b);
+            }
+            CHK(ferr < 1.0e-12, kind + ": frac 1 de-weights each row from its own phi-factor weights (max rel err " + to_string(ferr) + ")");
+            CHK(over <= 0.0, kind + ": frac 1 never puts a weight above its phi-factor weight");
+            CHK(cerr < 1.0e-12, kind + ": frac 1 control file weights de-weighted from the phi-factor ones");
+            CHK(cover <= 0.0, kind + ": frac 1 control file weights never above the phi-factor ones");
+
+            // frac 0: back to exactly the phi-factor weights - not re-balanced by the phi
+            // factors, not left de-weighted
+            double back = 0.0, cback = 0.0;
+            for (int i = 0; i < r0.size(); i++)
+                for (int j = 0; j < wvars.size(); j++)
+                    back = max(back, abs(w0(i, j) - wb(wb_rmap.at(r0[i]), j)));
+            for (auto& o : wvars)
+                cback = max(cback, abs(ctl2[o] - ctl0[o]));
+            CHK(back == 0.0, kind + ": frac 0 puts the phi-factor weight ensemble back exactly (phi factors not re-run)");
+            CHK(cback == 0.0, kind + ": frac 0 puts the phi-factor control file weights back exactly");
+        }
+        catch (const exception& e)
+        {
+            cout.rdbuf(old);
+            CHK(false, name + ": threw during " + where + ": " + e.what());
+        }
     }
 }
 
@@ -4775,6 +5443,10 @@ int main()
     run_test(test_constraints_live, "test_constraints_live");
     run_test(test_ies_reinflate_reset, "test_ies_reinflate_reset");
     run_test(test_reinflate_multimodal_alpha_schedule, "test_reinflate_multimodal_alpha_schedule");
+    run_test(test_reinflate_structnoise_frac_schedule, "test_reinflate_structnoise_frac_schedule");
+    run_test(test_structnoise_draws, "test_structnoise_draws");
+    run_test(test_structnoise_deweight, "test_structnoise_deweight");
+    run_test(test_structnoise_phi_factors, "test_structnoise_phi_factors");
     run_test(test_ies_ensemble_reset, "test_ies_ensemble_reset");
     run_test(test_ies_iteration_controls, "test_ies_iteration_controls");
     run_test(test_mou_generation_controls, "test_mou_generation_controls");

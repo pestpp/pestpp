@@ -116,7 +116,8 @@ void IterEnsembleSmoother::iterate_2_solution()
             message(2,"incrementing iteration count for reinflation cycle");
             iter++;
 
-            reinflate_par_ensemble(reinflation.get_factor(),reinflation.get_num_reals());
+            reinflate_par_ensemble(reinflation.get_factor(),reinflation.get_num_reals(),-1,
+                                   reinflation.get_structnoise_frac());
             //adjust_weights(true);
             reinflation.advance();
             new_cycle = true;

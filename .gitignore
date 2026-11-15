@@ -91,6 +91,9 @@ docs/users_manual_processed.md
 benchmarks/capi_*/
 benchmarks/api_*/
 examples/nb_*/
+examples/structnoise_*/
+examples/dsd26/notebooks/models/
+examples/dsd26/notebooks/__pycache__/
 pestpp-glm_benchmarks/*/master_user_lambdas/
 
 __pycache__/

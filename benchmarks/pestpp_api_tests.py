@@ -557,6 +557,28 @@ def api_notebook_runs_test():
                 shutil.rmtree(os.path.join(nb_dir, prefix + stem), ignore_errors=True)
 
 
+    # the structural noise demo: the pestpp-ies executable (not the api) on a python reservoir
+    # model through the external run manager, three cases.  its last cell checks the parameter
+    # error, the weights and the noise, so a cell error here covers those too
+    nb_path = os.path.join(_REPO, "examples", "pestpp_structnoise_demo.ipynb")
+    assert os.path.exists(nb_path), nb_path
+    nb_dir = os.path.dirname(nb_path)
+    nb = nbformat.read(nb_path, as_version=4)
+    client = NotebookClient(nb, timeout=1800, kernel_name="python3", allow_errors=True,
+                            resources={"metadata": {"path": nb_dir}})
+    client.execute()
+    failures = []
+    for i, cell in enumerate(nb.cells):
+        if cell.cell_type != "code":
+            continue
+        for out in cell.get("outputs", []):
+            if out.output_type == "error":
+                failures.append("cell {0}: {1}: {2}".format(i, out.ename, str(out.evalue)[:200]))
+    assert not failures, "pestpp_structnoise_demo.ipynb cells raised:\n  " + "\n  ".join(failures)
+    for stem in ("template", "baseline", "shared", "unique"):
+        shutil.rmtree(os.path.join(nb_dir, "structnoise_" + stem), ignore_errors=True)
+
+
 def api_pyemu_objects_test():
     """The pyemu surface hands back real pyemu objects, not lookalikes.
 

@@ -666,6 +666,9 @@ public:
 	/// multimodal alpha for the current reinflation cycle, or negative when
 	/// ies_reinflate_multimodal_alpha was not given and ies_multimodal_alpha decides as before
 	double get_multimodal_alpha() const { return current_mm_alpha; }
+	/// structural noise fraction for this reinflation, walked like the factor (last entry held).
+	/// 0.0 means no structural noise at this reinflation
+	double get_structnoise_frac() const { return current_sn_frac; }
 
 private:
 	vector<int> n_iter_reinflate;
@@ -673,6 +676,8 @@ private:
 	vector<int> reinflate_num_reals;
 	vector<string> reinflate_solver;
 	vector<double> reinflate_mm_alpha;
+	vector<double> reinflate_sn_frac;
+	double current_sn_frac = 0.0;
 	string current_solver;
 	double current_mm_alpha = -1.0;
 	int iters_since = 0;
@@ -962,8 +967,12 @@ public:
 	/// ensemble mean; positive forces the min-phi realization. The option version of this is a
 	/// schedule-wide flag derived from the SIGN of an unrelated setting, which a caller driving
 	/// one reinflation at a time has no way to express - hence the argument.
+    ///
+    /// structnoise_frac is this reinflation's ies_reinflate_structnoise_frac entry.  0 (the
+    /// default, and what the api passes) leaves the noise alone unless the residuals were
+    /// already captured, in which case it puts the user's noise back for this cycle
     void reinflate_par_ensemble(double reinflate_factor,int reinflate_num_reals,
-                                int center_on_min_phi = -1);
+                                int center_on_min_phi = -1, double structnoise_frac = 0.0);
 
 	/// pick the solver for the solves that follow: "ies", "esmda", "enif", or empty to go back
 	/// to what ies_use_mda / ies_use_enif say.  set by the ies loop from ies_reinflate_solver
@@ -1078,6 +1087,31 @@ protected:
 	Eigen::DiagonalMatrix<double, Eigen::Dynamic> obscov_inv_sqrt, parcov_inv_sqrt;
 	bool oe_drawn, pe_drawn;
     ObservationInfo org_obs_info;
+
+    // structural noise from the irreducible residuals (ies_reinflate_structnoise_frac).
+    // everything here is captured once, at the first reinflation with frac > 0, and frozen
+    // for the rest of the run - recapturing from a de-weighted fit feeds back and runs away
+    bool sn_captured = false;
+    // R: actual residuals (observed minus simulated, not centred), rows are the realizations
+    // of oe at the capture, columns are sn_obs_names
+    Eigen::MatrixXd sn_resid;
+    vector<string> sn_obs_names;
+    // mean over realizations of R^2 for each obs (uncentred) - the irreducible residual variance
+    Eigen::VectorXd sn_s2;
+    // one column of standard normals per noise realization, fixed for the run
+    map<string, Eigen::VectorXd> sn_coef;
+    // the user's noise realizations from before anything was added, by realization name,
+    // ordered as sn_meas_names
+    map<string, Eigen::VectorXd> sn_meas;
+    vector<string> sn_meas_names;
+    // capture R (first time frac > 0) and rebuild oe_base = user noise + sqrt(frac) * draws
+    void apply_structural_noise(double frac);
+    // lower each obs weight by its irreducible residual variance (ies_structnoise_deweight),
+    // in the weight ensemble and the control file weights, from the user's weights every time
+    void apply_structural_deweight(double frac);
+    // write case.N.adjusted.weights.* and case.N.adjusted.obs_data.csv
+    void save_adjusted_weights();
+
     // not an option cache: this records a one-time resolved decision (the save_binary +
     // oversized-problem fallback flips save_dense on, erasing the state it was derived from)
     string dense_file_ext = ".bin";

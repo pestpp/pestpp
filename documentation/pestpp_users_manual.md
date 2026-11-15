@@ -3805,6 +3805,8 @@ This option is implemented in PESTPP-IES via the *ies_n_iter_reinflate* option. 
 
 - The multi-modal solution process (section 9.1.14) can also be changed at each reinflation cycle using *ies_reinflate_multimodal_alpha*, which takes a list of values between 0.0 and 1.0, one per cycle, with the last entry held for any remaining cycles. A value of 0.0 turns the multi-modal solution off for that cycle. For example, *ies_reinflate_multimodal_alpha(0.0,0.25)* with *ies_n_iter_reinflate(3)* runs the standard update for three iterations, reinflates, and then uses the multi-modal update with local groups of 25% of the ensemble. When supplied, *ies_multimodal_alpha* is ignored.
 
+- At each reinflation, the residuals the model cannot remove can be turned into extra noise on the observation targets, and optionally used to lower the weights, through *ies_reinflate_structnoise_frac* and *ies_structnoise_deweight*. See section 9.1.17.
+
 - In an effort to minimize the number of model evaluations required to apply PESTPP-IES, users may want to use a small(er) ensemble for a few iterations to hone in an acceptable mean parameter vector, then expand the ensemble to use more realizations, centered on the location of that mean vector.  Standard reinflation resets to the prior parameter variances and correlations (as described in the prior parameter ensemble), this prior reinflation can and should result in a large increase in phi for the reinflated realizations.  In some cases, where users want to better maintain the phi of the ensemble (that is keep the realizations more calibrated), new realiztions can be generated from the current ensemble, such that the variances and correlations in the current ensemble are preserved, which, depending on the linearity of the inverse problem, can result in the newly generated ensemble maintaining a lower phi value, that is, the new realizations are somewhat "calibrated".  This optional behavior is actived by supplying the *ies_reinflate_num_reals* value as negative.  Note that any new realization generated from this operation is essentially a linear combination of the current parameter realizations, which means at most the new realizations will occupy a limited dimensional subspace (at most, the dimensions occupied will be equal to the number of realziations in the current ensemble).  To help expand the subset dimensions of the new ensemble, users can supply *ies_reinflate_factor* as a negative value ranging from less than zero to -1.0 (inclusive).  With a negative *ies_reinflate_factor*, a randomly selected scaled, centered prior ensemble realization is added to each new realization, where the scaling amount is the absolute value of *ies_reinflate_factor*.  
 
 
@@ -3834,6 +3836,40 @@ EnIF is activated with *ies_use_enif(true)*. A graph is supplied with *ies_enif_
 - Through the reinflation process described in section 9.1.15, the solver can be switched at a reinflation cycle using *ies_reinflate_solver()*, which takes a list of solver names, one per cycle. For example *ies_reinflate_solver(ies,enif)* with *ies_n_iter_reinflate(4,999)* runs the standard update for four iterations, reinflates, and then hands the remaining iterations to EnIF. In testing this reached a considerably better fit than EnIF alone in the same number of iterations, because the standard update makes fast early progress and EnIF then refines while preserving spread. Centering the reinflated ensemble on the ensemble mean (a positive *ies_n_iter_reinflate* value) seems to work better than centering on the minimum-phi realization (a negative value) in this arrangement.
 
 - *ies_use_prior_prec(true)* keeps the standard Chen and Oliver update but replaces the ensemble estimate of the prior in it (both in the “Hessian” and in the prior-pull gradient term of the full solution) with the explicit prior precision, either estimated on *ies_enif_graph()* from the prior ensemble or, if no graph is supplied, the inverse of *parcov*. The upgrade is still confined to the ensemble subspace, but uses a full-rank prior instead of a low-rank diagonal approximation. This option requires *ies_use_approx(false)* to have any effect beyond the first iteration and cannot be combined with localization, the multimodal solution process, ESMDA or EnIF itself. Testing to date shows it behaves more like EnIF than like the standard update.
+
+### <a id='s13-1-17' />9.1.17 Structural Noise from Irreducible Residuals (experimental)
+
+*This section, and the functionality it describes, is experimental. The options described here have seen limited testing and may change.*
+
+When the model cannot reproduce part of what was observed - a missing process, a boundary in the wrong place, a stress that isn't in the model - the residuals that are left after fitting are much larger than the measurement noise the user stated through the weights. The standard update treats those residuals as information and keeps bending the parameters to try to remove them, which leads to biased parameters and a posterior that is too narrow. PESTPP-IES can instead take the residuals the model cannot remove and turn them into extra noise on the observation targets, so that the bias they carry becomes variance rather than something the parameters chase. This is tied to the reinflation process (section 9.1.15) and only does anything when reinflation is in use.
+
+At the first reinflation with a non-zero *ies_reinflate_structnoise_frac* entry, PESTPP-IES captures the actual residuals (observed minus simulated, without noise) of the current ensemble for all non-zero-weighted observations. These are not centred - the part shared across realizations is the bias that should become variance. They are captured once and held for the rest of the run; capturing them again from a de-weighted fit feeds back on itself. At that reinflation and every one after, each noise realization is rebuilt from the user's original noise realization plus a fixed random combination of the captured residuals, scaled by the square root of the fraction for that reinflation. The combinations have zero-mean coefficients, so the targets spread symmetrically around the observed values, and their covariance is the residual covariance (uncentred) times the fraction. Each observation only combines its own residuals, so no scaling by weights or standard deviations is involved. The "base" realization is not changed.
+
+*ies_reinflate_structnoise_frac* is a list, one entry per reinflation, walked like *ies_reinflate_factor*: the first entry is used at the first reinflation, the second at the second, and the last entry is held. A value of 0.0 turns the structural noise off at that reinflation (the user's noise realizations are put back), and if every entry is 0.0 nothing is done at all. Values above 1.0 are allowed but a warning is issued.
+
+The structural draws alone widen the spread of the posterior but do little about the parameter bias. *ies_structnoise_deweight(true)* also lowers each observation's weight by its irreducible residual variance at each reinflation:
+
+w' = 1 / sqrt( w<sup>-2</sup> + frac × s<sup>2</sup> )
+
+where s<sup>2</sup> is the mean over realizations of the squared captured residuals for that observation. This is applied to every row of the weight ensemble from that row's own original weights, and to the control file weights, starting from the user's weights every time so nothing accumulates. It is what removes most of the parameter bias. The adjusted weight ensemble and observation data are saved as *case.N.adjusted.weights.csv* and *case.N.adjusted.obs_data.csv*, and the run record carries a per-group summary of the ratio of adjusted to original weights.
+
+Two things are guaranteed. Weights are never increased above the user's weights (after any phi factor adjustment of the prior, see section 9.2.10), and where an observation's s<sup>2</sup> is zero (for example a satisfied inequality observation) its weight is left alone. And noise is never decreased below the user's level - the structural part is added on top of the user's noise realizations.
+
+Some other behavioural characteristics:
+
+- The measured phi gets large from the reinflation where the structural noise comes in, because the noisy targets now carry the structural draws. The actual phi is the one to watch.
+
+- If the observations have *lower_bound* and/or *upper_bound* values in the external observation data, the rebuilt noise realizations are clamped to them at each reinflation, and the number of values clamped is reported in the run record. Near a bound this makes the draws one-sided, and because the structural draws are usually larger than the measurement noise this shows more than it does for the noise alone. The de-weighting is computed from the captured residuals, not the clamped draws.
+
+- The phi factors (*ies_phi_factor_file*) are applied to the prior weights only and are not applied again at a reinflation, since that would count the structure twice. The de-weighting starts from the phi factor weights.
+
+- The same s<sup>2</sup> cuts a large weight proportionally more than a small one, so where the structure is large, the realizations' weights for that observation move toward each other. This is intended - a large structural variance swamps whatever precision the user's weight implied.
+
+- The de-weighting is per observation (diagonal); it does not follow the patterns of the residuals across observations, while the noise draws do. As a result the posterior ensemble tends to be too wide, even though the parameter correction holds up.
+
+- The ESMDA solve does not use the weights, so *ies_structnoise_deweight* has no effect there; the structural noise draws do reach it, through the noise ensemble.
+
+- Structure that the parameters have already absorbed before the residuals are captured never shows up in the residuals, and compensation that leaves no residual (e.g. a parameter fixed at a wrong value that the others make up for exactly) cannot be seen. Real signal that looks like the bias is discounted along with it. The forecasts get the benefit of the corrected parameters, but not any structural error of their own.
 
 ## <a id='s13-2' />9.2 Using PESTPP-IES
 
@@ -4441,6 +4477,16 @@ Note also that the number of control variables may change with time. Refer to th
 <td><em>ies_reinflate_multimodal_alpha</em></td>
 <td>list of floats</td>
 <td>The <em>ies_multimodal_alpha</em> to use in each reinflation cycle, one entry per cycle; the last entry is held for any remaining cycles. Each entry must be between 0.0 and 1.0, and 0.0 turns the multimodal solve off for that cycle. Overrides <em>ies_multimodal_alpha</em> when supplied. For example “0.0,0.25” runs the standard update until the first reinflation and the multimodal update after it. See sections 9.1.14 and 9.1.15.</td>
+</tr>
+<tr class="odd">
+<td><em>ies_reinflate_structnoise_frac</em></td>
+<td>list of floats</td>
+<td>The fraction of the irreducible residual variance added to the noise realizations as structural noise, one entry per reinflation, walked like <em>ies_reinflate_factor</em> (last entry held). The residuals are captured at the first reinflation with a non-zero entry. 0.0 turns it off for that reinflation, and entirely if every entry is 0.0. Default is 0.0. Experimental; see section 9.1.17.</td>
+</tr>
+<tr class="even">
+<td><em>ies_structnoise_deweight</em></td>
+<td>bool</td>
+<td>Also lower each observation weight by its irreducible residual variance at each reinflation where <em>ies_reinflate_structnoise_frac</em> is non-zero, in the weight ensemble and the control file weights. Weights are never increased. Has no effect on the ESMDA solve. Default is false. Experimental; see section 9.1.17.</td>
 </tr>
 <tr class="even">
 <td><em>ies_use_phi_lambda_iters</em></td>

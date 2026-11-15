@@ -4696,43 +4696,8 @@ void ObservationEnsemble::draw(int num_reals, Covariance &cov, PerformanceLog *p
 
 	Ensemble::draw(num_reals, cov, obs, sorted_var_names, grouper, plog, level);
 
-	//apply any bounds that were supplied
-	map<string, double> lower_bnd = pest_scenario_ptr->get_ext_file_double_map("observation data external", "lower_bound");
-	map<string, double> upper_bnd = pest_scenario_ptr->get_ext_file_double_map("observation data external", "upper_bound");
-	set<string> snames(var_names.begin(), var_names.end());
-	double v, lb, ub;
-	Eigen::VectorXd col;
-	string var_name;
-	if ((lower_bnd.size() > 0) || (upper_bnd.size() > 0))
-	{
-		frec << "Note: the following observations contain 'lower_bound' and/or 'upper_bound' information that will be" << endl;
-		frec << "      enforced on the additive noise realizations: " << endl;
-		for (int j = 0; j < reals.cols(); j++)
-		{
-			var_name = var_names[j];
-			lb = std::numeric_limits<double>::lowest();
-			ub = 1.79769e+308;//std::numeric_limits<double>::max();
-			if (auto lb_it = lower_bnd.find(var_name); lb_it != lower_bnd.end())
-			{
-				lb = lb_it->second;
-			}
-			if (auto ub_it = upper_bnd.find(var_name); ub_it != upper_bnd.end())
-			{
-				ub = ub_it->second;
-			}
-			frec << var_name << " " << lb << " " << ub << endl;
-			col = reals.col(j);
-
-			for (int i = 0; i < reals.rows(); i++)
-			{
-				v = col(i);
-				v = v < lb ? lb : v;
-				col(i) = v > ub ? ub : v;
-			}
-			reals.col(j) = col;
-			
-		}
-	}
+	//apply any bounds that were supplied (var_names is still just the nz obs here)
+	enforce_obs_bounds(frec, true);
 
 	//now fill in all the zero-weighted obs
 	Eigen::MatrixXd drawn = reals;
@@ -4758,7 +4723,82 @@ void ObservationEnsemble::draw(int num_reals, Covariance &cov, PerformanceLog *p
 		}
 	}
 	var_names = full_var_names;
-	
+
+}
+
+/**
+ * @brief Clamp realizations to the obs 'lower_bound' / 'upper_bound' external columns.
+ *
+ * this used to live inline in draw().  it is pulled out so the structural noise draws at a
+ * reinflation can be clamped the same way.  draw() calls it with report = true, which writes
+ * the same bounded-obs listing it always has.  whenever any value is actually clamped, a count
+ * per obs is written as well, whoever the caller is.
+ *
+ * @param frec the rec file stream.
+ * @param report list every bounded obs and its bounds.
+ * @param names the obs to clamp; empty means all of var_names.
+ *
+ * @return the number of values clamped.
+ */
+int ObservationEnsemble::enforce_obs_bounds(ofstream& frec, bool report, const vector<string>& names)
+{
+	map<string, double> lower_bnd = pest_scenario_ptr->get_ext_file_double_map("observation data external", "lower_bound");
+	map<string, double> upper_bnd = pest_scenario_ptr->get_ext_file_double_map("observation data external", "upper_bound");
+	if ((lower_bnd.size() == 0) && (upper_bnd.size() == 0))
+		return 0;
+	set<string> snames(names.begin(), names.end());
+	if (report)
+	{
+		frec << "Note: the following observations contain 'lower_bound' and/or 'upper_bound' information that will be" << endl;
+		frec << "      enforced on the additive noise realizations: " << endl;
+	}
+	double v, lb, ub;
+	Eigen::VectorXd col;
+	string var_name;
+	int total = 0, count;
+	vector<pair<string, int>> clamped;
+	for (int j = 0; j < reals.cols(); j++)
+	{
+		var_name = var_names[j];
+		if ((snames.size() > 0) && (snames.find(var_name) == snames.end()))
+			continue;
+		lb = std::numeric_limits<double>::lowest();
+		ub = 1.79769e+308;//std::numeric_limits<double>::max();
+		if (auto lb_it = lower_bnd.find(var_name); lb_it != lower_bnd.end())
+		{
+			lb = lb_it->second;
+		}
+		if (auto ub_it = upper_bnd.find(var_name); ub_it != upper_bnd.end())
+		{
+			ub = ub_it->second;
+		}
+		if (report)
+			frec << var_name << " " << lb << " " << ub << endl;
+		col = reals.col(j);
+		count = 0;
+		for (int i = 0; i < reals.rows(); i++)
+		{
+			v = col(i);
+			if ((v < lb) || (v > ub))
+				count++;
+			v = v < lb ? lb : v;
+			col(i) = v > ub ? ub : v;
+		}
+		reals.col(j) = col;
+		if (count > 0)
+		{
+			clamped.push_back(make_pair(var_name, count));
+			total += count;
+		}
+	}
+	if (total > 0)
+	{
+		frec << "Note: obs bound enforcement clamped " << total << " values in " << clamped.size()
+			 << " observations (obs name, number of realizations clamped):" << endl;
+		for (auto& c : clamped)
+			frec << "      " << c.first << " " << c.second << endl;
+	}
+	return total;
 }
 
 /**
