@@ -1414,18 +1414,18 @@ static void test_structnoise_phi_factors()
             const vector<string> wvars = ies.wts_base().get_var_names();
             const vector<string> wreals = ies.wts_base().get_real_names();
             const vector<string> ireals = ies.wts().get_real_names();
-            map<string, double> ctl0;
+            map<string, double> ctl_wts0;
             for (auto& o : wvars)
-                ctl0[o] = p.get_observation_info_ptr()->get_weight(o);
+                ctl_wts0[o] = p.get_observation_info_ptr()->get_weight(o);
 
             where = "reinflation with frac 1";
             ies.bump_iter();
             ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
             const Eigen::MatrixXd w1 = *ies.wts().get_eigen_ptr();
             const vector<string> r1 = ies.wts().get_real_names();
-            map<string, double> ctl1;
+            map<string, double> ctl_wts1;
             for (auto& o : wvars)
-                ctl1[o] = p.get_observation_info_ptr()->get_weight(o);
+                ctl_wts1[o] = p.get_observation_info_ptr()->get_weight(o);
             Eigen::VectorXd s2 = ies.s2();
             vector<string> robs = ies.resid_obs();
 
@@ -1434,9 +1434,9 @@ static void test_structnoise_phi_factors()
             ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
             const Eigen::MatrixXd w0 = *ies.wts().get_eigen_ptr();
             const vector<string> r0 = ies.wts().get_real_names();
-            map<string, double> ctl2;
+            map<string, double> ctl_wts2;
             for (auto& o : wvars)
-                ctl2[o] = p.get_observation_info_ptr()->get_weight(o);
+                ctl_wts2[o] = p.get_observation_info_ptr()->get_weight(o);
             cout.rdbuf(old);
 
             map<string, double> s2_map;
@@ -1456,8 +1456,8 @@ static void test_structnoise_phi_factors()
             for (int j = 0; j < wvars.size(); j++)
             {
                 double pst_w = (wvars[j] == "O1" || wvars[j] == "O2") ? 10.0 : 2.0;
-                moved = max(moved, abs(ctl0[wvars[j]] - pst_w));
-                org_vs_ctl = max(org_vs_ctl, abs(ies.org_info().get_weight(wvars[j]) - ctl0[wvars[j]]));
+                moved = max(moved, abs(ctl_wts0[wvars[j]] - pst_w));
+                org_vs_ctl = max(org_vs_ctl, abs(ies.org_info().get_weight(wvars[j]) - ctl_wts0[wvars[j]]));
                 for (auto& ri : wi_rmap)
                 {
                     base_vs_init = max(base_vs_init, abs(wb(wb_rmap.at(ri.first), j) - w_init(ri.second, j)));
@@ -1496,9 +1496,9 @@ static void test_structnoise_phi_factors()
             }
             for (auto& o : wvars)
             {
-                double b = ctl0[o];
-                cerr = max(cerr, abs(ctl1[o] - 1.0 / sqrt(1.0 / (b * b) + s2_map.at(o))) / b);
-                cover = max(cover, ctl1[o] - b);
+                double b = ctl_wts0[o];
+                cerr = max(cerr, abs(ctl_wts1[o] - 1.0 / sqrt(1.0 / (b * b) + s2_map.at(o))) / b);
+                cover = max(cover, ctl_wts1[o] - b);
             }
             CHK(ferr < 1.0e-12, kind + ": frac 1 de-weights each row from its own phi-factor weights (max rel err " + to_string(ferr) + ")");
             CHK(over <= 0.0, kind + ": frac 1 never puts a weight above its phi-factor weight");
@@ -1512,7 +1512,7 @@ static void test_structnoise_phi_factors()
                 for (int j = 0; j < wvars.size(); j++)
                     back = max(back, abs(w0(i, j) - wb(wb_rmap.at(r0[i]), j)));
             for (auto& o : wvars)
-                cback = max(cback, abs(ctl2[o] - ctl0[o]));
+                cback = max(cback, abs(ctl_wts2[o] - ctl_wts0[o]));
             CHK(back == 0.0, kind + ": frac 0 puts the phi-factor weight ensemble back exactly (phi factors not re-run)");
             CHK(cback == 0.0, kind + ": frac 0 puts the phi-factor control file weights back exactly");
         }
