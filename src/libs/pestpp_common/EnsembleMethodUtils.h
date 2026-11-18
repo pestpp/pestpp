@@ -970,7 +970,8 @@ public:
     ///
     /// structnoise_frac is this reinflation's ies_reinflate_structnoise_frac entry.  0 (the
     /// default, and what the api passes) leaves the noise alone unless the residuals were
-    /// already captured, in which case it puts the user's noise back for this cycle
+    /// already captured, in which case it puts the user's noise back for this cycle.  negative
+    /// recaptures the residuals at this reinflation and uses the magnitude as the fraction
     void reinflate_par_ensemble(double reinflate_factor,int reinflate_num_reals,
                                 int center_on_min_phi = -1, double structnoise_frac = 0.0);
 
@@ -1089,8 +1090,10 @@ protected:
     ObservationInfo org_obs_info;
 
     // structural noise from the irreducible residuals (ies_reinflate_structnoise_frac).
-    // everything here is captured once, at the first reinflation with frac > 0, and frozen
-    // for the rest of the run - recapturing from a de-weighted fit feeds back and runs away
+    // everything here is captured at the first reinflation with frac != 0 and reused after
+    // that, unless an entry is negative, which recaptures R, s2 and the coefficients at that
+    // reinflation (the user asks for it: recapturing from a de-weighted fit can feed back).
+    // the user's noise (sn_meas) is only taken at the first capture
     bool sn_captured = false;
     // R: actual residuals (observed minus simulated, not centred), rows are the realizations
     // of oe at the capture, columns are sn_obs_names
@@ -1098,14 +1101,24 @@ protected:
     vector<string> sn_obs_names;
     // mean over realizations of R^2 for each obs (uncentred) - the irreducible residual variance
     Eigen::VectorXd sn_s2;
+    // the variance the correction is built on, ordered as sn_obs_names: sn_s2 as is, or with
+    // ies_structnoise_em the excess max(0, s2 - sig2) over the user's noise
+    Eigen::VectorXd sn_var;
+    // with ies_structnoise_em: the user's noise variance per obs (mean square of the noise
+    // draws) and the per obs scale sqrt(var / s2) put on the draws.  sn_scale is empty otherwise
+    Eigen::VectorXd sn_sig2;
+    Eigen::VectorXd sn_scale;
     // one column of standard normals per noise realization, fixed for the run
     map<string, Eigen::VectorXd> sn_coef;
     // the user's noise realizations from before anything was added, by realization name,
     // ordered as sn_meas_names
     map<string, Eigen::VectorXd> sn_meas;
     vector<string> sn_meas_names;
-    // capture R (first time frac > 0) and rebuild oe_base = user noise + sqrt(frac) * draws
+    // capture R (first time frac != 0, or again when frac < 0) and rebuild
+    // oe_base = user noise + sqrt(abs(frac)) * draws
     void apply_structural_noise(double frac);
+    // ies_structnoise_em: set sn_var, sn_sig2 and sn_scale from the em excess at a capture
+    void set_structural_em_variance();
     // lower each obs weight by its irreducible residual variance (ies_structnoise_deweight),
     // in the weight ensemble and the control file weights, from the user's weights every time
     void apply_structural_deweight(double frac);

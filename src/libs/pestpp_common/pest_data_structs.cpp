@@ -1368,6 +1368,11 @@ bool PestppOptions::assign_ies_value_by_key(const string& key, const string& val
         ies_structnoise_deweight = pest_utils::parse_string_arg_to_bool(value);
         return true;
     }
+    else if (key == "IES_STRUCTNOISE_EM")
+    {
+        ies_structnoise_em = pest_utils::parse_string_arg_to_bool(value);
+        return true;
+    }
     else if (key == "IES_UPDATE_BY_REALS")
     {
         ies_updatebyreals = pest_utils::parse_string_arg_to_bool(value);
@@ -2459,6 +2464,7 @@ os << endl << "...pestpp-swp options:" << endl;
         os << v << ",";
     os << endl;
     os << "ies_structnoise_deweight: " << ies_structnoise_deweight << endl;
+    os << "ies_structnoise_em: " << ies_structnoise_em << endl;
     os << "ies_updatebyreals: " << ies_updatebyreals << endl;
 
     os << "ies_autoadaloc_indicator_pars: " << endl;
@@ -2722,6 +2728,7 @@ void PestppOptions::set_defaults_legacy()
     set_ies_reinflate_multimodal_alpha(vector<double>());
     set_ies_reinflate_structnoise_frac(vector<double>{0.0});
     set_ies_structnoise_deweight(false);
+    set_ies_structnoise_em(false);
     set_ies_run_realname("");
 	set_ies_reinflate_num_reals(vector<int>{0});
 	set_ies_use_phi_lambda_iters(false);

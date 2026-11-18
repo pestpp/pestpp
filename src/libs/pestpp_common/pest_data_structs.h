@@ -742,6 +742,8 @@ public:
     vector<double> get_ies_reinflate_structnoise_frac() const {return ies_reinflate_structnoise_frac;}
     void set_ies_structnoise_deweight(bool _flag) { ies_structnoise_deweight = _flag; }
     bool get_ies_structnoise_deweight() const { return ies_structnoise_deweight; }
+    void set_ies_structnoise_em(bool _flag) { ies_structnoise_em = _flag; }
+    bool get_ies_structnoise_em() const { return ies_structnoise_em; }
     void set_ies_aal_indicator_pars(vector<string> pars)  { ies_aal_indicator_pars = pars;}
     vector<string> get_ies_aal_indicator_pars() const {return ies_aal_indicator_pars;}
     void set_ies_run_realname(string name) {ies_run_realname = name;}
@@ -1159,6 +1161,7 @@ private:
     vector<double> ies_reinflate_multimodal_alpha;
     vector<double> ies_reinflate_structnoise_frac;
     bool ies_structnoise_deweight;
+    bool ies_structnoise_em;
     bool ies_updatebyreals;
     vector<string> ies_aal_indicator_pars;
     string ies_run_realname;

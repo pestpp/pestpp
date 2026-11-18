@@ -99,6 +99,8 @@ struct StructNoiseProbe : public IterEnsembleSmoother
     const vector<string>& resid_obs() const { return sn_obs_names; }
     const map<string, Eigen::VectorXd>& coef() const { return sn_coef; }
     const Eigen::VectorXd& s2() const { return sn_s2; }
+    const Eigen::VectorXd& var() const { return sn_var; }
+    const Eigen::VectorXd& sig2() const { return sn_sig2; }
     ObservationEnsemble& wts() { return weights; }
     ObservationEnsemble& wts_base() { return weights_base; }
     ObservationInfo& org_info() { return org_obs_info; }
@@ -605,6 +607,500 @@ static void test_structnoise_draws()
         }
         CHK(o4_min >= 0.0, "o4 (lower_bound 0) is never below 0 after the draws (min " + to_string(o4_min) + ")");
         CHK(nclamped > 0, "the clamp actually bit on o4 (" + to_string(nclamped) + " values)");
+    }
+    catch (const exception& e)
+    {
+        cout.rdbuf(old);
+        CHK(false, name + ": threw during " + where + ": " + e.what());
+    }
+}
+
+static void test_structnoise_recapture()
+{
+    cout << "[structural noise: a negative frac recaptures the residuals, a positive one reuses them]" << endl;
+    // the same irreducible pair as the draws test: o1 = p1 observed at 0, o2 = p1 observed
+    // at 2.  o3 = p2 at 0.5 is fittable.  the sims are shifted by hand before each
+    // reinflation so a recapture is bound to see different residuals
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p1);
+        obs.update_rec("O3", p2);
+    };
+    string name = "selftest_structnoise_rc";
+    {
+        ofstream f(name + ".obs_data.csv");
+        f << "obsnme,obsval,weight,obgnme" << endl
+          << "o1,0.0,10.0,g1" << endl
+          << "o2,2.0,10.0,g1" << endl
+          << "o3,0.5,10.0,g2" << endl;
+    }
+    {
+        ofstream f(name + ".pst");
+        f << "pcf" << endl
+          << "* control data" << endl
+          << "restart estimation" << endl
+          << "2 3 1 0 2" << endl
+          << "1 1 single point 1 0 0" << endl
+          << "5.0 2.0 0.3 0.03 10" << endl
+          << "5.0 5.0 0.001" << endl
+          << "0.1" << endl
+          << "1 0.01 3 3 0.01 3" << endl
+          << "0 0 0" << endl
+          << "* parameter groups" << endl
+          << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+          << "* parameter data" << endl
+          << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "* observation groups" << endl
+          << "g1" << endl
+          << "g2" << endl
+          << "* observation data external" << endl
+          << name << ".obs_data.csv" << endl
+          << "* model command line" << endl
+          << "echo" << endl
+          << "* model input/output" << endl
+          << "x.tpl x.dat" << endl
+          << "y.ins y.dat" << endl
+          << "++ies_num_reals(100)" << endl
+          << "++ies_n_iter_reinflate(1)" << endl
+          // negative entries have to get through the input checks
+          << "++ies_reinflate_structnoise_frac(0,-1,1,-0.5,0)" << endl
+          << "++ies_structnoise_deweight(true)" << endl;
+    }
+    stringstream cap;
+    streambuf* old = cout.rdbuf(cap.rdbuf());
+    string where = "startup";
+    try
+    {
+        ofstream flog(name + "_perf.log");
+        PerformanceLog pfm(flog);
+        FileManager fm(name);
+        ofstream& frec = fm.open_ofile_ext("rec");
+        Pest p;
+        {
+            ifstream fin(name + ".pst");
+            p.process_ctl_file(fin, name + ".pst", frec);
+        }
+        p.check_inputs(frec);
+        OutputFileWriter ofw(fm, p);
+        p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+        InProcessRunManager rm(name + ".rns", model);
+        rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+        StructNoiseProbe ies(p, fm, ofw, &pfm, &rm);
+        ies.initialize();
+        Observations ctl_obs = p.get_ctl_observations();
+
+        const vector<string> rnames = ies.noise().get_real_names();
+        const vector<string> vnames = ies.noise().get_var_names();
+        const Eigen::MatrixXd n0 = *ies.noise().get_eigen_ptr();
+        map<string, int> vmap;
+        for (int j = 0; j < vnames.size(); j++)
+            vmap[vnames[j]] = j;
+
+        // shift every sim by a different amount per realization, and keep what the capture
+        // will see
+        auto shift_sims = [&](double d)
+        {
+            Eigen::MatrixXd* sv = ies.sim().get_eigen_ptr_4_mod();
+            for (int i = 0; i < sv->rows(); i++)
+                sv->row(i).array() += d * (1.0 + 0.01 * i);
+            return ies.sim();
+        };
+        // observed minus simulated, as the capture should compute it
+        auto expected_R = [&](ObservationEnsemble& sim, const vector<string>& robs)
+        {
+            Eigen::MatrixXd sv = sim.get_eigen(vector<string>(), robs);
+            Eigen::MatrixXd r(sv.rows(), sv.cols());
+            for (int i = 0; i < sv.rows(); i++)
+                for (int k = 0; k < robs.size(); k++)
+                    r(i, k) = ctl_obs.get_rec(robs[k]) - sv(i, k);
+            return r;
+        };
+        // the noise each realization should carry: user noise + sqrt(frac) * coef^T R / sqrt(Ne)
+        auto noise_err = [&](const Eigen::MatrixXd& n, double frac)
+        {
+            const Eigen::MatrixXd& R = ies.resid();
+            const vector<string>& robs = ies.resid_obs();
+            double ne = R.rows(), err = 0.0;
+            for (int i = 0; i < rnames.size(); i++)
+            {
+                if (rnames[i] == BASE_REAL_NAME)
+                    continue;
+                Eigen::RowVectorXd srow = sqrt(frac) * (ies.coef().at(rnames[i]).transpose() * R) / sqrt(ne);
+                for (int k = 0; k < robs.size(); k++)
+                {
+                    int j = vmap.at(robs[k]);
+                    err = max(err, abs(n(i, j) - (n0(i, j) + srow[k])));
+                }
+            }
+            return err;
+        };
+        // the control file weight each obs should have after de-weighting at |frac|
+        auto weight_err = [&](double frac)
+        {
+            const vector<string>& robs = ies.resid_obs();
+            double err = 0.0;
+            for (int k = 0; k < robs.size(); k++)
+            {
+                double w = ies.org_info().get_weight(robs[k]);
+                double s2 = ies.resid().col(k).squaredNorm() / ies.resid().rows();
+                double want = (s2 > 0.0) ? 1.0 / sqrt(1.0 / (w * w) + frac * s2) : w;
+                err = max(err, abs(p.get_ctl_observation_info().get_weight(robs[k]) - want));
+            }
+            return err;
+        };
+
+        where = "reinflation with frac 0";
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+        bool cap0 = ies.captured();
+
+        // the first non-zero entry is negative: it captures, same as a positive one would
+        where = "first capture with frac -1";
+        ObservationEnsemble sim1 = shift_sims(0.3);
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, -1.0);
+        bool cap1 = ies.captured();
+        Eigen::MatrixXd R1 = ies.resid();
+        vector<string> robs = ies.resid_obs();
+        auto coef1 = ies.coef();
+        double rerr1 = (R1 - expected_R(sim1, robs)).cwiseAbs().maxCoeff();
+        double nerr1 = noise_err(*ies.noise().get_eigen_ptr(), 1.0);
+        double werr1 = weight_err(1.0);
+
+        // positive: reuse what was captured, even though the sims have moved
+        where = "reuse with frac 1";
+        shift_sims(0.7);
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
+        bool same_R = (ies.resid() - R1).cwiseAbs().maxCoeff() == 0.0;
+        bool same_coef = true;
+        for (auto& c : coef1)
+            if ((ies.coef().at(c.first) - c.second).cwiseAbs().maxCoeff() != 0.0)
+                same_coef = false;
+        double nerr2 = noise_err(*ies.noise().get_eigen_ptr(), 1.0);
+
+        // negative: recapture from the shifted sims, at a fraction of 0.5
+        where = "recapture with frac -0.5";
+        ObservationEnsemble sim3 = shift_sims(1.1);
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, -0.5);
+        Eigen::MatrixXd R3 = ies.resid();
+        double rerr3 = (R3 - expected_R(sim3, ies.resid_obs())).cwiseAbs().maxCoeff();
+        double rdiff = (R3.rows() == R1.rows()) ? (R3 - R1).cwiseAbs().maxCoeff() : 1.0;
+        int coef_changed = 0;
+        for (auto& c : coef1)
+            if ((ies.coef().at(c.first) - c.second).cwiseAbs().maxCoeff() != 0.0)
+                coef_changed++;
+        double nerr3 = noise_err(*ies.noise().get_eigen_ptr(), 0.5);
+        double werr3 = weight_err(0.5);
+
+        where = "reinflation with frac 0 after the recapture";
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+        const Eigen::MatrixXd n4 = *ies.noise().get_eigen_ptr();
+        double werr4 = 0.0;
+        for (auto& oname : robs)
+            werr4 = max(werr4, abs(p.get_ctl_observation_info().get_weight(oname) - ies.org_info().get_weight(oname)));
+        cout.rdbuf(old);
+
+        CHK(!cap0, "frac 0 before any capture: nothing captured");
+        CHK(cap1, "a negative first entry captures the residuals");
+        CHK(rerr1 < 1.0e-10, "first capture: R is observed minus the sims going in (max err " + to_string(rerr1) + ")");
+        CHK(nerr1 < 1.0e-10, "first capture at -1: noise = user noise + the full draws (max err " + to_string(nerr1) + ")");
+        CHK(werr1 < 1.0e-10, "first capture at -1: weights lowered with fraction 1 (max err " + to_string(werr1) + ")");
+        CHK(same_R, "positive frac after the capture: R is reused, not recaptured");
+        CHK(same_coef, "positive frac after the capture: the coefficients are reused");
+        CHK(nerr2 < 1.0e-10, "positive frac: noise rebuilt from the user's noise, nothing piled up (max err " + to_string(nerr2) + ")");
+        CHK(rerr3 < 1.0e-10, "negative frac: R recaptured from the sims as they stand (max err " + to_string(rerr3) + ")");
+        CHK(rdiff > 0.1, "negative frac: the recaptured R differs from the first one (max diff " + to_string(rdiff) + ")");
+        CHK(coef_changed > 0, "negative frac: new coefficients drawn (" + to_string(coef_changed) + " changed)");
+        CHK(nerr3 < 1.0e-10, "negative frac -0.5: noise = the user's noise (not the last noise) + sqrt(0.5) * new draws (max err " + to_string(nerr3) + ")");
+        CHK(werr3 < 1.0e-10, "negative frac -0.5: weights lowered from the user's weights with fraction 0.5 and the new s2 (max err " + to_string(werr3) + ")");
+        CHK((n4 - n0).cwiseAbs().maxCoeff() == 0.0, "frac 0 after a recapture puts the user's noise back exactly");
+        CHK(werr4 == 0.0, "frac 0 after a recapture puts the user's weights back exactly");
+    }
+    catch (const exception& e)
+    {
+        cout.rdbuf(old);
+        CHK(false, name + ": threw during " + where + ": " + e.what());
+    }
+}
+
+static void test_ensemble_dup_real_names()
+{
+    cout << "[duplicate realization names: weight and restart ensembles are checked like par and noise]" << endl;
+    // binary files, since the csv reader already trips over a repeated row name (with a
+    // vaguer message) before the duplicate check is reached
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        obs.update_rec("O1", pars.get_rec("P1"));
+        obs.update_rec("O2", pars.get_rec("P2"));
+    };
+    // kind: the option that names the ensemble with two 'BASE' rows
+    for (string kind : {"ies_weight_ensemble", "ies_restart_obs_en", "ies_restart_par_en"})
+    {
+        string name = "selftest_dupreal_" + kind;
+        {
+            ofstream f(name + ".pst");
+            f << "pcf" << endl
+              << "* control data" << endl
+              << "restart estimation" << endl
+              << "2 2 1 0 1" << endl
+              << "1 1 single point 1 0 0" << endl
+              << "5.0 2.0 0.3 0.03 10" << endl
+              << "5.0 5.0 0.001" << endl
+              << "0.1" << endl
+              << "1 0.01 3 3 0.01 3" << endl
+              << "0 0 0" << endl
+              << "* parameter groups" << endl
+              << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+              << "* parameter data" << endl
+              << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+              << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+              << "* observation groups" << endl
+              << "g1" << endl
+              << "* observation data" << endl
+              << "o1 1.0 10.0 g1" << endl
+              << "o2 0.5 10.0 g1" << endl
+              << "* model command line" << endl
+              << "echo" << endl
+              << "* model input/output" << endl
+              << "x.tpl x.dat" << endl
+              << "y.ins y.dat" << endl
+              << "++ies_num_reals(3)" << endl;
+            // the clean ensembles each case needs beside the bad one: a weight ensemble
+            // needs a noise ensemble, a restart needs the par ensemble it started from
+            if (kind == "ies_weight_ensemble")
+                f << "++ies_obs_en(" << name << ".obs.jcb)" << endl;
+            else
+                f << "++ies_par_en(" << name << ".par.jcb)" << endl;
+            if (kind == "ies_restart_par_en")
+                f << "++ies_restart_obs_en(" << name << ".obs.jcb)" << endl;
+            f << "++" << kind << "(" << name << ".dup.jcb)" << endl;
+        }
+        stringstream cap;
+        streambuf* old = cout.rdbuf(cap.rdbuf());
+        string msg;
+        try
+        {
+            ofstream flog(name + "_perf.log");
+            PerformanceLog pfm(flog);
+            FileManager fm(name);
+            ofstream& frec = fm.open_ofile_ext("rec");
+            Pest p;
+            {
+                ifstream fin(name + ".pst");
+                p.process_ctl_file(fin, name + ".pst", frec);
+            }
+            p.check_inputs(frec);
+            {
+                std::mt19937 rgen(1);
+                Eigen::MatrixXd m(3, 2);
+                m << 1.0, 0.5, 1.1, 0.4, 0.9, 0.6;
+                vector<string> clean{BASE_REAL_NAME, "0", "1"}, dup{BASE_REAL_NAME, "0", BASE_REAL_NAME};
+                ObservationEnsemble(&p, &rgen, m, clean, vector<string>{"O1", "O2"}).to_binary(name + ".obs.jcb");
+                ParameterEnsemble(&p, &rgen, m, clean, vector<string>{"P1", "P2"}).to_binary(name + ".par.jcb");
+                if (kind == "ies_restart_par_en")
+                    ParameterEnsemble(&p, &rgen, m, dup, vector<string>{"P1", "P2"}).to_binary(name + ".dup.jcb");
+                else
+                    ObservationEnsemble(&p, &rgen, m, dup, vector<string>{"O1", "O2"}).to_binary(name + ".dup.jcb");
+            }
+            OutputFileWriter ofw(fm, p);
+            p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+            InProcessRunManager rm(name + ".rns", model);
+            rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+            IterEnsembleSmoother ies(p, fm, ofw, &pfm, &rm);
+            ies.initialize();
+        }
+        catch (const exception& e)
+        {
+            msg = e.what();
+        }
+        cout.rdbuf(old);
+        string want = (kind == "ies_weight_ensemble") ? "weight ensemble" :
+                      (kind == "ies_restart_obs_en") ? "restart obs ensemble" : "restart par ensemble";
+        CHK(msg.find("duplicate") != string::npos, kind + ": two 'base' rows stop the run (got: '" + msg.substr(0, 160) + "')");
+        CHK(msg.find(want) != string::npos, kind + ": the error names the " + want);
+    }
+}
+
+static void test_structnoise_em()
+{
+    cout << "[structural noise em: base variance max(0, s2 - sig2), sig2 from the noise not the weights]" << endl;
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p1);
+        obs.update_rec("O3", p2);
+    };
+    string name = "selftest_structnoise_em";
+    // weight 10 says a variance of 0.01, the standard deviation column says 0.25: the em
+    // excess has to be measured against the 0.25
+    {
+        ofstream f(name + ".obs_data.csv");
+        f << "obsnme,obsval,weight,obgnme,standard_deviation" << endl
+          << "o1,0.0,10.0,g1,0.5" << endl
+          << "o2,2.0,10.0,g1,0.5" << endl
+          << "o3,0.5,10.0,g2,0.5" << endl;
+    }
+    {
+        ofstream f(name + ".pst");
+        f << "pcf" << endl
+          << "* control data" << endl
+          << "restart estimation" << endl
+          << "2 3 1 0 2" << endl
+          << "1 1 single point 1 0 0" << endl
+          << "5.0 2.0 0.3 0.03 10" << endl
+          << "5.0 5.0 0.001" << endl
+          << "0.1" << endl
+          << "1 0.01 3 3 0.01 3" << endl
+          << "0 0 0" << endl
+          << "* parameter groups" << endl
+          << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+          << "* parameter data" << endl
+          << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "* observation groups" << endl
+          << "g1" << endl
+          << "g2" << endl
+          << "* observation data external" << endl
+          << name << ".obs_data.csv" << endl
+          << "* model command line" << endl
+          << "echo" << endl
+          << "* model input/output" << endl
+          << "x.tpl x.dat" << endl
+          << "y.ins y.dat" << endl
+          << "++ies_num_reals(300)" << endl
+          << "++ies_n_iter_reinflate(1)" << endl
+          << "++ies_no_noise(false)" << endl
+          << "++ies_reinflate_structnoise_frac(0.5,-1)" << endl
+          << "++ies_structnoise_deweight(true)" << endl
+          << "++ies_structnoise_em(true)" << endl;
+    }
+    stringstream cap;
+    streambuf* old = cout.rdbuf(cap.rdbuf());
+    string where = "startup";
+    try
+    {
+        ofstream flog(name + "_perf.log");
+        PerformanceLog pfm(flog);
+        FileManager fm(name);
+        ofstream& frec = fm.open_ofile_ext("rec");
+        Pest p;
+        {
+            ifstream fin(name + ".pst");
+            p.process_ctl_file(fin, name + ".pst", frec);
+        }
+        p.check_inputs(frec);
+        OutputFileWriter ofw(fm, p);
+        p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+        InProcessRunManager rm(name + ".rns", model);
+        rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+        StructNoiseProbe ies(p, fm, ofw, &pfm, &rm);
+        ies.initialize();
+        Observations ctl_obs = p.get_ctl_observations();
+
+        const vector<string> rnames = ies.noise().get_real_names();
+        const vector<string> vnames = ies.noise().get_var_names();
+        const Eigen::MatrixXd n0 = *ies.noise().get_eigen_ptr();
+        map<string, int> vmap, rmap;
+        for (int j = 0; j < vnames.size(); j++)
+            vmap[vnames[j]] = j;
+        for (int i = 0; i < rnames.size(); i++)
+            rmap[rnames[i]] = i;
+
+        // the user's noise variance per obs, straight from the draws (base left out)
+        map<string, double> sig2_want;
+        for (auto& v : vnames)
+        {
+            double ss = 0.0;
+            int n = 0;
+            for (int i = 0; i < rnames.size(); i++)
+            {
+                if (rnames[i] == BASE_REAL_NAME)
+                    continue;
+                double d = n0(i, vmap[v]) - ctl_obs.get_rec(v);
+                ss += d * d;
+                n++;
+            }
+            sig2_want[v] = ss / n;
+        }
+        // set every sim so its actual residual (obs - sim) is the given value per obs
+        auto set_resid = [&](std::function<double(const string&, const string&)> r)
+        {
+            ObservationEnsemble& sim = ies.sim();
+            Eigen::MatrixXd* sv = sim.get_eigen_ptr_4_mod();
+            vector<string> sr = sim.get_real_names(), sc = sim.get_var_names();
+            for (int i = 0; i < sr.size(); i++)
+                for (int j = 0; j < sc.size(); j++)
+                    (*sv)(i, j) = ctl_obs.get_rec(sc[j]) - r(sr[i], sc[j]);
+        };
+
+        // 1. a shared bias the model cannot remove: o1 1.5, o2 -2.0, o3 none
+        where = "capture with a bias, frac 0.5";
+        map<string, double> bias{{"O1", 1.5}, {"O2", -2.0}, {"O3", 0.0}};
+        set_resid([&](const string&, const string& o) { return bias[o]; });
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.5);
+        const Eigen::MatrixXd n1 = *ies.noise().get_eigen_ptr();
+        vector<string> robs = ies.resid_obs();
+        Eigen::VectorXd s2 = ies.s2(), var = ies.var(), sig2 = ies.sig2();
+        Eigen::MatrixXd R = ies.resid();
+        double sig_err = 0.0, var_err = 0.0, noise_err = 0.0, w_err = 0.0, sig_min = 1e30, sig_max = 0.0;
+        for (int k = 0; k < robs.size(); k++)
+        {
+            sig_err = max(sig_err, abs(sig2[k] - sig2_want[robs[k]]));
+            var_err = max(var_err, abs(var[k] - max(0.0, s2[k] - sig2_want[robs[k]])));
+            sig_min = min(sig_min, sig2[k]);
+            sig_max = max(sig_max, sig2[k]);
+            double w = ies.org_info().get_weight(robs[k]);
+            double want = (var[k] > 0.0) ? 1.0 / sqrt(1.0 / (w * w) + 0.5 * var[k]) : w;
+            w_err = max(w_err, abs(p.get_ctl_observation_info().get_weight(robs[k]) - want));
+        }
+        int ne = R.rows();
+        for (int i = 0; i < rnames.size(); i++)
+        {
+            if (rnames[i] == BASE_REAL_NAME)
+                continue;
+            Eigen::RowVectorXd srow = (ies.coef().at(rnames[i]).transpose() * R) / sqrt(double(ne));
+            for (int k = 0; k < robs.size(); k++)
+            {
+                double scale = (s2[k] > 0.0) ? sqrt(0.5 * var[k] / s2[k]) : 0.0;
+                int j = vmap.at(robs[k]);
+                noise_err = max(noise_err, abs(n1(i, j) - (n0(i, j) + scale * srow[k])));
+            }
+        }
+        int k3 = find(robs.begin(), robs.end(), "O3") - robs.begin();
+        double o3_change = (n1.col(vmap.at("O3")) - n0.col(vmap.at("O3"))).cwiseAbs().maxCoeff();
+
+        // 2. residuals that are just the user's noise: no excess anywhere, so nothing changes
+        where = "recapture with noise-only residuals";
+        set_resid([&](const string& r, const string& o)
+            { return (r == BASE_REAL_NAME) ? 0.0 : n0(rmap.at(r), vmap.at(o)) - ctl_obs.get_rec(o); });
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, -1.0);
+        double var_max2 = ies.var().maxCoeff();
+        double n_change2 = (*ies.noise().get_eigen_ptr() - n0).cwiseAbs().maxCoeff();
+        double w_change2 = 0.0;
+        for (auto& o : robs)
+            w_change2 = max(w_change2, abs(p.get_ctl_observation_info().get_weight(o) - ies.org_info().get_weight(o)));
+        cout.rdbuf(old);
+
+        CHK(sig_err < 1.0e-10, "sig2 is the mean square of the user's noise draws (max err " + to_string(sig_err) + ")");
+        CHK(sig_min > 0.18 && sig_max < 0.33, "sig2 follows the standard deviation (0.25), not the weights (0.01): " +
+            to_string(sig_min) + " to " + to_string(sig_max));
+        CHK(var_err < 1.0e-10, "the base variance is max(0, s2 - sig2) (max err " + to_string(var_err) + ")");
+        CHK(var[k3] == 0.0, "an obs with no misfit beyond the noise gets no excess");
+        CHK(noise_err < 1.0e-10, "noise = user noise + draws scaled to variance frac * excess (max err " + to_string(noise_err) + ")");
+        CHK(o3_change == 0.0, "an obs with no excess keeps the user's noise exactly");
+        CHK(w_err < 1.0e-10, "weights lowered with frac * excess, from the user's weights (max err " + to_string(w_err) + ")");
+        CHK(var_max2 == 0.0, "residuals that are only the user's noise give no excess (max " + to_string(var_max2) + ")");
+        CHK(n_change2 == 0.0, "no excess: the noise stays the user's noise exactly");
+        CHK(w_change2 == 0.0, "no excess: the weights stay the user's weights exactly");
     }
     catch (const exception& e)
     {
@@ -5445,6 +5941,9 @@ int main()
     run_test(test_reinflate_multimodal_alpha_schedule, "test_reinflate_multimodal_alpha_schedule");
     run_test(test_reinflate_structnoise_frac_schedule, "test_reinflate_structnoise_frac_schedule");
     run_test(test_structnoise_draws, "test_structnoise_draws");
+    run_test(test_structnoise_recapture, "test_structnoise_recapture");
+    run_test(test_ensemble_dup_real_names, "test_ensemble_dup_real_names");
+    run_test(test_structnoise_em, "test_structnoise_em");
     run_test(test_structnoise_deweight, "test_structnoise_deweight");
     run_test(test_structnoise_phi_factors, "test_structnoise_phi_factors");
     run_test(test_ies_ensemble_reset, "test_ies_ensemble_reset");

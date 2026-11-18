@@ -3,7 +3,7 @@
 
 # <a id='s1' />PEST++ Users Manual
 
-Version 6.0.0a4
+Version 6.0.0a5
 
 <img src="./media/image2.png" style="width:6.26806in;height:3.05972in" />
 
@@ -3843,15 +3843,21 @@ EnIF is activated with *ies_use_enif(true)*. A graph is supplied with *ies_enif_
 
 When the model cannot reproduce part of what was observed - a missing process, a boundary in the wrong place, a stress that isn't in the model - the residuals that are left after fitting are much larger than the measurement noise the user stated through the weights. The standard update treats those residuals as information and keeps bending the parameters to try to remove them, which leads to biased parameters and a posterior that is too narrow. PESTPP-IES can instead take the residuals the model cannot remove and turn them into extra noise on the observation targets, so that the bias they carry becomes variance rather than something the parameters chase. This is tied to the reinflation process (section 9.1.15) and only does anything when reinflation is in use.
 
-At the first reinflation with a non-zero *ies_reinflate_structnoise_frac* entry, PESTPP-IES captures the actual residuals (observed minus simulated, without noise) of the current ensemble for all non-zero-weighted observations. These are not centred - the part shared across realizations is the bias that should become variance. They are captured once and held for the rest of the run; capturing them again from a de-weighted fit feeds back on itself. At that reinflation and every one after, each noise realization is rebuilt from the user's original noise realization plus a fixed random combination of the captured residuals, scaled by the square root of the fraction for that reinflation. The combinations have zero-mean coefficients, so the targets spread symmetrically around the observed values, and their covariance is the residual covariance (uncentred) times the fraction. Each observation only combines its own residuals, so no scaling by weights or standard deviations is involved. The "base" realization is not changed.
+At the first reinflation with a non-zero *ies_reinflate_structnoise_frac* entry, PESTPP-IES captures the actual residuals (observed minus simulated, without noise) of the current ensemble for all non-zero-weighted observations. These are not centred - the part shared across realizations is the bias that should become variance. By default they are captured once and held for the rest of the run. A negative entry in *ies_reinflate_structnoise_frac* tells PESTPP-IES to capture them again at that reinflation, from the ensemble as it stands, and to use the magnitude of the entry as the fraction; a positive entry reuses the residuals already captured. The user decides when residuals are captured: a run can capture once early, capture again at the end of a later cycle, or capture at every reinflation. Users should be aware that residuals captured from a fit made with lowered weights can feed back on the next capture. At that reinflation and every one after, each noise realization is rebuilt from the user's original noise realization plus a fixed random combination of the captured residuals, scaled by the square root of the fraction for that reinflation. The combinations have zero-mean coefficients, so the targets spread symmetrically around the observed values, and their covariance is the residual covariance (uncentred) times the fraction. Each observation only combines its own residuals, so no scaling by weights or standard deviations is involved. The "base" realization is not changed.
 
-*ies_reinflate_structnoise_frac* is a list, one entry per reinflation, walked like *ies_reinflate_factor*: the first entry is used at the first reinflation, the second at the second, and the last entry is held. A value of 0.0 turns the structural noise off at that reinflation (the user's noise realizations are put back), and if every entry is 0.0 nothing is done at all. Values above 1.0 are allowed but a warning is issued.
+*ies_reinflate_structnoise_frac* is a list, one entry per reinflation, walked like *ies_reinflate_factor*: the first entry is used at the first reinflation, the second at the second, and the last entry is held. A value of 0.0 turns the structural noise off at that reinflation (the user's noise realizations are put back), and if every entry is 0.0 nothing is done at all. A negative value recaptures the residuals at that reinflation (see above), and the first non-zero entry captures them whatever its sign. For example, *ies_reinflate_structnoise_frac(0,1,-1)* adds nothing at the first reinflation, captures and adds the full residual variance at the second, and recaptures at the third and every one after. Values with a magnitude above 1.0 are allowed but a warning is issued. The noise always starts from the user's original noise realizations, so the user's noise stays the floor however many times the residuals are captured.
 
 The structural draws alone widen the spread of the posterior but do little about the parameter bias. *ies_structnoise_deweight(true)* also lowers each observation's weight by its irreducible residual variance at each reinflation:
 
 w' = 1 / sqrt( w<sup>-2</sup> + frac × s<sup>2</sup> )
 
 where s<sup>2</sup> is the mean over realizations of the squared captured residuals for that observation. This is applied to every row of the weight ensemble from that row's own original weights, and to the control file weights, starting from the user's weights every time so nothing accumulates. It is what removes most of the parameter bias. The adjusted weight ensemble and observation data are saved as *case.N.adjusted.weights.csv* and *case.N.adjusted.obs_data.csv*, and the run record carries a per-group summary of the ratio of adjusted to original weights.
+
+By default the structural correction is built on the whole captured residual variance s<sup>2</sup>. Because the actual residuals are measured against the observed values, that variance also holds the measurement error in those values, which the user's noise already accounts for. *ies_structnoise_em(true)* builds the correction instead on the excess of the residual variance over the user's noise:
+
+excess = max( 0, s<sup>2</sup> − σ<sup>2</sup> )
+
+where σ<sup>2</sup> is the mean square of the user's noise realizations for that observation (the base realization left out). This is the expectation-maximization (EM) update of a structural noise level per observation, with the observation's own residual variance as the shape. σ<sup>2</sup> is taken from the noise realizations, not from the weights, so a user whose weights and noise differ on purpose (for example through a *standard_deviation* column) keeps that difference: the same added variance, *ies_reinflate_structnoise_frac* × excess, goes onto the noise realizations (the structural draws are scaled per observation to that variance) and, with *ies_structnoise_deweight*, onto the weights, each from the user's own starting point. The fraction stays a user scale on the EM correction. An observation whose residuals are no larger than its noise gets no correction at all. One capture recovers roughly (1 − p<sub>eff</sub>/n) of the structural variance, because the realizations absorb part of it; recapturing at each reinflation (negative entries) repeats the EM update and moves it toward the full value. The run record carries a per-group table of the mean s<sup>2</sup>, mean σ<sup>2</sup>, mean excess and the number of observations with no excess at each capture.
 
 Two things are guaranteed. Weights are never increased above the user's weights (after any phi factor adjustment of the prior, see section 9.2.10), and where an observation's s<sup>2</sup> is zero (for example a satisfied inequality observation) its weight is left alone. And noise is never decreased below the user's level - the structural part is added on top of the user's noise realizations.
 
@@ -4481,12 +4487,17 @@ Note also that the number of control variables may change with time. Refer to th
 <tr class="odd">
 <td><em>ies_reinflate_structnoise_frac</em></td>
 <td>list of floats</td>
-<td>The fraction of the irreducible residual variance added to the noise realizations as structural noise, one entry per reinflation, walked like <em>ies_reinflate_factor</em> (last entry held). The residuals are captured at the first reinflation with a non-zero entry. 0.0 turns it off for that reinflation, and entirely if every entry is 0.0. Default is 0.0. Experimental; see section 9.1.17.</td>
+<td>The fraction of the irreducible residual variance added to the noise realizations as structural noise, one entry per reinflation, walked like <em>ies_reinflate_factor</em> (last entry held). The residuals are captured at the first reinflation with a non-zero entry; a negative entry recaptures them at that reinflation and uses the magnitude as the fraction. 0.0 turns it off for that reinflation, and entirely if every entry is 0.0. Default is 0.0. Experimental; see section 9.1.17.</td>
 </tr>
 <tr class="even">
 <td><em>ies_structnoise_deweight</em></td>
 <td>bool</td>
 <td>Also lower each observation weight by its irreducible residual variance at each reinflation where <em>ies_reinflate_structnoise_frac</em> is non-zero, in the weight ensemble and the control file weights. Weights are never increased. Has no effect on the ESMDA solve. Default is false. Experimental; see section 9.1.17.</td>
+</tr>
+<tr class="odd">
+<td><em>ies_structnoise_em</em></td>
+<td>bool</td>
+<td>Build the structural correction on the excess of each observation's captured residual variance over the user's noise variance (taken from the noise realizations, not the weights), max(0, s<sup>2</sup> − σ<sup>2</sup>), instead of the whole residual variance. This is the EM update of the structural noise level; <em>ies_reinflate_structnoise_frac</em> scales it. Default is false. Experimental; see section 9.1.17.</td>
 </tr>
 <tr class="even">
 <td><em>ies_use_phi_lambda_iters</em></td>

@@ -5680,18 +5680,22 @@ void EnsembleMethod::sanity_checks()
         bool any_sn = false;
         for (auto f : ppo->get_ies_reinflate_structnoise_frac())
         {
-            if (f < 0.0)
-                errors.push_back("ies_reinflate_structnoise_frac entry " + to_string(f) + " must be >= 0.0");
-            else if (f > 1.0)
-                warnings.push_back("ies_reinflate_structnoise_frac entry " + to_string(f) + " > 1.0, more structural noise than the residuals carry...user beware!");
-            if (f > 0.0)
+            // a negative entry means recapture the residuals at that reinflation, with abs(f)
+            // as the fraction
+            if (abs(f) > 1.0)
+                warnings.push_back("ies_reinflate_structnoise_frac entry " + to_string(f) + " magnitude > 1.0, more structural noise than the residuals carry...user beware!");
+            if (f != 0.0)
                 any_sn = true;
         }
         bool reinflating = false;
         for (auto n : ppo->get_ies_n_iter_reinflate())
             if (n != 0) reinflating = true;
         if ((any_sn) && (!reinflating))
-            warnings.push_back("ies_reinflate_structnoise_frac > 0 but reinflation is off (ies_n_iter_reinflate = 0), no structural noise will be added");
+            warnings.push_back("ies_reinflate_structnoise_frac nonzero but reinflation is off (ies_n_iter_reinflate = 0), no structural noise will be added");
+        if ((ppo->get_ies_structnoise_em()) && (!any_sn))
+            warnings.push_back("ies_structnoise_em is true but every ies_reinflate_structnoise_frac entry is 0.0, nothing will be done");
+        if ((ppo->get_ies_structnoise_em()) && (any_sn) && (ppo->get_ies_no_noise()))
+            warnings.push_back("ies_structnoise_em with ies_no_noise: the user's noise is zero, so the em excess is the whole residual variance (the same as without em)");
         if ((ppo->get_ies_structnoise_deweight()) && (!any_sn))
             warnings.push_back("ies_structnoise_deweight is true but every ies_reinflate_structnoise_frac entry is 0.0, weights will not be changed");
         if ((any_sn) && (ppo->get_ies_phi_fractions_file().size() > 0))
@@ -9969,7 +9973,7 @@ void EnsembleMethod::reinflate_par_ensemble(double reinflate_factor,int reinflat
     // with structural noise in play, report the ensemble as it stands - the noise and weights
     // it was fitted with - before they are reset, so it can be set against the reinflation
     // phi report after
-    if ((structnoise_frac > 0.0) || (sn_captured))
+    if ((structnoise_frac != 0.0) || (sn_captured))
     {
         ph.update(oe, pe, weights);
         message(0, "phi report before the reinflation noise and weight reset:");
@@ -10014,10 +10018,13 @@ void EnsembleMethod::reinflate_par_ensemble(double reinflate_factor,int reinflat
 /**
  * @brief Add structural noise from the irreducible residuals to the noise realizations.
  *
- * at the first call with frac > 0, the actual residuals of the current ensemble are captured
+ * at the first call with frac != 0, the actual residuals of the current ensemble are captured
  * (observed minus simulated, active nz obs, not centred - the shared part is the bias that
  * should become variance), along with a copy of the user's noise and one column of standard
- * normals per noise realization.  all of that is frozen for the rest of the run.
+ * normals per noise realization.  a positive frac after that reuses what was captured; a
+ * negative frac recaptures the residuals (and draws new coefficients) from the ensemble as it
+ * stands, with abs(frac) as the fraction.  the copy of the user's noise is only ever taken at
+ * the first capture, so the user's noise stays the floor whatever the schedule.
  *
  * every call then rebuilds oe_base from the user's noise:
  *   S       = coef^T R / sqrt(Ne)              (one row per realization, plain combinations)
@@ -10026,22 +10033,26 @@ void EnsembleMethod::reinflate_par_ensemble(double reinflate_factor,int reinflat
  * are zero mean the targets spread symmetrically around the observed values, and since each
  * obs only combines its own residuals the units drop out - no sigma or weight scaling.
  *
- * frac <= 0 before anything was captured does nothing at all (no random numbers are used),
- * so a run with every entry 0 is unchanged.  frac <= 0 after the capture puts the user's
+ * frac == 0 before anything was captured does nothing at all (no random numbers are used),
+ * so a run with every entry 0 is unchanged.  frac == 0 after the capture puts the user's
  * noise back for that cycle.
  */
 void EnsembleMethod::apply_structural_noise(double frac)
 {
-    if ((frac <= 0.0) && (!sn_captured))
+    // a negative frac means recapture the residuals here and use abs(frac) as the fraction
+    bool recapture = (frac < 0.0) && (sn_captured);
+    frac = abs(frac);
+    if ((frac == 0.0) && (!sn_captured))
         return;
     ofstream& frec = file_manager.rec_ofstream();
     vector<string> rnames = oe_base.get_real_names();
     vector<string> vnames = oe_base.get_var_names();
     Eigen::MatrixXd* reals = oe_base.get_eigen_ptr_4_mod();
     int ne;
-    if (!sn_captured)
+    if ((!sn_captured) || (recapture))
     {
-        message(0, "capturing irreducible residuals for structural noise");
+        message(0, recapture ? "recapturing irreducible residuals for structural noise" :
+                               "capturing irreducible residuals for structural noise");
         performance_log->log_event("capturing irreducible residuals for structural noise");
         // get_actual_obs_resid() is simulated minus observed over oe_base's obs (the active
         // nz obs), with satisfied inequality obs at zero.  flip it to observed minus simulated
@@ -10051,10 +10062,16 @@ void EnsembleMethod::apply_structural_noise(double frac)
         if (ne < 2)
             throw_em_error("structural noise: need at least 2 realizations to capture residuals");
         sn_s2 = sn_resid.array().square().colwise().sum().transpose() / static_cast<double>(ne);
-        sn_meas.clear();
-        for (int i = 0; i < rnames.size(); i++)
-            sn_meas[rnames[i]] = reals->row(i).transpose();
-        sn_meas_names = vnames;
+        // the user's noise only at the first capture: at a recapture oe_base already carries
+        // the last structural draws, and the user's noise has to stay the floor
+        if (!sn_captured)
+        {
+            sn_meas.clear();
+            for (int i = 0; i < rnames.size(); i++)
+                sn_meas[rnames[i]] = reals->row(i).transpose();
+            sn_meas_names = vnames;
+        }
+        // new coefficients every capture, since the number of realizations in R can change
         sn_coef.clear();
         for (auto& rname : rnames)
         {
@@ -10066,12 +10083,23 @@ void EnsembleMethod::apply_structural_noise(double frac)
             sn_coef[rname] = c;
         }
         sn_captured = true;
-        frec << "...structural noise: captured residuals of " << ne << " realizations and "
+        frec << "...structural noise: " << (recapture ? "recaptured" : "captured") << " residuals of " << ne << " realizations and "
              << sn_obs_names.size() << " observations" << endl;
         frec << "...structural noise: mean irreducible residual variance over observations: "
              << sn_s2.mean() << ", max: " << sn_s2.maxCoeff() << endl;
         frec << "...structural noise: note the measured phi will jump from here on, since the" << endl;
         frec << "   noisy targets now carry the structural draws as well as the measurement noise" << endl;
+
+        // the variance the correction is built on.  by default the captured residual variance
+        // as is.  with ies_structnoise_em, the em excess over the user's noise:
+        //   var = max(0, s2 - sig2)
+        // where sig2 is the mean square of the user's noise draws for that obs (taken from the
+        // noise realizations, never the weights, so weights and noise stay separate).  the
+        // draws are then scaled per obs so their variance is var instead of s2
+        sn_var = sn_s2;
+        sn_scale.resize(0);
+        if (pest_scenario.get_pestpp_options().get_ies_structnoise_em())
+            set_structural_em_variance();
     }
     ne = sn_resid.rows();
     double sfac = sqrt(max(frac, 0.0) / static_cast<double>(ne));
@@ -10118,6 +10146,8 @@ void EnsembleMethod::apply_structural_noise(double frac)
             nnew++;
         }
         Eigen::RowVectorXd srow = sfac * (cit->second.transpose() * sn_resid);
+        if (sn_scale.size() > 0)
+            srow.array() *= sn_scale.transpose().array();
         for (int j = 0; j < vnames.size(); j++)
             if (r_idx[j] >= 0)
                 (*reals)(i, j) += srow[r_idx[j]];
@@ -10151,13 +10181,84 @@ void EnsembleMethod::apply_structural_noise(double frac)
 }
 
 /**
+ * @brief The em base variance for the structural noise (ies_structnoise_em).
+ *
+ * called at each capture.  for each captured obs, sig2 is the mean square of the user's noise
+ * draws (the copy in sn_meas, minus obsval, base realization left out) and the em m-step for a
+ * level per obs, with the obs's own residual variance as the shape, is
+ *   var = max(0, s2 - sig2)
+ * the excess of the misfit over the user's noise.  sig2 comes from the noise realizations and
+ * not from the weights, so a user whose weights and noise differ on purpose keeps that.  one
+ * capture gives about (1 - p_eff/n) of the true structure; recapturing at each reinflation
+ * (negative entries) is what iterates it toward the em fixed point.
+ */
+void EnsembleMethod::set_structural_em_variance()
+{
+    ofstream& frec = file_manager.rec_ofstream();
+    Observations ctl_obs = pest_scenario.get_ctl_observations();
+    map<string, int> mcol;
+    for (int k = 0; k < sn_meas_names.size(); k++)
+        mcol[sn_meas_names[k]] = k;
+    int nobs = sn_obs_names.size();
+    sn_sig2 = Eigen::VectorXd::Zero(nobs);
+    int nnoise = 0;
+    double d;
+    for (auto& m : sn_meas)
+    {
+        if (m.first == BASE_REAL_NAME)
+            continue;
+        nnoise++;
+        for (int k = 0; k < nobs; k++)
+        {
+            auto it = mcol.find(sn_obs_names[k]);
+            if (it == mcol.end())
+                continue;
+            d = m.second[it->second] - ctl_obs.get_rec(sn_obs_names[k]);
+            sn_sig2[k] += d * d;
+        }
+    }
+    if (nnoise > 0)
+        sn_sig2 /= static_cast<double>(nnoise);
+    sn_var = (sn_s2 - sn_sig2).cwiseMax(0.0);
+    sn_scale.resize(nobs);
+    for (int k = 0; k < nobs; k++)
+        sn_scale[k] = (sn_s2[k] > 0.0) ? sqrt(sn_var[k] / sn_s2[k]) : 0.0;
+
+    // per group: mean s2, mean sig2, mean excess, and how many obs have no excess at all
+    map<string, double> g_s2, g_sig2, g_var;
+    map<string, int> g_n, g_zero;
+    for (int k = 0; k < nobs; k++)
+    {
+        string g = org_obs_info.get_group(sn_obs_names[k]);
+        g_s2[g] += sn_s2[k];
+        g_sig2[g] += sn_sig2[k];
+        g_var[g] += sn_var[k];
+        g_n[g]++;
+        if (sn_var[k] <= 0.0)
+            g_zero[g]++;
+    }
+    message(1, "structural noise: em excess over the user's noise computed from realizations: ", nnoise);
+    frec << "...structural noise em: base variance is max(0, s2 - sig2), sig2 from the user's noise draws" << endl;
+    frec << "      " << setw(20) << left << "group" << right << setw(8) << "nobs" << setw(14) << "mean s2"
+         << setw(14) << "mean sig2" << setw(14) << "mean excess" << setw(10) << "no excess" << endl;
+    for (auto& gn : g_n)
+    {
+        const string& g = gn.first;
+        frec << "      " << setw(20) << left << g << right << setw(8) << gn.second
+             << setw(14) << g_s2[g] / gn.second << setw(14) << g_sig2[g] / gn.second
+             << setw(14) << g_var[g] / gn.second << setw(10) << g_zero[g] << endl;
+    }
+}
+
+/**
  * @brief Lower each obs weight by its irreducible residual variance (ies_structnoise_deweight).
  *
  * called right after reinflation has put the weight ensemble back to weights_base and the
  * control file weights back to org_obs_info, so it always starts from the user's weights and
  * nothing accumulates.  row by row, each realization from its own original weight:
  *   w' = 1 / sqrt( w^-2 + frac * s2 )
- * where s2 is the mean over realizations of the captured R^2 for that obs.  w' <= w always,
+ * where s2 is the mean over realizations of the captured R^2 for that obs (or, with
+ * ies_structnoise_em, its excess over the user's noise, sn_var).  w' <= w always,
  * w' == w where s2 or frac is 0, and zero weights stay zero.  nothing goes to the solver - it
  * just sees an ordinary weight ensemble.  this is the diagonal version: each obs is discounted
  * by its own variance, not along the shapes of the residuals across obs.
@@ -10166,7 +10267,9 @@ void EnsembleMethod::apply_structural_deweight(double frac)
 {
     if (!pest_scenario.get_pestpp_options().get_ies_structnoise_deweight())
         return;
-    if ((!sn_captured) || (frac <= 0.0))
+    // the sign only says whether the residuals were recaptured
+    frac = abs(frac);
+    if ((!sn_captured) || (frac == 0.0))
     {
         if (sn_captured)
             message(1, "structural noise fraction is 0, using the user's weights for this cycle");
@@ -10176,7 +10279,7 @@ void EnsembleMethod::apply_structural_deweight(double frac)
     message(1, "lowering weights by the irreducible residual variance, fraction:", frac);
     map<string, double> s2_map;
     for (int k = 0; k < sn_obs_names.size(); k++)
-        s2_map[sn_obs_names[k]] = sn_s2[k];
+        s2_map[sn_obs_names[k]] = sn_var[k];
 
     // the weight ensemble, row by row from its own originals
     vector<string> wnames = weights.get_var_names();
@@ -10789,6 +10892,16 @@ bool EnsembleMethod::initialize_weights()
 			ss << "unrecognized weights ensemble extension " << obs_ext << ", looking for csv, jcb, jco, or bin";
 			throw_em_error(ss.str());
 		}
+		// same check as the par and noise ensembles get in initialize(): two rows with one
+		// name (e.g. two 'base' realizations) would otherwise go through quietly
+		try
+		{
+			weights.check_for_dups();
+		}
+		catch (const exception& e)
+		{
+			throw_em_error("error in weight ensemble: " + string(e.what()));
+		}
 		//make sure all oe realizations are in weights
 		vector<string> missing, keep, real_names = oe_base.get_real_names();
 		map<string,int> rmap = weights.get_real_map();
@@ -10972,6 +11085,16 @@ void EnsembleMethod::initialize_restart()
 		ss << "unrecognized restart obs ensemble extension " << obs_ext << ", looking for csv, jcb, jco, bin";
 		throw_em_error(ss.str());
 	}
+	// same check as the par and noise ensembles get in initialize(): two rows with one
+	// name (e.g. two 'base' realizations) would otherwise go through quietly
+	try
+	{
+		oe.check_for_dups();
+	}
+	catch (const exception& e)
+	{
+		throw_em_error("error in restart obs ensemble: " + string(e.what()));
+	}
 	if (par_restart_csv.size() > 0)
 	{
 		string par_ext = pest_utils::lower_cp(par_restart_csv).substr(par_restart_csv.size() - 3, par_restart_csv.size());
@@ -11013,6 +11136,16 @@ void EnsembleMethod::initialize_restart()
 		{
 			ss << "unrecognized restart par ensemble extension " << par_ext << ", looking for csv, jcb, jco, or bin";
 			throw_em_error(ss.str());
+		}
+		// same check as the par and noise ensembles get in initialize(): two rows with one
+		// name (e.g. two 'base' realizations) would otherwise go through quietly
+		try
+		{
+			pe.check_for_dups();
+		}
+		catch (const exception& e)
+		{
+			throw_em_error("error in restart par ensemble: " + string(e.what()));
 		}
 		if (pe.shape().first != oe.shape().first)
 		{

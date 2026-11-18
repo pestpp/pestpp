@@ -94,6 +94,10 @@ examples/nb_*/
 examples/structnoise_*/
 examples/dsd26/notebooks/models/
 examples/dsd26/notebooks/__pycache__/
+examples/dsd26/notebooks_enif/models/
+examples/dsd26/notebooks_enif/__pycache__/
+benchmarks/structnoise_stress/runs/
+benchmarks/structnoise_stress_ci/
 pestpp-glm_benchmarks/*/master_user_lambdas/
 
 __pycache__/
