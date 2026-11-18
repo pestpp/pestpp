@@ -1092,7 +1092,7 @@ protected:
     // structural noise from the irreducible residuals (ies_reinflate_structnoise_frac).
     // everything here is captured at the first reinflation with frac != 0 and reused after
     // that, unless an entry is negative, which recaptures R, s2 and the coefficients at that
-    // reinflation (the user asks for it: recapturing from a de-weighted fit can feed back).
+    // reinflation - the user asks for it, since recapturing from a de-weighted fit can feed back.
     // the user's noise (sn_meas) is only taken at the first capture
     bool sn_captured = false;
     // R: actual residuals (observed minus simulated, not centred), rows are the realizations
