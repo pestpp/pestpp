@@ -68,6 +68,8 @@ The PEST++ software suite includes several stand-alone tools for model-independe
 * ``pestpp-mou``: multi-objective optimization under uncertainty using evolutionary algorithms (single objective also!)
 * ``pestpp-da``: model-independent ensemble-based sequential and batch iterative data assimilation with options to use standard Kalman update, multiple data assimilation (MDA), or the GLM algorithm of Chen and Oliver (2013).
 
+* ``pestpp-appl``: a utility run from the forward run script that applies the multiplier files set up by pyemu's ``PstFrom`` to the model input files - a compiled equivalent of ``pyemu.helpers.apply_list_and_array_pars()``. See section 5.6 of the user's manual.
+
 All members of the software suite can be compiled for PC, MAC, or Linux and have several run managers to support parallelization.  Windows users with older OS versions should use the ``iwin`` binaries (starting "i", compiled with intel C++) to avoid the dreaded MSVC missing runtime DLL issue.
 
 <br>

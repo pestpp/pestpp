@@ -638,7 +638,7 @@ class PestppLib:
         lib.pestpp_set_obs_weights.restype = c_int
         lib.pestpp_broadcast_weights.argtypes = (c_void_p,)
         lib.pestpp_broadcast_weights.restype = c_int
-        lib.pestpp_reinflate_ensemble.argtypes = (c_void_p, c_double, c_int, c_int)
+        lib.pestpp_reinflate_ensemble.argtypes = (c_void_p, c_double, c_int, c_int, c_double)
         lib.pestpp_reinflate_ensemble.restype = c_int
         lib.pestpp_update_phi.argtypes = (c_void_p,)
         lib.pestpp_update_phi.restype = c_int
@@ -1671,11 +1671,12 @@ class PestppLib:
                     "pestpp_set_obs_weights")
 
     def reinflate_ensemble(self, factor: float = 1.0, num_reals: int = 0,
-                           center_on_min_phi: int = -1) -> None:
+                           center_on_min_phi: int = -1,
+                           structnoise_frac: float = 0.0) -> None:
         """Rebuild the parameter ensemble from the prior's spread, re-centred on the current."""
         self._check(self.lib.pestpp_reinflate_ensemble(
             self.handle, c_double(float(factor)), c_int(int(num_reals)),
-            c_int(int(center_on_min_phi))),
+            c_int(int(center_on_min_phi)), c_double(float(structnoise_frac))),
             "pestpp_reinflate_ensemble")
 
     def broadcast_weights(self) -> None:

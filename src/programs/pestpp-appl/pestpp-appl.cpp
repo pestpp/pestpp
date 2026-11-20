@@ -1469,7 +1469,10 @@ void usage()
 		 << "  model input files (a compiled equivalent of pyemu.helpers.apply_list_and_array_pars).\n"
 		 << "\n"
 		 << "  --apply_order <value>  only process rows with this 'apply_order' value\n"
-		 << "  --threads <n>          number of threads (default: number of cores)\n"
+		 << "  --threads <n>          number of threads to use (default: 1). this program\n"
+		 << "                         runs inside each model run, often with many agents on one\n"
+		 << "                         machine, so only raise it when the machine has cores to spare\n"
+		 << "  -v, --version          print the version number and stop\n"
 		 << "  --ignore_functions     process the whole table even though it has entries in the\n"
 		 << "                         'pre_apply_function'/'post_apply_function' columns (Python\n"
 		 << "                         code this program cannot run)\n"
@@ -1482,8 +1485,7 @@ int run(int argc, char* argv[])
 	string info_file = "mult2model_info.csv";
 	bool have_order = false, ignore_functions = false, skip_pp = false;
 	double only_order = 0;
-	unsigned nthreads = thread::hardware_concurrency();
-	if (nthreads == 0) nthreads = 1;
+	unsigned nthreads = 1;
 	for (int i = 1; i < argc; ++i)
 	{
 		string a = argv[i];
@@ -1492,7 +1494,7 @@ int run(int argc, char* argv[])
 			return argv[++i];
 		};
 		if (a == "-h" || a == "--help") { usage(); return 0; }
-		else if (a == "--version") { cout << "pestpp-appl: version " << PESTPP_VERSION << endl; return 0; }
+		else if (a == "-v" || a == "--version") { cout << PESTPP_VERSION << endl; return 0; }
 		else if (a == "--apply_order") { only_order = cell_number(value(), "--apply_order"); have_order = true; }
 		else if (a == "--threads") { nthreads = (unsigned)max(1.0, cell_number(value(), "--threads")); }
 		else if (a == "--ignore_functions") ignore_functions = true;
@@ -1571,7 +1573,9 @@ int run(int argc, char* argv[])
 		// pilot points first: they produce multiplier arrays that the array files below read
 		if (!skip_pp && info.has("pp_file"))
 		{
-			set<PilotPointTask> task_set;
+			// one task per multiplier file, so no two threads ever write the same file; rows that
+			// name the same file must agree on everything that goes into it
+			map<string, PilotPointTask> task_by_file;
 			for (size_t r = 0; r < info.rows.size(); ++r)
 			{
 				if (order_of(r) != order || info.get(r, "pp_file").empty() || !info.get(r, "index_cols").empty()) continue;
@@ -1583,9 +1587,14 @@ int run(int argc, char* argv[])
 				if (!info.get(r, "pp_fill_value").empty()) t.fill = cell_number(info.get(r, "pp_fill_value"), "pp_fill_value");
 				if (!info.get(r, "pp_lower_limit").empty()) t.lower = cell_number(info.get(r, "pp_lower_limit"), "pp_lower_limit");
 				if (!info.get(r, "pp_upper_limit").empty()) t.upper = cell_number(info.get(r, "pp_upper_limit"), "pp_upper_limit");
-				task_set.insert(t);
+				auto it = task_by_file.find(t.out_file);
+				if (it == task_by_file.end()) task_by_file[t.out_file] = t;
+				else if (it->second < t || t < it->second)
+					errors.push_back("rows write the pilot point multiplier file '" + t.out_file + "' with different pp_file, fac_file, pp_fill_value, pp_lower_limit or pp_upper_limit entries");
 			}
-			vector<PilotPointTask> tasks(task_set.begin(), task_set.end());
+			if (!errors.empty()) break;
+			vector<PilotPointTask> tasks;
+			for (auto& kv : task_by_file) tasks.push_back(kv.second);
 			run_parallel(tasks.size(), nthreads, errors, [&](size_t i) {
 				try { run_pilot_point_task(tasks[i]); }
 				catch (const exception& ex) { fail("pilot point multiplier file '" + tasks[i].out_file + "': " + ex.what()); }

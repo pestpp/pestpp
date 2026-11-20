@@ -202,6 +202,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         - [5.4.1 Failed Run Storage File](#s9-4-1)
         - [5.4.2 All Runs Storage File](#s9-4-2)
     - [5.5 PEST++ API](#s9-4-3)
+    - [5.6 PESTPP-APPL](#s9-4-4)
 - [6. PESTPP-GLM](#s10)
     - [6.1 Introduction](#s10-1)
     - [6.2 Highly Parameterized Inversion](#s10-1b)
@@ -2651,7 +2652,7 @@ The name of a file in an agent's working directory. The last few characters of t
 
 When several agents run on more than one machine, a single bad host - a failing disk, a missing model executable, a misconfigured environment - can consume a large share of a run batch. Each of its agents accepts work, fails it, and accepts more. Because the failures are spread across several agents, they can look like unrelated one-off problems rather than one machine at fault.
 
-This check is off by default. When it is switched on by giving `panther_agent_max_failed_run_delta` a value above 0, PEST++ keeps, for each host, the number of runs it has finished or failed and the number that failed, summed across every agent on that host, and compares each host's failure rate with the failure rate of the other hosts still in service:
+This check is off by default (earlier versions switched it on with a value of 3). When it is switched on by giving `panther_agent_max_failed_run_delta` a value above 0, PEST++ keeps, for each host, the number of runs it has finished or failed and the number that failed, summed across every agent on that host, and compares each host's failure rate with the failure rate of the other hosts still in service:
 
 > expected failures = (runs on host) &times; (failures on other hosts) &divide; (runs on other hosts)
 
@@ -2696,6 +2697,24 @@ As well as the executables described above, the PEST++ suite can now be built as
 Using the shared library affords control over the loop the executables run internally, including initialization, solving algorithms, and run management. A caller program using the API can evaluate the initial ensemble, examine it, change it, and carry on; can take one iteration at a time, changing observation weights or algorithmic variables between iterations; and can take ownership of every batch of model runs, so no model run happens inside a library call that the caller did not ask for.  Users can change a number of PEST++ settings at runtime if desired.
 
 The API is at an early stage and is not yet published as a package on PyPI. See python/README.md in the release bundle for installation and a description of both layers, and the notebooks in examples for worked cases.
+
+## <a id='s9-4-4' />5.6 PESTPP-APPL
+
+PESTPP-APPL is a small utility for models set up with pyemu's *PstFrom* class. *PstFrom* writes a table, *mult2model_info.csv*, listing for each model input file the saved original file, the multiplier (or addend) files to apply to it and how to apply them; at model run time the forward run script normally calls *pyemu.helpers.apply_list_and_array_pars()* to read that table and write the model input files. PESTPP-APPL does the same job as a compiled program, which is quicker for large models. It is run from the model's forward run script, once per model run, in the agent's working folder:
+
+pestpp-appl [mult2model_info.csv] [--apply_order *value*] [--threads *n*] [--ignore_functions] [--skip_pilot_points]
+
+It handles array files (rows with an empty *index_cols* entry) and list files (rows with an *index_cols* entry), applies each row's operator, enforces the ultimate bounds, and makes pilot point multiplier arrays from text factor files (rows with a *pp_file* entry), as *pyemu.geostats.fac2real()* does. Rows that write the same pilot point multiplier file must agree on its pilot point file, factor file, fill value and limits, or PESTPP-APPL stops with an error.
+
+The command line arguments are:
+
+- *--apply_order value*: process only the rows with this *apply_order* value.
+- *--threads n*: the number of threads to use. The default is 1. Because PESTPP-APPL runs inside each model run, often with many agents on one machine, raise this only where the machine has cores to spare.
+- *--ignore_functions*: process the whole table even though it has entries in the *pre_apply_function* or *post_apply_function* columns. Those entries are Python code, which PESTPP-APPL cannot run.
+- *--skip_pilot_points*: do not make the pilot point multiplier arrays; the forward run script has already written them.
+- *-v* or *--version*: print the version number and stop.
+
+PESTPP-APPL does not run the Python in the *pre_apply_function* and *post_apply_function* columns, and does not read the binary factor files written by pypestutils. Where a table has either, the forward run script does that part itself, runs PESTPP-APPL once for each *apply_order* value in turn (with *--apply_order*), and uses *--skip_pilot_points* if it made the pilot point arrays itself. PESTPP-APPL stops with an error message and a non-zero exit code if anything is wrong, so a failed application shows up as a failed model run.
 
 # <a id='s10' />6. PESTPP-GLM
 
@@ -3853,6 +3872,8 @@ w' = 1 / sqrt( w<sup>-2</sup> + frac × s<sup>2</sup> )
 
 where s<sup>2</sup> is the mean over realizations of the squared captured residuals for that observation. This is applied to every row of the weight ensemble from that row's own original weights, and to the control file weights, starting from the user's weights every time so nothing accumulates. It is what removes most of the parameter bias. The adjusted weight ensemble and observation data are saved as *case.N.adjusted.weights.csv* and *case.N.adjusted.obs_data.csv*, and the run record carries a per-group summary of the ratio of adjusted to original weights.
 
+At each reinflation where structural noise is in play, PESTPP-IES saves the rebuilt noise realizations (the user's noise plus the structural draws) as *case.N.obs+noise.csv*, where N is the iteration of the reinflation (*.jcb* or *.bin* if *save_binary* or *save_dense* is used). This can be set against *case.obs+noise.csv*, which holds the user's noise realizations, to see what the structural draws added. The run record also carries an extra phi report at each such reinflation, headed "phi report before the reinflation noise and weight reset": it is the ensemble as it stands, scored with the noise and weights it was fitted with, and can be compared with the "reinflation phi report" that follows, which is scored with the rebuilt noise and the adjusted weights.
+
 By default the structural correction is built on the whole captured residual variance s<sup>2</sup>. Because the actual residuals are measured against the observed values, that variance also holds the measurement error in those values, which the user's noise already accounts for. *ies_structnoise_em(true)* builds the correction instead on the excess of the residual variance over the user's noise:
 
 excess = max( 0, s<sup>2</sup> − σ<sup>2</sup> )
@@ -4114,6 +4135,9 @@ As always, it is assumed that the filename base of the PEST control file on whic
 | *case.N.par.csv/jcb*              | Values of all parameters in all realizations comprising an ensemble. For N=0, this is the initial ensemble, sampled from the prior parameter probability distribution. Otherwise, it is the parameter realizations at the end of iteration N                                                                                                                                                                                                                   |
 | *case.N.obs.csv/jcb*              | The ensemble of model outputs values which correspond to observations listed in the “observation data” section of the PEST control file. These are calculated using all realizations comprising the parameter ensemble.                                                                                                                                                                                                                                        |
 | *case.obs+noise.csv/jcb*          | Base observation values. These are calculated by generating realizations of measurement noise and adding this noise to measured values listed in the “observation data” section of the PEST control file.                                                                                                                                                                                                                                                      |
+| *case.N.obs+noise.csv/jcb*        | Written at each reinflation where structural noise is in play (section 9.1.17): the noise realizations rebuilt with the structural draws added, for iteration N. Compare with *case.obs+noise.csv*. |
+| *case.N.adjusted.weights.csv*     | Written at each reinflation with *ies_structnoise_deweight(true)* (section 9.1.17): the weight ensemble after the structural de-weighting, for iteration N. |
+| *case.N.adjusted.obs_data.csv*    | Written with *case.N.adjusted.weights.csv*: the observation data with the de-weighted control file weights, for iteration N. |
 | *case.N.L.lambda.F.scale.csv/jcb* | These files are produced if the *ies_save_lambda_ensembles()* control variable is set to *true*. They record parameter values used in testing the effects of different Marquardt lambdas and line search factors. *L* is the value of the Marquardt lambda; *F* is the value of the line search factor.                                                                                                                                                            |
 | *case.phi.actual.csv*             | Objective functions calculated during all iterations of the ensemble smoother process for all members of the ensemble. Objective functions are computed from differences between model outputs and measurements recorded in the “observation data” section of the PEST control file using weights that are also provided in this section.                                                                                                                      |
 | *case.phi.group.csv*              | Objective function components pertaining to different observation groups calculated for all iterations of the ensemble smoother process. Progression of the regularization objective function is also recorded; this measures discrepancies between current and initial parameter values. Contributions by different parameter groups to the regularization objective function are also listed.                                                                |
@@ -4487,7 +4511,7 @@ Note also that the number of control variables may change with time. Refer to th
 <tr class="odd">
 <td><em>ies_reinflate_structnoise_frac</em></td>
 <td>list of floats</td>
-<td>The fraction of the irreducible residual variance added to the noise realizations as structural noise, one entry per reinflation, walked like <em>ies_reinflate_factor</em> (last entry held). The residuals are captured at the first reinflation with a non-zero entry; a negative entry recaptures them at that reinflation and uses the magnitude as the fraction. 0.0 turns it off for that reinflation, and entirely if every entry is 0.0. Default is 0.0. Experimental; see section 9.1.17.</td>
+<td>The fraction of the irreducible residual variance added to the noise realizations as structural noise, one entry per reinflation, walked like <em>ies_reinflate_factor</em> (last entry held). The residuals are captured at the first reinflation with a non-zero entry; a negative entry recaptures them at that reinflation and uses the magnitude as the fraction. 0.0 turns it off for that reinflation, and entirely if every entry is 0.0. Default is 0.0. PESTPP-IES only: PESTPP-DA reads it but does not use it. Experimental; see section 9.1.17.</td>
 </tr>
 <tr class="even">
 <td><em>ies_structnoise_deweight</em></td>

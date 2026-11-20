@@ -969,7 +969,7 @@ public:
 	/// one reinflation at a time has no way to express - hence the argument.
     ///
     /// structnoise_frac is this reinflation's ies_reinflate_structnoise_frac entry.  0 (the
-    /// default, and what the api passes) leaves the noise alone unless the residuals were
+    /// default) leaves the noise alone unless the residuals were
     /// already captured, in which case it puts the user's noise back for this cycle.  negative
     /// recaptures the residuals at this reinflation and uses the magnitude as the fraction
     void reinflate_par_ensemble(double reinflate_factor,int reinflate_num_reals,

@@ -1,6 +1,39 @@
 {
+    "version": "0.2.0",
     "configurations": [
         {
+            // Debugs whichever program is picked as the CMake "launch target"
+            // (status bar, or Cmd+Shift+P > "CMake: Set Launch/Debug Target").
+            // Builds it first, then asks for the folder and control file.
+            "name": "Debug PEST++ (CMake launch target)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${command:cmake.launchTargetPath}",
+            "args": ["${input:pstFile}"],
+            "cwd": "${input:runDir}",
+            "preLaunchTask": "CMake: build launch target",
+            "stopOnEntry": false
+        },
+        {
+            // Same, but always pestpp-ies; no target picking needed.
+            "name": "Debug pestpp-ies",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build_vscode/src/programs/pestpp-ies/pestpp-ies",
+            "args": ["${input:pstFile}"],
+            "cwd": "${input:runDir}",
+            "preLaunchTask": "CMake: build all",
+            "stopOnEntry": false
+        },
+        {
+            // Attach to an already-running pestpp process (e.g. a worker).
+            "name": "Attach to running pestpp",
+            "type": "lldb",
+            "request": "attach",
+            "pid": "${command:pickMyProcess}"
+        },
+        {
+            // Original placeholder config, kept as it was.
             "name": "C/C++: clang build and debug active file",
             "type": "cppdbg",
             "request": "launch",
@@ -14,5 +47,18 @@
             "preLaunchTask": "C/C++: clang build active file"
         }
     ],
-    "version": "2.0.0"
+    "inputs": [
+        {
+            "id": "runDir",
+            "type": "promptString",
+            "description": "Folder to run in (holds the .pst and model files)",
+            "default": "${workspaceFolder}/benchmarks/ies_10par_xsec/master_pestpp-ies"
+        },
+        {
+            "id": "pstFile",
+            "type": "promptString",
+            "description": "Control file name (inside that folder)",
+            "default": "pest.pst"
+        }
+    ]
 }

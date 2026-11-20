@@ -23,6 +23,7 @@
 #include <iostream>
 #include <cstdio>
 #include <cstddef>
+#include <cmath>
 #if defined(_WIN32)
 // Deliberately no descriptor macros here. The windows redirect swaps cout's streambuf and must
 // never call _dup2/_close on fd 1: under the static CRT this library has a private descriptor
@@ -3366,7 +3367,7 @@ pestpp_status pestpp_set_obs_weights(pestpp_handle h, const char* names,
 }
 
 pestpp_status pestpp_reinflate_ensemble(pestpp_handle h, double factor, int num_reals,
-                                        int center_on_min_phi)
+                                        int center_on_min_phi, double structnoise_frac)
 {
     CAPI_BEGIN(h)
         EnsembleMethod* em = s->adapter->ensemble_method();
@@ -3400,7 +3401,9 @@ pestpp_status pestpp_reinflate_ensemble(pestpp_handle h, double factor, int num_
         if ((center_on_min_phi < -1) || (center_on_min_phi > 1))
             bad_arg("center_on_min_phi must be -1 (follow 'ies_n_iter_reinflate'), 0 (the "
                     "ensemble mean) or 1 (the minimum-phi realization)");
-        em->reinflate_par_ensemble(factor, num_reals, center_on_min_phi);
+        if (!std::isfinite(structnoise_frac))
+            bad_arg("structnoise_frac must be a finite number");
+        em->reinflate_par_ensemble(factor, num_reals, center_on_min_phi, structnoise_frac);
         return PESTPP_OK;
     CAPI_END()
 }

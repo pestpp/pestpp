@@ -581,10 +581,19 @@ PESTPP_API pestpp_status pestpp_broadcast_weights(pestpp_handle h);
  *               what the new spread is centred on. -1 follows 'ies_n_iter_reinflate' the way
  *               the built-in loop does (a negative entry there means min-phi), 0 forces the
  *               ensemble mean, 1 forces the minimum-phi realization - the aggressive form.
+ *   structnoise_frac
+ *               this reinflation's 'ies_reinflate_structnoise_frac' entry - the same value
+ *               the built-in loop passes for each reinflation. 0 adds no structural noise (and
+ *               puts the user's noise back if the residuals were captured at an earlier
+ *               reinflation); positive captures the residuals at the first nonzero call and
+ *               adds that fraction of them as structural noise; negative recaptures the
+ *               residuals now and uses the magnitude. 'ies_structnoise_deweight' and
+ *               'ies_structnoise_em' apply as they do in the built-in loop.
  *
  * ies and da only. */
 PESTPP_API pestpp_status pestpp_reinflate_ensemble(pestpp_handle h, double factor,
-                                                   int num_reals, int center_on_min_phi);
+                                                   int num_reals, int center_on_min_phi,
+                                                   double structnoise_frac);
 
 /* Recompute phi from the current ensembles and weights.
  *
@@ -965,8 +974,11 @@ PESTPP_API pestpp_status pestpp_set_run_failed(pestpp_handle h, int run_id);
  * NULL) says which is which. `nobs` is the count. with obs=NULL nothing is run - that is the
  * sizing call, and obs_names can be filled on it too.
  *
- * a model that fails, or an instruction file that cannot find what it is looking for, returns
- * PESTPP_ERROR and pestpp_last_error() has the message. */
+ * a run fails - PESTPP_ERROR, with the message in pestpp_last_error() - when the model command
+ * cannot be started, an output file is missing, or an instruction file cannot find what it is
+ * looking for. the model's exit code is NOT checked, the same as in the tools' run managers: a
+ * model that exits with an error but leaves readable outputs is not caught. the output files
+ * are deleted before each run, so a run that writes nothing never returns the last run's values. */
 PESTPP_API pestpp_status pestpp_run_model(pestpp_handle h,
                                           const double* pars, int npars, const char* par_names,
                                           double* obs, int max_nobs,

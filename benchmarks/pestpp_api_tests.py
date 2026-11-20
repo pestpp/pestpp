@@ -967,6 +967,36 @@ def api_reinflate_grows_after_activation_test():
         ies.finalize()
 
 
+def api_reinflate_structnoise_test():
+    """structural noise reaches an explicit reinflation, the same as the built-in loop.
+
+    pestpp_reinflate_ensemble used to call the reinflation without the structural noise
+    fraction, so it was always 0: an api user who set ies_reinflate_structnoise_frac and
+    reinflated got no structural noise and no warning. the fraction is now an argument,
+    passed the way the loop passes each reinflation's entry.
+    """
+    wd = _case("api_reinflate_structnoise", noptmax=3, num_reals=10)
+    with Ies.from_pst("pest.pst", workdir=wd) as ies:
+        ies.initialize()
+        ies.solve()
+        before = ies.noise_df(lower=True)
+        nz = [n.lower() for n in pyemu.Pst(os.path.join(wd, "pest.pst")).nnz_obs_names]
+
+        # 0 with nothing captured yet leaves the user's noise alone
+        ies.reinflate(factor=1.0, structnoise_frac=0.0)
+        same = ies.noise_df(lower=True)
+        assert np.allclose(same.loc[before.index, nz].values, before[nz].values), \
+            "a reinflation with structnoise_frac 0 changed the noise realizations"
+
+        # a nonzero fraction adds the structural draws to the noise
+        ies.reinflate(factor=1.0, structnoise_frac=1.0)
+        after = ies.noise_df(lower=True)
+        diff = np.abs(after.loc[before.index, nz].values - before[nz].values).max()
+        assert diff > 0.0, "a reinflation with structnoise_frac 1.0 left the noise unchanged"
+        ies.solve()
+        ies.finalize()
+
+
 def api_option_values_are_native_types_test():
     """Options take python values, not control-file spellings - lists especially.
 
@@ -3221,7 +3251,10 @@ def api_model_run_test():
 
     # a model that fails is an error with a reason, not a row of garbage - both a command that
     # runs and fails, and one that cannot be started at all. the second used to clone this
-    # process: the forked child threw when exec failed and carried on running the caller
+    # process: the forked child threw when exec failed and carried on running the caller.
+    # a clone would also raise PestppError and land here, so the error alone proves nothing:
+    # a clone leaves a marker file before it exits, and the parent (which waits for the child
+    # to exit before run() returns) checks the marker is not there
     for label, cmd in (("fails", "mfnwt not_a_real.nam"),
                        ("missing", "not_a_real_model_command")):
         d3 = _case("api_model_fail_" + label, noptmax=1, num_reals=5)
@@ -3231,6 +3264,8 @@ def api_model_run_test():
         if os.path.exists(os.path.join(d3, "10par_xsec.hds")):
             os.remove(os.path.join(d3, "10par_xsec.hds"))
         me = os.getpid()
+        if os.path.exists(os.path.join(d3, "forked_clone.marker")):
+            os.remove(os.path.join(d3, "forked_clone.marker"))
         with Model.from_pst("pest.pst", workdir=d3) as m:
             try:
                 m.run()
@@ -3238,8 +3273,13 @@ def api_model_run_test():
                 pass
             else:
                 raise AssertionError("a model that never ran returned results ({0})".format(label))
+        marker = os.path.abspath(os.path.join(d3, "forked_clone.marker"))
         if os.getpid() != me:
-            os._exit(1)        # a clone of this process - get out before it runs anything else
+            with open(marker, "w") as f:   # a clone of this process - say so, then get out
+                f.write(str(os.getpid()))
+            os._exit(1)
+        assert not os.path.exists(marker), \
+            "a failed model start ({0}) cloned the calling process".format(label)
 
     # panther makes no sense for a run in this process
     try:

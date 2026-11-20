@@ -821,7 +821,8 @@ class _Tool:
             self.update_phi()
 
     def reinflate(self, factor: float = 1.0, num_reals: int = 0,
-                  center_on_min_phi: bool | None = None) -> None:
+                  center_on_min_phi: bool | None = None,
+                  structnoise_frac: float = 0.0) -> None:
         """Rebuild the parameter ensemble from the PRIOR's spread, re-centred on the current one.
 
         A smoother narrows the ensemble every iteration. After a few, the realizations can
@@ -856,11 +857,17 @@ class _Tool:
         ``ies_n_iter_reinflate`` the way the built-in loop does, ``False`` forces the ensemble
         mean, ``True`` forces the minimum-phi realization - the aggressive form.
 
+        ``structnoise_frac`` is this reinflation's ``ies_reinflate_structnoise_frac`` entry,
+        the value the built-in loop passes for each reinflation: 0 adds no structural noise,
+        positive adds that fraction of the captured residuals, negative recaptures the
+        residuals now and uses the magnitude. ``ies_structnoise_deweight`` and
+        ``ies_structnoise_em`` apply as they do in the built-in loop.
+
         This RUNS the reinflated ensemble, so it costs ``num_reals`` model runs.
         """
         center = -1 if center_on_min_phi is None else int(bool(center_on_min_phi))
         with self._q():
-            self._lib.reinflate_ensemble(factor, num_reals, center)
+            self._lib.reinflate_ensemble(factor, num_reals, center, structnoise_frac)
 
     def update_phi(self) -> None:
         """Recompute phi from the current ensembles and weights.

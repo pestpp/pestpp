@@ -84,6 +84,24 @@
                 "clear": true
             }
         },
-
+        {
+            // build everything in build_vscode (debug); runs cmake directly,
+            // so it works even before the CMake extension has picked a kit
+            "label": "CMake: build all",
+            "type": "shell",
+            "command": "/Users/jwhite/miniforge3/bin/cmake",
+            "args": ["--build", "${workspaceFolder}/build_vscode"],
+            "group": "build",
+            "problemMatcher": "$gcc"
+        },
+        {
+            // build only the target currently picked as the launch target
+            "label": "CMake: build launch target",
+            "type": "shell",
+            "command": "/Users/jwhite/miniforge3/bin/cmake",
+            "args": ["--build", "${workspaceFolder}/build_vscode", "--target", "${command:cmake.launchTargetName}"],
+            "group": "build",
+            "problemMatcher": "$gcc"
+        }
     ]
 }
