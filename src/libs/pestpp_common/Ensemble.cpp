@@ -767,9 +767,8 @@ void Ensemble::fill_moment_maps(map<string, double>& mean_map, map<string, doubl
  */
 void Ensemble::replace_col(string var_name, Eigen::VectorXd& vec, bool update_map)
 {
-	if (update_map)
-		update_var_map();
-	if (var_map.find(var_name) == var_map.end())
+	int icol = var_names.find(var_name);
+	if (icol < 0)
 		throw_ensemble_error("replace_col(): var_name not found: " + var_name);
 	if (vec.size() != reals.rows())
 	{
@@ -777,7 +776,7 @@ void Ensemble::replace_col(string var_name, Eigen::VectorXd& vec, bool update_ma
 		ss << "replace_col(): vec of length " << vec.size() << " not aligned with reals first dimen " << reals.rows();
 		throw_ensemble_error(ss.str());
 	}
-	reals.col(var_map[var_name]) = vec;
+	reals.col(icol) = vec;
 }
 
 //Ensemble Ensemble::get_mean()
@@ -974,7 +973,7 @@ void Ensemble::keep_rows(const vector<string> &keep_names)
  *
  * @return Description.
  */
-Eigen::MatrixXd Ensemble::get_eigen(vector<string> row_names, vector<string> col_names, bool update_vmap)
+Eigen::MatrixXd Ensemble::get_eigen(const vector<string>& row_names, const vector<string>& col_names, bool update_vmap)
 {
 	//get a dense eigen matrix from reals by row and col names
 	vector<string> missing_rows,missing_cols;
@@ -1005,21 +1004,52 @@ Eigen::MatrixXd Ensemble::get_eigen(vector<string> row_names, vector<string> col
 	}
 	if (col_names.size() > 0)
 	{
-		//map<string, int> var_map;
-		//for (int i = 0; i < var_names.size(); i++)
-		//	var_map[var_names[i]] = i;
-		if (update_vmap)
-			update_var_map();
-
-		//set<string> var_set(var_names.begin(), var_names.end());
-		map<string,int>::iterator end = var_map.end();
-		for (auto& name : col_names)
+		//when only a few columns are wanted from a lot of names (like the weighted obs out of
+		//millions of obs) and the name lookup hasn't been built, scan the names once against
+		//a small lookup of the wanted columns instead of building the big one.
+		//update_vmap is kept for callers but doesn't change anything now.
+		if ((!var_names.has_lookup()) && (col_names.size() * 4 < var_names.size()))
 		{
-			auto it = var_map.find(name);
-			if (it == end)
-				missing.push_back(name);
-			else
-				col_idxs.push_back(it->second);
+			std::unordered_map<std::string_view, int> want;
+			want.reserve(col_names.size());
+			for (int j = 0; j < col_names.size(); j++)
+				want.emplace(std::string_view(col_names[j]), j);
+			vector<int> found(col_names.size(), -1);
+			int ivar = 0;
+			for (auto& name : var_names)
+			{
+				auto it = want.find(std::string_view(name));
+				//first one wins if a name is in there twice
+				if ((it != want.end()) && (found[it->second] < 0))
+					found[it->second] = ivar;
+				ivar++;
+			}
+			for (int j = 0; j < col_names.size(); j++)
+			{
+				int icol = found[j];
+				//a name asked for twice only went in the small lookup once
+				if (icol < 0)
+				{
+					auto it = want.find(std::string_view(col_names[j]));
+					if (it != want.end())
+						icol = found[it->second];
+				}
+				if (icol < 0)
+					missing.push_back(col_names[j]);
+				else
+					col_idxs.push_back(icol);
+			}
+		}
+		else
+		{
+			for (auto& name : col_names)
+			{
+				int icol = var_names.find(name);
+				if (icol < 0)
+					missing.push_back(name);
+				else
+					col_idxs.push_back(icol);
+			}
 		}
 		if (missing.size() > 0)
 			throw_ensemble_error("Ensemble.get_eigen() error: the following variable names were not found:", missing);
@@ -1232,11 +1262,10 @@ Eigen::VectorXd Ensemble::get_real_vector(int ireal)
  */
 Eigen::VectorXd Ensemble::get_var_vector(const string& var_name)
 {
-	update_var_map();
-	auto vm_it = var_map.find(var_name);
-	if (vm_it == var_map.end())
+	int icol = var_names.find(var_name);
+	if (icol < 0)
 		throw_ensemble_error("Ensemble::get_var_vector(): var_name not found: " + var_name);
-	return reals.col(vm_it->second);
+	return reals.col(icol);
 
 }
 
@@ -1318,16 +1347,69 @@ void Ensemble::update_real_ip(const string & rname, Eigen::VectorXd & real)
  */
 void Ensemble::update_var_map()
 {
-	var_map.clear();
-	
-	//for (int i = 0; i < var_names.size(); i++)
-	int i = 0;
-	for (auto& name : var_names)
+	//the lookup lives with the (shared) names and always matches them, so this just makes
+	//sure it has been built
+	var_names.build_lookup();
+}
+
+vector<string>& SharedNames::mut()
+{
+	if (p.use_count() > 1)
+		p = std::make_shared<Data>(p->names);
+	else
+		p->lookup.reset();
+	return p->names;
+}
+
+const std::unordered_map<std::string_view, int>& SharedNames::get_lookup() const
+{
+	std::lock_guard<std::mutex> g(p->lookup_lock);
+	if (!p->lookup)
 	{
-		//var_map[var_names[i]] = i;
-		var_map.insert(make_pair(name, i));
+		auto lu = std::make_unique<std::unordered_map<std::string_view, int>>();
+		lu->reserve(p->names.size());
+		int i = 0;
+		for (auto& name : p->names)
+		{
+			//first one wins if a name is in there twice, same as the old map insert()
+			lu->emplace(std::string_view(name), i);
+			i++;
+		}
+		p->lookup = std::move(lu);
+	}
+	return *p->lookup;
+}
+
+bool SharedNames::has_lookup() const
+{
+	std::lock_guard<std::mutex> g(p->lookup_lock);
+	return p->lookup != nullptr;
+}
+
+void SharedNames::build_lookup() const
+{
+	get_lookup();
+}
+
+int SharedNames::find(const string& name) const
+{
+	const auto& lu = get_lookup();
+	auto it = lu.find(std::string_view(name));
+	if (it == lu.end())
+		return -1;
+	return it->second;
+}
+
+map<string, int> SharedNames::to_map() const
+{
+	map<string, int> m;
+	int i = 0;
+	for (auto& name : p->names)
+	{
+		m.insert(make_pair(name, i));
 		i++;
 	}
+	return m;
 }
 
 /**
@@ -1974,7 +2056,7 @@ map<string, int> Ensemble::from_binary(string file_name, vector<string> &names, 
 	var_names.clear();
 	real_names.clear();
 	reals.resize(0, 0);
-	bool is_new_format = pest_utils::read_binary(file_name, real_names, var_names, reals);
+	bool is_new_format = pest_utils::read_binary(file_name, real_names, var_names.mut(), reals);
 	if ((!is_new_format) && (transposed))
 	{
 		vector<string> temp = real_names;
@@ -2039,7 +2121,7 @@ map<string,int> Ensemble::from_binary_old(string file_name, vector<string> &name
 		in.seekg(n_nonzero*(sizeof(double) + sizeof(int) + sizeof(int)), ios_base::cur);
 
 		//read col names
-		vector<string>* col_names = &var_names;
+		vector<string>* col_names = &var_names.mut();
 		vector<string>* row_names = &real_names;
 		
 
@@ -2112,12 +2194,12 @@ map<string,int> Ensemble::from_binary_old(string file_name, vector<string> &name
 		in.seekg(n_nonzero*(sizeof(double) + sizeof(int)), ios_base::cur);
 
 		//read col names
-		vector<string>* col_names = &var_names;
+		vector<string>* col_names = &var_names.mut();
 		vector<string>* row_names = &real_names;
 		if (transposed)
 		{
 			col_names = &real_names;
-			row_names = &var_names;
+			row_names = &var_names.mut();
 		}
 
 		for (int i_rec = 0; i_rec < n_col; ++i_rec)
@@ -3588,7 +3670,7 @@ void ParameterEnsemble::to_binary_unordered(string file_name)
 		for (auto& tname : t_names)
 		{
 			n = irow + 1 + (jcol * n_real);
-			data = t[var_map[tied_items.at(tname).first]] * tied_items.at(tname).second;
+			data = t[var_names.find(tied_items.at(tname).first)] * tied_items.at(tname).second;
 			n = irow;
 			fout.write((char*)&(n), sizeof(n));
 			n = jcol;
@@ -4066,7 +4148,7 @@ void ParameterEnsemble::to_dense_unordered(string file_name)
 
 		for (auto& tname : t_names)
 		{
-			data = t[var_map[tied_items.at(tname).first]] * tied_items.at(tname).second;
+			data = t[var_names.find(tied_items.at(tname).first)] * tied_items.at(tname).second;
 			fout.write((char*)&(data), sizeof(data));
 			jcol++;
 		}
@@ -5019,20 +5101,17 @@ void ObservationEnsemble::from_binary(string file_name)
     }
 	if (var_names.size() < names.size())
 	{
-		update_var_map();
-		map<string, int>::iterator end = var_map.end();
 		Eigen::MatrixXd full(reals.rows(), names.size());
 		full.setZero();
-		string name;
+		int icol;
 		for (int j = 0; j < names.size(); j++)
 		{
-			name = names[j];
-			if (var_map.find(name) != end)
-				full.col(j) = reals.col(var_map.at(name));
+			icol = var_names.find(names[j]);
+			if (icol >= 0)
+				full.col(j) = reals.col(icol);
 		}
 		var_names = names;
 		reals = full;
-		update_var_map();
 	}
 }
 

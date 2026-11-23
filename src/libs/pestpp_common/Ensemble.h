@@ -2,6 +2,9 @@
 #define ENSEMBLE_H_
 
 #include <map>
+#include <memory>
+#include <string_view>
+#include <unordered_map>
 #include <random>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
@@ -56,6 +59,71 @@ struct EnsembleViewGuard
 	}
 };
 
+/**
+ * @brief The variable (column) names of an ensemble, shared between copies.
+ *
+ * with millions of observations the name list (and the name->column lookup built from it)
+ * is much bigger than the numbers in a small ensemble like a lambda-test ensemble. copying
+ * an ensemble used to copy both. now copies point at the same names and the same lookup,
+ * and an ensemble only gets its own copy when its names are changed (through mut(),
+ * assignment, clear() or push_back()).
+ *
+ * the lookup is built the first time something asks for it and always matches the names -
+ * there is no way for it to go stale. its keys point into the names, so the names in a
+ * shared list are never changed in place once the lookup exists.
+ */
+class SharedNames
+{
+public:
+	SharedNames() : p(std::make_shared<Data>()) {}
+	SharedNames(const vector<string>& v) : p(std::make_shared<Data>(v)) {}
+	SharedNames(vector<string>&& v) : p(std::make_shared<Data>(std::move(v))) {}
+	// copies (and moves, which fall back to these) share the names. a move must not leave
+	// the old ensemble with no names at all
+	SharedNames(const SharedNames&) = default;
+	SharedNames& operator=(const SharedNames&) = default;
+	SharedNames& operator=(const vector<string>& v) { p = std::make_shared<Data>(v); return *this; }
+	SharedNames& operator=(vector<string>&& v) { p = std::make_shared<Data>(std::move(v)); return *this; }
+
+	operator const vector<string>&() const { return p->names; }
+	const vector<string>& get() const { return p->names; }
+	size_t size() const { return p->names.size(); }
+	bool empty() const { return p->names.empty(); }
+	const string& operator[](size_t i) const { return p->names[i]; }
+	const string& at(size_t i) const { return p->names.at(i); }
+	vector<string>::const_iterator begin() const { return p->names.begin(); }
+	vector<string>::const_iterator end() const { return p->names.end(); }
+
+	void clear() { p = std::make_shared<Data>(); }
+	void push_back(const string& s) { mut().push_back(s); }
+	/// the names to change in place - copied first if another ensemble shares them
+	vector<string>& mut();
+
+	/// column of name, or -1 if it isn't one of the names. builds the lookup if needed
+	int find(const string& name) const;
+	/// true if the lookup has already been built (so find() costs nothing extra)
+	bool has_lookup() const;
+	/// build the lookup now if it hasn't been
+	void build_lookup() const;
+	/// the lookup as an ordinary map, for code that wants its own copy
+	map<string, int> to_map() const;
+	/// true if this and other are the same shared list
+	bool same_as(const SharedNames& other) const { return p == other.p; }
+
+private:
+	struct Data
+	{
+		Data() {}
+		Data(const vector<string>& v) : names(v) {}
+		Data(vector<string>&& v) : names(std::move(v)) {}
+		vector<string> names;
+		std::unique_ptr<std::unordered_map<std::string_view, int>> lookup;
+		std::mutex lookup_lock;
+	};
+	std::shared_ptr<Data> p;
+	const std::unordered_map<std::string_view, int>& get_lookup() const;
+};
+
 class Ensemble
 {
 public:
@@ -73,6 +141,10 @@ public:
 	void throw_ensemble_error(string message);
 	void throw_ensemble_error(string message,vector<string> vec);
 	const vector<string> get_var_names() const { return var_names; }
+	/// the shared name list itself, so another ensemble can share it instead of copying
+	const SharedNames& get_shared_var_names() const { return var_names; }
+	/// column of var_name, or -1 if not found
+	int get_var_index(const string& var_name) const { return var_names.find(var_name); }
 	const vector<string> get_real_names() const { return real_names; }
 
 	const vector<string> get_real_names(vector<int> &indices);
@@ -96,7 +168,7 @@ public:
 	Eigen::VectorXd get_real_vector(const string &real_name);
 	Eigen::VectorXd get_var_vector(const string& var_name);
 	void update_real_ip(const string &rname, Eigen::VectorXd &real);
-	Eigen::MatrixXd get_eigen(vector<string> row_names, vector<string> col_names, bool update_vmap=true);
+	Eigen::MatrixXd get_eigen(const vector<string>& row_names, const vector<string>& col_names, bool update_vmap=true);
 	const Eigen::MatrixXd get_eigen() const { return reals; }
 	const Eigen::MatrixXd* get_eigen_ptr() const { return &reals; }
 	Eigen::MatrixXd* get_eigen_ptr_4_mod() { return &reals; }
@@ -138,7 +210,7 @@ public:
 	~Ensemble();
 	void set_rand_gen(std::mt19937* _rand_gen_ptr) { rand_gen_ptr = _rand_gen_ptr; }
 	std::mt19937* get_rand_gen_ptr() { return rand_gen_ptr; }
-	map<string, int> get_var_map() { return var_map; }
+	map<string, int> get_var_map() { return var_names.to_map(); }
 	map<string, int> get_real_map();
 
 	bool try_align_other_rows(PerformanceLog* performance_log, Ensemble& other);
@@ -152,10 +224,9 @@ protected:
 	Pest* pest_scenario_ptr;
 	Eigen::MatrixXd reals;
 	EnsembleViewGuard view_guard;
-	vector<string> var_names;
+	SharedNames var_names;
 	vector<string> real_names;	
 	vector<string> org_real_names;
-	map<string, int> var_map;
 	void read_csv_by_reals(int num_reals,ifstream &csv, map<string,int> &header_info, map<string,int> &index_info);
 	void read_csv_by_vars(int num_reals, ifstream &csv, map<string, int> &header_info, map<string, int> &index_info);
 	map<string,int> from_binary_old(string file_name, vector<string> &names,  bool transposed);
