@@ -82,7 +82,8 @@ public:
 	// the old ensemble with no names at all
 	SharedNames(const SharedNames&) = default;
 	SharedNames& operator=(const SharedNames&) = default;
-	SharedNames& operator=(const vector<string>& v) { p = std::make_shared<Data>(v); return *this; }
+	// v can be this list's own names (e.g. e.reorder({}, e.get_var_names())) - nothing to do then
+	SharedNames& operator=(const vector<string>& v) { if (&v != &p->names) p = std::make_shared<Data>(v); return *this; }
 	SharedNames& operator=(vector<string>&& v) { p = std::make_shared<Data>(std::move(v)); return *this; }
 
 	operator const vector<string>&() const { return p->names; }
@@ -94,7 +95,8 @@ public:
 	vector<string>::const_iterator begin() const { return p->names.begin(); }
 	vector<string>::const_iterator end() const { return p->names.end(); }
 
-	void clear() { p = std::make_shared<Data>(); }
+	// in place when nobody else shares the names, like clearing a plain vector
+	void clear() { if (p.use_count() == 1) { p->names.clear(); p->lookup.reset(); } else p = std::make_shared<Data>(); }
 	void push_back(const string& s) { mut().push_back(s); }
 	/// the names to change in place - copied first if another ensemble shares them
 	vector<string>& mut();
@@ -140,7 +142,10 @@ public:
 	pair<int, int> shape() { return pair<int, int>(reals.rows(), reals.cols()); }
 	void throw_ensemble_error(string message);
 	void throw_ensemble_error(string message,vector<string> vec);
-	const vector<string> get_var_names() const { return var_names; }
+	// a reference, not a copy - with millions of obs a copy is about 1 GB. it stays good until
+	// this ensemble's names change, so take a copy (vector<string> x = ...) if you need to keep
+	// it past something that changes them
+	const vector<string>& get_var_names() const { return var_names.get(); }
 	/// the shared name list itself, so another ensemble can share it instead of copying
 	const SharedNames& get_shared_var_names() const { return var_names; }
 	/// column of var_name, or -1 if not found
@@ -163,6 +168,8 @@ public:
 	vector<string> get_generic_real_names(int num_reals);
 
 	void reserve(vector<string> _real_names, vector<string> _var_names);
+	/// same, but shares the names with whatever ensemble they came from instead of copying
+	void reserve(const vector<string>& _real_names, const SharedNames& _var_names);
 	void replace_col(string var_name, Eigen::VectorXd & vec, bool update_map=true);
 	Eigen::VectorXd get_real_vector(int ireal);
 	Eigen::VectorXd get_real_vector(const string &real_name);

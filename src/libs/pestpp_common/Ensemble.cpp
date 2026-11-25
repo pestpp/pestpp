@@ -105,6 +105,15 @@ void Ensemble::reserve(vector<string> _real_names, vector<string> _var_names)
 {
 	reals.resize(_real_names.size(), _var_names.size());
 	reals.setZero();
+	var_names = std::move(_var_names);
+	real_names = std::move(_real_names);
+	org_real_names = real_names;
+}
+
+void Ensemble::reserve(const vector<string>& _real_names, const SharedNames& _var_names)
+{
+	reals.resize(_real_names.size(), _var_names.size());
+	reals.setZero();
 	var_names = _var_names;
 	real_names = _real_names;
 	org_real_names = real_names;
@@ -253,7 +262,7 @@ void Ensemble::add_2_cols_ip(Ensemble &other)
 	}
 	if (mismatch.size() > 0)
 	throw_ensemble_error("the following real_names don't match other", mismatch);
-	vector<string> other_var_names = other.get_var_names();
+	const vector<string>& other_var_names = other.get_var_names();
 	add_2_cols_ip(other_var_names, other.get_eigen());
 
 }

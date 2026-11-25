@@ -402,7 +402,10 @@ public:
 	inline void fill_col_vector(string col_name, vector<t> &col_vector);
 	void read_file(ofstream& f_rec);
 	void keep_cols(set<string>& keep_cols);
-	void clear() { data.clear(); }
+	void clear() { for (auto& c : col_data) c.clear(); }
+	/// only store these columns when read_file() runs (names any case). the other columns are
+	/// still listed in the col names but read back as empty. empty set (default) stores all
+	void set_read_cols(const set<string>& cols);
 	
 private:
 	bool cast;
@@ -410,9 +413,18 @@ private:
 	string line, filename, index_col_name;
 	string delim,missing_val;
 	vector<string> col_names;
+	// the key of each row (its line number in the file, less one), in file order
 	vector<int> row_order;
 	void parse_control_record();
-	map<int, map<string, string>> data;
+	// the values, one list per column in the same order as col_names, one entry per row in
+	// row_order order. a column that wasn't kept is an empty list and reads back as ""
+	vector<vector<string>> col_data;
+	set<string> read_cols;
+	// position of row key idx in row_order, -1 if not there
+	int row_pos(int idx) const;
+	// position of col in col_names, -1 if not there
+	int col_pos(const string& col) const;
+	const string& cell(int pos, int icol) const;
 	void throw_externalctrlfile_error(const string message);
 	bool isduplicated(string col_name);
 	int get_row_idx(string key, string col_name);
@@ -434,13 +446,13 @@ inline void ExternalCtlFile::fill_col_vector(string col_name, vector<t>& col_vec
 	string sval;
 	t tval;
 	vector<string> s_col_vector = get_col_string_vector(col_name);
-	for (auto ro : row_order)
+	for (int i = 0; i < s_col_vector.size(); i++)
 	{
-		sval = s_col_vector[ro];
+		sval = s_col_vector[i];
 		if (sval == missing_val)
 		{
 			ss.str("");
-			ss << "fill_col_vector() error: missing value in row " << ro << " and column '" + col_name + "'";
+			ss << "fill_col_vector() error: missing value in row " << row_order[i] << " and column '" + col_name + "'";
 			throw_externalctrlfile_error(ss.str());
 		}
 		convert_ip(sval, tval);
