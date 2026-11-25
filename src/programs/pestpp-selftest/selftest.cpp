@@ -4345,139 +4345,6 @@ static void test_prior_inv_sqrt_diag()
         "agrees with scale_prior_anomalies() on the same prior");
 }
 
-/* ies_use_prior_prec: the glm step with an explicit prior precision Q in both the
- * hessian and the gradient.  when Q is the (untruncated) Am Am^T of the same
- * ensemble - the pseudo-inverse of the prior anomaly covariance that the existing
- * path uses - the two forms are the same thing written differently, so the
- * upgrades have to agree to roundoff, at iteration 1 (data term only) and at
- * iteration 2 with the prior pull switched on.  the obs anomalies are kept full
- * rank (nobs >= N-1) so the existing path's V-subspace projection is the whole
- * centred subspace; with fewer obs the two forms legitimately differ.
- */
-static void test_ies_prior_prec_reduces_to_am()
-{
-    cout << "[ies prior precision: Q = Am Am^T reproduces the existing glm step]" << endl;
-
-    const int npar = 30, nobs = 40, nreal = 12;
-    // seeded pseudo-random so the anomalies are full rank (N-1): a smooth formula
-    // like sin(a i + b j) is rank 2 and then the obs svd spans only part of the
-    // centred subspace, which is exactly the case where the two forms differ
-    std::mt19937 gen(20260919);
-    std::uniform_real_distribution<double> unif(-1.0, 1.0);
-    Eigen::MatrixXd par_diff0(npar, nreal), obs_diff0(nobs, nreal), obs_resid0(nobs, nreal),
-        par_resid0(npar, nreal);
-    for (int i = 0; i < npar; i++)
-        for (int j = 0; j < nreal; j++)
-        {
-            par_diff0(i, j) = unif(gen);
-            par_resid0(i, j) = 0.3 * unif(gen);
-        }
-    for (int i = 0; i < nobs; i++)
-        for (int j = 0; j < nreal; j++)
-        {
-            obs_diff0(i, j) = unif(gen);
-            obs_resid0(i, j) = 0.2 * unif(gen) + 0.1;
-        }
-    par_diff0 = par_diff0.colwise() - par_diff0.rowwise().mean();
-    obs_diff0 = obs_diff0.colwise() - obs_diff0.rowwise().mean();
-    Eigen::MatrixXd obs_err0 = 0.1 * obs_diff0;
-
-    Eigen::VectorXd wvec(nobs);
-    for (int i = 0; i < nobs; i++)
-        wvec[i] = 0.5 + 0.1 * (i % 4);
-    Eigen::DiagonalMatrix<double, Eigen::Dynamic> weights(wvec);
-    Eigen::DiagonalMatrix<double, Eigen::Dynamic> parcov_identity(Eigen::VectorXd::Ones(npar));
-    vector<string> onames, pnames;
-    for (int i = 0; i < nobs; i++) onames.push_back("o" + to_string(i));
-    for (int i = 0; i < npar; i++) pnames.push_back("p" + to_string(i));
-
-    // Am exactly as get_Am builds it: tsvd of the scaled prior anomalies, U S^-1
-    const double eigthresh = 1.0e-10;
-    const int maxsing = 1000;
-    Eigen::MatrixXd Am;
-    {
-        Eigen::MatrixXd pd = par_diff0 / sqrt(double(nreal - 1));
-        Eigen::MatrixXd s, U, V;
-        SVD_REDSVD rsvd;
-        rsvd.solve_ip(pd, s, U, V, eigthresh, maxsing);
-        Eigen::MatrixXd sinv = s.asDiagonal().inverse();
-        Am = U * sinv;
-    }
-    Eigen::MatrixXd Qd = Am * Am.transpose();
-    Eigen::SparseMatrix<double> Q = Qd.sparseView();
-
-    auto solve_old = [&](int iter, double lam, double reg)
-    {
-        Eigen::MatrixXd par_resid = par_resid0, par_diff = par_diff0;
-        Eigen::MatrixXd obs_resid = obs_resid0, obs_diff = obs_diff0, obs_err = obs_err0;
-        Eigen::MatrixXd upgrade;
-        UpgradeThread::ensemble_solution(iter, 0, maxsing, 0, 0, false, false, true, lam, eigthresh,
-                                         par_resid, par_diff, Am, obs_resid, obs_diff, upgrade,
-                                         obs_err, weights, parcov_identity, onames, pnames, reg, -1.0);
-        return upgrade;
-    };
-    auto solve_new = [&](int iter, double lam, double reg, const Eigen::SparseMatrix<double>& q)
-    {
-        Eigen::MatrixXd par_resid = par_resid0, par_diff = par_diff0;
-        Eigen::MatrixXd obs_resid = obs_resid0, obs_diff = obs_diff0;
-        Eigen::MatrixXd upgrade;
-        UpgradeThread::ensemble_solution_prec(iter, 0, maxsing, false, lam, eigthresh, par_resid,
-                                              par_diff, q, obs_resid, obs_diff, upgrade, weights, reg);
-        return upgrade;
-    };
-    auto rel = [](const Eigen::MatrixXd& a, const Eigen::MatrixXd& b)
-    { return (a - b).norm() / max(1.0e-30, a.norm()); };
-
-    // iteration 1: data term only, at two lambdas
-    for (double lam : {0.0, 3.0})
-    {
-        Eigen::MatrixXd o = solve_old(1, lam, 1.0), n = solve_new(1, lam, 1.0, Q);
-        CHK(o.rows() == n.rows() && o.cols() == n.cols(), "prec form gives an N x p upgrade");
-        double d = rel(o, n);
-        if (d > 1.0e-8)
-            cout << "  iteration 1, lambda " << lam << ": relative diff " << d << endl;
-        CHK(d < 1.0e-8, "iteration 1 upgrade matches the existing glm step (lambda " + to_string(lam) + ")");
-        CHK(o.norm() > 1.0e-8, "the iteration 1 upgrade is non-zero");
-    }
-    // iteration 2 with reg_factor 1: the prior pull is in on both sides
-    {
-        Eigen::MatrixXd o = solve_old(2, 2.0, 1.0), n = solve_new(2, 2.0, 1.0, Q);
-        double d = rel(o, n);
-        if (d > 1.0e-8)
-            cout << "  iteration 2, prior pull on: relative diff " << d << endl;
-        CHK(d < 1.0e-8, "iteration 2 upgrade with the prior pull matches the existing full solution");
-        // and the pull did something, or the check above is the iteration 1 check again
-        CHK(rel(solve_old(1, 2.0, 1.0), o) > 1.0e-6, "the prior pull changes the iteration 2 upgrade");
-        // reg_factor 0 (the default) means weight 1 on the pull, on both sides.  this
-        // used to multiply the pull by 0 and quietly turn the full solution into the
-        // approx one - the guard was >= 0 instead of > 0
-        CHK(rel(solve_old(2, 2.0, 0.0), o) < 1.0e-12, "reg_factor 0 (default) is weight 1 on the existing full solution");
-        CHK(rel(solve_new(2, 2.0, 0.0, Q), n) < 1.0e-12, "reg_factor 0 (default) is weight 1 on the prec full solution");
-        // and a fractional weight really scales it, so the > 0 branch is live too
-        Eigen::MatrixXd half_o = solve_old(2, 2.0, 0.5), half_n = solve_new(2, 2.0, 0.5, Q);
-        CHK(rel(half_o, o) > 1.0e-6, "reg_factor 0.5 scales the pull on the existing full solution");
-        CHK(rel(half_o, half_n) < 1.0e-8, "reg_factor 0.5 matches on both sides");
-    }
-    // the two readings of ies_reg_factor: the upgrade takes |r| (negative = full
-    // solution with the magnitude on the pull, no reg phi), the phi handler max(0,r)
-    {
-        CHK(L2PhiHandler::upgrade_reg_factor(-1.0) == 1.0, "upgrade reg factor of -1 is 1");
-        CHK(L2PhiHandler::upgrade_reg_factor(0.0) == 0.0, "upgrade reg factor of 0 is 0");
-        CHK(L2PhiHandler::upgrade_reg_factor(0.5) == 0.5, "upgrade reg factor of 0.5 is 0.5");
-        CHK(L2PhiHandler::phi_reg_factor(-1.0) == 0.0, "phi reg factor of -1 is 0");
-        CHK(L2PhiHandler::phi_reg_factor(0.0) == 0.0, "phi reg factor of 0 is 0");
-        CHK(L2PhiHandler::phi_reg_factor(0.5) == 0.5, "phi reg factor of 0.5 is 0.5");
-    }
-    // a different Q must give a different answer, or none of this proves Q is used
-    {
-        Eigen::SparseMatrix<double> Qdiag(npar, npar);
-        Qdiag.setIdentity();
-        Qdiag *= 4.0;
-        CHK(rel(solve_new(1, 1.0, 1.0, Q), solve_new(1, 1.0, 1.0, Qdiag)) > 1.0e-4,
-            "a diagonal Q gives a different upgrade than Am Am^T");
-        CHK(solve_new(1, 1.0, 1.0, Qdiag).allFinite(), "the singular ones direction is dropped, not inverted");
-    }
-}
 
 static void test_local_writeback()
 {
@@ -4612,18 +4479,6 @@ static void test_zero_obs_diff_trap()
         CHK((u.rows() == nreal) && (u.cols() == npar) && (u.cwiseAbs().maxCoeff() > 0.0) && u.allFinite(),
             pk.second + ": varying obs are not trapped and give a finite nonzero upgrade");
     }
-
-    //the precision form goes through the same trap
-    Eigen::MatrixXd par_resid = par_resid0, par_diff = par_diff0;
-    Eigen::MatrixXd obs_diff = Eigen::MatrixXd::Zero(1, nreal), obs_resid = Eigen::MatrixXd::Ones(1, nreal);
-    Eigen::SparseMatrix<double> Q(npar, npar);
-    Q.setIdentity();
-    Eigen::DiagonalMatrix<double, Eigen::Dynamic> w1(Eigen::VectorXd::Ones(1));
-    Eigen::MatrixXd up;
-    UpgradeThread::ensemble_solution_prec(2, 0, 1000, false, 0.1, 1.0e-7, par_resid, par_diff, Q,
-                                          obs_resid, obs_diff, up, w1, 0.0, PestppOptions::BDCSVD);
-    CHK((up.rows() == nreal) && (up.cols() == npar) && (up.cwiseAbs().maxCoeff() == 0.0),
-        "prec form: all-zero obs gives a zero upgrade");
 }
 
 static void test_svd_pack_bdcsvd()
@@ -5028,16 +4883,13 @@ static void test_enif_lowrank_step()
     CHK(threw, "a zero noise variance throws");
 }
 
-static void test_enif_supplied_prec_hybrid()
+static void test_enif_supplied_prec()
 {
-    cout << "[enif: supplied prior precision file and the hybrid damping step]" << endl;
+    cout << "[enif: supplied prior precision file]" << endl;
     PO o; o.set_defaults();
     CHK(o.get_ies_enif_prec_file() == "", "ies_enif_prec_file defaults to empty");
-    CHK(!o.get_ies_enif_hybrid_damp(), "ies_enif_hybrid_damp defaults to false");
     CHK(o.assign_value_by_key("IES_ENIF_PREC_FILE", "MyPrec.jcb") == PO::ARG_STATUS::ARG_ACCEPTED, "prec file parses");
     CHK(o.get_ies_enif_prec_file() == "MyPrec.jcb", "and keeps its case");
-    CHK(o.assign_value_by_key("IES_ENIF_HYBRID_DAMP", "true") == PO::ARG_STATUS::ARG_ACCEPTED, "hybrid parses");
-    CHK(o.get_ies_enif_hybrid_damp(), "and is true after 'true'");
 
     // a 4-node chain precision with values, in the pest ascii matrix format
     Eigen::MatrixXd Q(4, 4);
@@ -5052,7 +4904,7 @@ static void test_enif_supplied_prec_hybrid()
         for (int i = 0; i < 4; i++) { for (int j = 0; j < 4; j++) f << " " << Q(i, j); f << "\n"; }
         f << "* row and column names\nP1\nP2\nP3\nP4\n";
     }
-    ofstream frec("selftest_enif_prec_hybrid.rec");
+    ofstream frec("selftest_enif_prec.rec");
     vector<string> names = {"P1", "P2", "P3", "P4"};
     EnifGraph g;
     g.from_file(pf, names, frec);
@@ -5073,19 +4925,9 @@ static void test_enif_supplied_prec_hybrid()
     try { EnifGraph gb; gb.from_file(bf, names, frec); gb.load_precision(bf, frec); } catch (...) { threw = true; }
     CHK(threw, "a non-symmetric precision file throws");
 
-    // hybrid step: Lam_post = Q + lam Qcur + H^T Rinv H against the dense formula
+    // the step with the loaded precision: Lam_post = (1+lam) Q + H^T Rinv H, against the dense formula
     std::mt19937 gen(9);
     std::normal_distribution<double> nd(0.0, 1.0);
-    int N = 40;
-    Eigen::MatrixXd A(4, N);
-    for (int i = 0; i < 4; i++) for (int j = 0; j < N; j++) A(i, j) = 0.3 * nd(gen);
-    for (int j = 0; j < N; j++) { A(1, j) += 0.5 * A(0, j); A(2, j) += 0.5 * A(1, j); A(3, j) += 0.5 * A(2, j); }
-    A = (A.colwise() - A.rowwise().mean()) / sqrt(double(N - 1));
-    g.estimate_precision(A, 1.0e-3, frec, false, true);
-    CHK(g.has_current_precision(), "current-ensemble precision estimated into its own slot");
-    CHK((Eigen::MatrixXd(g.precision()) - Q).cwiseAbs().maxCoeff() < 1e-12, "the prior precision is untouched by it");
-    Eigen::MatrixXd Qcur = Eigen::MatrixXd(g.current_precision());
-    CHK(Qcur.diagonal().minCoeff() > Q.diagonal().maxCoeff(), "contracted ensemble -> current precision larger than the prior's");
     Eigen::MatrixXd Hd(3, 4);
     Hd << 1.0, 0.0, 0.5, 0.0,
           0.0, 2.0, 0.0, 0.0,
@@ -5096,20 +4938,9 @@ static void test_enif_supplied_prec_hybrid()
     for (int i = 0; i < 3; i++) for (int j = 0; j < 2; j++) r(i, j) = nd(gen);
     for (int i = 0; i < 4; i++) e(i, 1) = 0.2 * nd(gen);
     double lam = 3.0;
-    g.set_hybrid_damp(false);
     Eigen::MatrixXd plain = g.information_step(H, rinv, e, r, lam, frec);
     Eigen::MatrixXd want_plain = -((1.0 + lam) * Q + Hd.transpose() * rinv.asDiagonal() * Hd).ldlt().solve(Q * e + Hd.transpose() * (rinv.asDiagonal() * r));
-    CHK((plain - want_plain).cwiseAbs().maxCoeff() < 1e-9, "plain step unchanged: (1+lam) on the prior precision");
-    g.set_hybrid_damp(true);
-    Eigen::MatrixXd hyb = g.information_step(H, rinv, e, r, lam, frec);
-    Eigen::MatrixXd want_hyb = -(Q + lam * Qcur + Hd.transpose() * rinv.asDiagonal() * Hd).ldlt().solve(Q * e + Hd.transpose() * (rinv.asDiagonal() * r));
-    CHK((hyb - want_hyb).cwiseAbs().maxCoeff() < 1e-9, "hybrid step: lam on the current precision, prior in the curvature and gradient");
-    CHK((hyb - plain).cwiseAbs().maxCoeff() > 1e-6, "and it differs from the plain step");
-    // without a current precision the hybrid step refuses
-    EnifGraph g2; g2.from_file(pf, names, frec); g2.load_precision(pf, frec); g2.set_hybrid_damp(true);
-    threw = false;
-    try { g2.information_step(H, rinv, e, r, lam, frec); } catch (...) { threw = true; }
-    CHK(threw, "hybrid damping without a current precision throws");
+    CHK((plain - want_plain).cwiseAbs().maxCoeff() < 1e-9, "step: (1+lam) on the prior precision");
 }
 
 static void test_estimate_sparse_h_divisor()
@@ -5127,8 +4958,8 @@ static void test_estimate_sparse_h_divisor()
     stringstream s1, s2, s3;
     Eigen::VectorXd u1, u2, u3;
     Eigen::SparseMatrix<double> H1 = estimate_sparse_H(A, B, 0.05, 1, u1, s1);
-    Eigen::SparseMatrix<double> H2 = estimate_sparse_H(A, B, 0.05, 1, u2, s2, 0, double(N));
-    Eigen::SparseMatrix<double> H3 = estimate_sparse_H(A, B, 0.05, 2, u3, s3, 0, 2.0 * double(N));
+    Eigen::SparseMatrix<double> H2 = estimate_sparse_H(A, B, 0.05, 1, u2, s2, double(N));
+    Eigen::SparseMatrix<double> H3 = estimate_sparse_H(A, B, 0.05, 2, u3, s3, 2.0 * double(N));
     CHK((Eigen::MatrixXd(H1) - Eigen::MatrixXd(H2)).cwiseAbs().maxCoeff() == 0.0, "divisor N is the default");
     CHK((u1 - u2).cwiseAbs().maxCoeff() < 1e-14, "and gives the same unexplained variance");
     CHK((Eigen::MatrixXd(H1) - Eigen::MatrixXd(H3)).cwiseAbs().maxCoeff() == 0.0, "the divisor does not touch H (two threads either)");
@@ -5142,9 +4973,9 @@ static void test_estimate_sparse_h_divisor()
     CHK((u4 - full).cwiseAbs().maxCoeff() < 1e-12, "empty rows report the full output variance as unexplained");
 }
 
-static void test_sparse_h_by_col()
+static void test_sparse_h_col_order()
 {
-    cout << "[enif: sparse H in column order matches the row-order fit]" << endl;
+    cout << "[enif: sparse H in column order (any localizer) matches the row-order fit]" << endl;
     // p > N, as on the real problems, with a sparse truth and some noise
     int p = 300, n = 40, N = 50;
     std::mt19937 gen(7);
@@ -5159,12 +4990,15 @@ static void test_sparse_h_by_col()
     // a parameter with no spread and an observation with no spread
     A.row(11).setZero();
     B.row(3).setZero();
+    // the column-order fit runs whenever a localizer is given; one listing every
+    // parameter changes nothing else
+    Eigen::SparseMatrix<double> LA = Eigen::MatrixXd::Ones(n, p).sparseView();
 
     auto compare = [&](double frac) {
         stringstream sr, sc;
         Eigen::VectorXd ur, uc;
         Eigen::MatrixXd Hr = Eigen::MatrixXd(estimate_sparse_H(A, B, frac, 1, ur, sr));
-        Eigen::MatrixXd Hc = Eigen::MatrixXd(estimate_sparse_H(A, B, frac, 1, uc, sc, 0, -1.0, true));
+        Eigen::MatrixXd Hc = Eigen::MatrixXd(estimate_sparse_H(A, B, frac, 1, uc, sc, -1.0, &LA));
         int mismatch = 0;
         for (int i = 0; i < n; i++) for (int j = 0; j < p; j++)
             if ((Hr(i, j) != 0.0) != (Hc(i, j) != 0.0)) mismatch++;
@@ -5188,73 +5022,41 @@ static void test_sparse_h_by_col()
     // threads own blocks of rows; the answer cannot depend on how many
     Eigen::VectorXd u1, u4, u7;
     stringstream s1, s4, s7;
-    Eigen::MatrixXd H1 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, u1, s1, 0, -1.0, true));
-    Eigen::MatrixXd H4 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 4, u4, s4, 0, -1.0, true));
-    Eigen::MatrixXd H7 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 7, u7, s7, 0, -1.0, true));
+    Eigen::MatrixXd H1 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, u1, s1, -1.0, &LA));
+    Eigen::MatrixXd H4 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 4, u4, s4, -1.0, &LA));
+    Eigen::MatrixXd H7 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 7, u7, s7, -1.0, &LA));
     CHK((H1 - H4).cwiseAbs().maxCoeff() == 0.0 && (H1 - H7).cwiseAbs().maxCoeff() == 0.0, "1, 4 and 7 threads give bit-identical H");
     CHK((u1 - u4).cwiseAbs().maxCoeff() == 0.0 && (u1 - u7).cwiseAbs().maxCoeff() == 0.0, "and bit-identical unexplained variance");
 
     // lasso fraction 1 empties every row and leaves the full variance unexplained
     Eigen::VectorXd ue; stringstream se;
-    Eigen::SparseMatrix<double> He = estimate_sparse_H(A, B, 1.0, 3, ue, se, 0, -1.0, true);
+    Eigen::SparseMatrix<double> He = estimate_sparse_H(A, B, 1.0, 3, ue, se, -1.0, &LA);
     Eigen::VectorXd full = B.array().square().rowwise().sum() * double(N - 1) / double(N);
     CHK(He.nonZeros() == 0, "lasso fraction 1 zeroes every row");
     CHK((ue - full).cwiseAbs().maxCoeff() < 1e-12, "and reports the full output variance as unexplained");
 
     // the divisor scales the unexplained variance and nothing else
     Eigen::VectorXd ud; stringstream sd;
-    Eigen::MatrixXd Hd = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 2, ud, sd, 0, 2.0 * double(N), true));
+    Eigen::MatrixXd Hd = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 2, ud, sd, 2.0 * double(N), &LA));
     CHK((Hd - H1).cwiseAbs().maxCoeff() == 0.0 && (ud * 2.0 - u1).cwiseAbs().maxCoeff() < 1e-12, "the divisor halves the unexplained variance and leaves H alone");
 
     // one observation, and one parameter
     {
         Eigen::MatrixXd B1 = B.topRows(1);
+        Eigen::SparseMatrix<double> LB1 = Eigen::MatrixXd::Ones(1, p).sparseView();
         Eigen::VectorXd ur, uc; stringstream sr, sc;
         Eigen::MatrixXd Hr = Eigen::MatrixXd(estimate_sparse_H(A, B1, 0.05, 1, ur, sr));
-        Eigen::MatrixXd Hc = Eigen::MatrixXd(estimate_sparse_H(A, B1, 0.05, 4, uc, sc, 0, -1.0, true));
+        Eigen::MatrixXd Hc = Eigen::MatrixXd(estimate_sparse_H(A, B1, 0.05, 4, uc, sc, -1.0, &LB1));
         CHK((Hr - Hc).cwiseAbs().maxCoeff() <= 1e-9 * max(1.0e-300, Hr.cwiseAbs().maxCoeff()), "a single observation row matches");
         Eigen::MatrixXd A1 = A.topRows(1);
         Eigen::MatrixXd B2 = 2.0 * A1;
         B2.conservativeResize(3, N);
         B2.row(1) = -A1.row(0); B2.row(2) = 0.5 * A1.row(0);
+        Eigen::SparseMatrix<double> LA1 = Eigen::MatrixXd::Ones(3, 1).sparseView();
         Hr = Eigen::MatrixXd(estimate_sparse_H(A1, B2, 0.0, 1, ur, sr));
-        Hc = Eigen::MatrixXd(estimate_sparse_H(A1, B2, 0.0, 2, uc, sc, 0, -1.0, true));
+        Hc = Eigen::MatrixXd(estimate_sparse_H(A1, B2, 0.0, 2, uc, sc, -1.0, &LA1));
         CHK((Hr - Hc).cwiseAbs().maxCoeff() < 1e-12, "a single parameter matches");
         CHK(abs(Hc(0, 0) - 2.0) < 1e-12 && abs(Hc(1, 0) + 1.0) < 1e-12 && abs(Hc(2, 0) - 0.5) < 1e-12, "and with no penalty recovers the exact slopes");
-    }
-
-    // the cross-validated fit: same folds, penalty path and refit, rows in step
-    {
-        Eigen::MatrixXd Acv = A.topRows(120), Bcv = B.topRows(12);
-        Eigen::VectorXd ur, uc, uc4; stringstream sr, sc, sc4;
-        Eigen::MatrixXd Hr = Eigen::MatrixXd(estimate_sparse_H(Acv, Bcv, 0.0, 1, ur, sr, 5));
-        Eigen::MatrixXd Hc = Eigen::MatrixXd(estimate_sparse_H(Acv, Bcv, 0.0, 1, uc, sc, 5, -1.0, true));
-        Eigen::MatrixXd Hc4 = Eigen::MatrixXd(estimate_sparse_H(Acv, Bcv, 0.0, 4, uc4, sc4, 5, -1.0, true));
-        // a coefficient sitting on the soft threshold can land at exactly zero in one fit and at
-        // roundoff in the other; any other pattern difference is a real one
-        double hmax = max(1.0e-300, Hr.cwiseAbs().maxCoeff());
-        int mismatch = 0, real_mismatch = 0;
-        double worst = 0.0;
-        for (int i = 0; i < Hr.rows(); i++) for (int j = 0; j < Hr.cols(); j++)
-            if ((Hr(i, j) != 0.0) != (Hc(i, j) != 0.0))
-            {
-                mismatch++;
-                double v = max(abs(Hr(i, j)), abs(Hc(i, j))) / hmax;
-                worst = max(worst, v);
-                if (v > 1.0e-12) real_mismatch++;
-            }
-        double hdiff = (Hr - Hc).cwiseAbs().maxCoeff() / hmax;
-        double udiff = (ur - uc).cwiseAbs().maxCoeff() / max(1.0e-300, ur.cwiseAbs().maxCoeff());
-        cout << "  cross-validated: nnz " << (Hr.array() != 0.0).count() << ", pattern mismatches " << mismatch
-             << " (largest " << worst << " of max |h|), max rel H diff " << hdiff << ", max rel unexplained diff " << udiff << endl;
-        CHK(real_mismatch == 0, "cross-validated: same sparsity pattern apart from entries at roundoff");
-        CHK(hdiff < 1.0e-6, "cross-validated: same coefficients to the solver tolerance");
-        CHK(udiff < 1.0e-6, "cross-validated: same unexplained variance to the solver tolerance");
-        CHK(Hc.row(3).cwiseAbs().maxCoeff() == 0.0 && uc[3] == 0.0, "cross-validated: an observation with no spread gives an empty row");
-        CHK(Hc.col(11).cwiseAbs().maxCoeff() == 0.0, "cross-validated: a parameter with no spread stays out");
-        CHK((Hc - Hc4).cwiseAbs().maxCoeff() == 0.0 && (uc - uc4).cwiseAbs().maxCoeff() == 0.0, "cross-validated: 1 and 4 threads bit-identical");
-        CHK(sc.str().find("column order") != string::npos && sr.str().find("chosen penalty") != string::npos
-            && sc.str().find("chosen penalty") != string::npos, "cross-validated: both summaries report, the column one says so");
     }
 }
 
@@ -5294,7 +5096,7 @@ static void test_sparse_h_localized()
     {
         string tag = " (lasso fraction " + to_string(frac) + ")";
         Eigen::VectorXd u; stringstream s;
-        Eigen::MatrixXd H = Eigen::MatrixXd(estimate_sparse_H(A, B, frac, 3, u, s, 0, -1.0, true, &loc));
+        Eigen::MatrixXd H = Eigen::MatrixXd(estimate_sparse_H(A, B, frac, 3, u, s, -1.0, &loc));
         int outside = 0;
         for (int i = 0; i < n; i++) for (int j = 0; j < p; j++)
             if ((H(i, j) != 0.0) && (locd(i, j) == 0.0)) outside++;
@@ -5326,36 +5128,17 @@ static void test_sparse_h_localized()
         CHK(s.str().find("localized") != string::npos, "the summary says localized" + tag);
     }
 
-    // a localizer listing everything is no localizer; row order is overridden; threads do not matter
+    // a localizer listing everything matches no localizer to roundoff; threads do not matter
     {
-        Eigen::VectorXd u0, ua, ur, u4; stringstream s0, sa, sr, s4;
-        Eigen::MatrixXd H0 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, u0, s0, 0, -1.0, true));
-        Eigen::MatrixXd Ha = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, ua, sa, 0, -1.0, true, &loc_all));
-        CHK((H0 - Ha).cwiseAbs().maxCoeff() == 0.0 && (u0 - ua).cwiseAbs().maxCoeff() == 0.0, "a full localizer is bit-identical to none");
-        Eigen::MatrixXd Hr = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, ur, sr, 0, -1.0, false, &loc));
-        Eigen::MatrixXd H4 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 4, u4, s4, 0, -1.0, true, &loc));
-        CHK((Hr - H4).cwiseAbs().maxCoeff() == 0.0 && (ur - u4).cwiseAbs().maxCoeff() == 0.0,
-            "row order asked for runs in column order, and 1 vs 4 threads are bit-identical");
-    }
-
-    // the cross-validated fit takes the same localizer
-    {
-        Eigen::MatrixXd Acv = A.topRows(120), Bcv = B.topRows(12);
-        Eigen::SparseMatrix<double> lcv = loc.topLeftCorner(12, 120);
-        Eigen::SparseMatrix<double> lcv_all = loc_all.topLeftCorner(12, 120);
-        Eigen::MatrixXd lcvd = Eigen::MatrixXd(lcv);
-        Eigen::VectorXd u, u4, u0, ua; stringstream s, s4, s0, sa;
-        Eigen::MatrixXd H = Eigen::MatrixXd(estimate_sparse_H(Acv, Bcv, 0.0, 1, u, s, 5, -1.0, true, &lcv));
-        Eigen::MatrixXd H4 = Eigen::MatrixXd(estimate_sparse_H(Acv, Bcv, 0.0, 4, u4, s4, 5, -1.0, true, &lcv));
-        int outside = 0;
-        for (int i = 0; i < H.rows(); i++) for (int j = 0; j < H.cols(); j++)
-            if ((H(i, j) != 0.0) && (lcvd(i, j) == 0.0)) outside++;
-        CHK(outside == 0 && H.row(5).cwiseAbs().maxCoeff() == 0.0, "cross-validated: nothing outside the localizer, unlisted row empty");
-        CHK((H - H4).cwiseAbs().maxCoeff() == 0.0 && (u - u4).cwiseAbs().maxCoeff() == 0.0, "cross-validated: 1 and 4 threads bit-identical");
-        Eigen::MatrixXd H0 = Eigen::MatrixXd(estimate_sparse_H(Acv, Bcv, 0.0, 1, u0, s0, 5, -1.0, true));
-        Eigen::MatrixXd Ha = Eigen::MatrixXd(estimate_sparse_H(Acv, Bcv, 0.0, 1, ua, sa, 5, -1.0, true, &lcv_all));
-        CHK((H0 - Ha).cwiseAbs().maxCoeff() == 0.0 && (u0 - ua).cwiseAbs().maxCoeff() == 0.0, "cross-validated: a full localizer is bit-identical to none");
-        cout << "  cross-validated: nnz " << (H.array() != 0.0).count() << endl;
+        Eigen::VectorXd u0, ua, u1, u4; stringstream s0, sa, s1, s4;
+        Eigen::MatrixXd H0 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, u0, s0));
+        Eigen::MatrixXd Ha = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, ua, sa, -1.0, &loc_all));
+        CHK((H0 - Ha).cwiseAbs().maxCoeff() <= 1e-9 * max(1.0e-300, H0.cwiseAbs().maxCoeff())
+            && (u0 - ua).cwiseAbs().maxCoeff() <= 1e-9 * max(1.0e-300, u0.cwiseAbs().maxCoeff()), "a full localizer matches none to roundoff");
+        Eigen::MatrixXd H1 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, u1, s1, -1.0, &loc));
+        Eigen::MatrixXd H4 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 4, u4, s4, -1.0, &loc));
+        CHK((H1 - H4).cwiseAbs().maxCoeff() == 0.0 && (u1 - u4).cwiseAbs().maxCoeff() == 0.0,
+            "1 vs 4 threads are bit-identical");
     }
 
     // a localizer of the wrong shape is an error
@@ -5363,7 +5146,7 @@ static void test_sparse_h_localized()
         Eigen::SparseMatrix<double> bad(n, p + 1);
         Eigen::VectorXd u; stringstream s;
         bool threw = false;
-        try { estimate_sparse_H(A, B, 0.05, 1, u, s, 0, -1.0, true, &bad); }
+        try { estimate_sparse_H(A, B, 0.05, 1, u, s, -1.0, &bad); }
         catch (const exception&) { threw = true; }
         CHK(threw, "a localizer of the wrong shape throws");
     }
@@ -5516,31 +5299,7 @@ static void test_enif_current_prec()
     A12 = (A12.colwise() - A12.rowwise().mean()) / sqrt(11.0);
     g.estimate_precision(A12, -1.0, frec_tail);
     CHK(Eigen::MatrixXd(g.precision()).allFinite(), "12 realizations: k/(N-1) fallback gives a finite precision");
-    // direct neighbours only: a chain has no fill, so it must reproduce the fill-inclusive result
-    g.estimate_precision(A, 1.0e-3, frec_tail);
-    Eigen::MatrixXd Pf = Eigen::MatrixXd(g.precision());
-    g.estimate_precision(A, 1.0e-3, frec_tail, true);
-    Eigen::MatrixXd Pd = Eigen::MatrixXd(g.precision());
-    CHK((Pf - Pd).cwiseAbs().maxCoeff() == 0.0, "direct-only on a chain (no fill) matches the fill-inclusive estimate");
-    // a 4-cycle has fill (eliminating one node links its two neighbours), so direct-only
-    // uses smaller regressions and gives a different, still finite, precision
-    {
-        ofstream f(gf);
-        f << " 4 4 1\n 0 1 0 1\n 1 0 1 0\n 0 1 0 1\n 1 0 1 0\n* row and column names\nP1\nP2\nP3\nP4\n";
-    }
-    EnifGraph gc;
-    gc.from_file(gf, names, frec_tail);
-    CHK(gc.num_edges() == 4, "4-cycle read: 4 edges");
-    gc.estimate_precision(A, 1.0e-3, frec_tail);
-    Eigen::MatrixXd Pcf = Eigen::MatrixXd(gc.precision());
-    gc.estimate_precision(A, 1.0e-3, frec_tail, true);
-    Eigen::MatrixXd Pcd = Eigen::MatrixXd(gc.precision());
-    CHK(Pcf.allFinite() && Pcd.allFinite(), "4-cycle: both estimates finite");
-    CHK((Pcf - Pcd).cwiseAbs().maxCoeff() > 1e-8, "4-cycle: ignoring the fill changes the estimate");
     frec_tail.close();
-    PO o2; o2.set_defaults();
-    CHK(!o2.get_ies_enif_direct_nbrs(), "ies_enif_direct_nbrs defaults to false");
-    CHK(o2.assign_value_by_key("IES_ENIF_DIRECT_NBRS", "true") == PO::ARG_STATUS::ARG_ACCEPTED && o2.get_ies_enif_direct_nbrs(), "and parses");
     frec.close();
     remove(gf.c_str()); remove("selftest_enif_current_prec.rec");
 }
@@ -6074,9 +5833,9 @@ int main()
     run_test(test_quarantine_screen, "test_quarantine_screen");
     run_test(test_enif_woodbury_step, "test_enif_woodbury_step");
     run_test(test_enif_lowrank_step, "test_enif_lowrank_step");
-    run_test(test_enif_supplied_prec_hybrid, "test_enif_supplied_prec_hybrid");
+    run_test(test_enif_supplied_prec, "test_enif_supplied_prec");
     run_test(test_estimate_sparse_h_divisor, "test_estimate_sparse_h_divisor");
-    run_test(test_sparse_h_by_col, "test_sparse_h_by_col");
+    run_test(test_sparse_h_col_order, "test_sparse_h_col_order");
     run_test(test_sparse_h_localized, "test_sparse_h_localized");
     run_test(test_enif_mm_inflation_csv, "test_enif_mm_inflation_csv");
     run_test(test_enif_current_prec, "test_enif_current_prec");
@@ -6131,7 +5890,6 @@ int main()
     run_test(test_ies_prior_scaling_is_neutral, "test_ies_prior_scaling_is_neutral");
     run_test(test_prior_anomaly_scaling, "test_prior_anomaly_scaling");
     run_test(test_prior_inv_sqrt_diag, "test_prior_inv_sqrt_diag");
-    run_test(test_ies_prior_prec_reduces_to_am, "test_ies_prior_prec_reduces_to_am");
     cout << "\npestpp-selftest: " << (g_fail == 0 ? "PASS" : "FAIL")
          << " (" << (g_total - g_fail) << "/" << g_total << " checks)" << endl;
     return g_fail == 0 ? 0 : 1;

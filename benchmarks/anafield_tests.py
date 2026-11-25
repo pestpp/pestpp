@@ -213,8 +213,7 @@ def anafield_scaling_compare(nrow=224, ncol=224, obs_sizes=(2000, 5000, 10000, 5
 
     methods picks what runs: "ies", "enif" (woodbury, implicit H) and
     "enif_lasso" (woodbury with the explicit lasso H, ies_enif_h_lasso =
-    lasso_frac, the lasso threaded over num_threads) and "enif_lasso_col" (the
-    same with the lasso fitted in column order, ies_enif_h_by_col).  rows for methods not
+    lasso_frac, the lasso threaded over num_threads).  rows for methods not
     run this time are kept from an earlier csv, so the variants can be run
     one at a time and still land in one table and one pdf.
 
@@ -230,7 +229,7 @@ def anafield_scaling_compare(nrow=224, ncol=224, obs_sizes=(2000, 5000, 10000, 5
         exe = exe_path
     model_d = "anafield_scaling"
     os.makedirs(model_d, exist_ok=True)
-    all_methods = ("ies", "enif", "enif_lasso", "enif_lasso_col")
+    all_methods = ("ies", "enif", "enif_lasso")
     csv_name = os.path.join(model_d, "anafield_scaling.csv")
     rows = []
     if os.path.exists(csv_name):
@@ -267,8 +266,6 @@ def anafield_scaling_compare(nrow=224, ncol=224, obs_sizes=(2000, 5000, 10000, 5
             if method.startswith("enif_lasso"):
                 pst.pestpp_options["ies_enif_h_lasso"] = lasso_frac
                 pst.pestpp_options["ies_num_threads"] = num_threads
-            if method == "enif_lasso_col":
-                pst.pestpp_options["ies_enif_h_by_col"] = "true"
             m_d = os.path.join(model_d, "master_{0}_{1}".format(method, nobs))
             if os.path.exists(m_d):
                 shutil.rmtree(m_d)
@@ -298,10 +295,9 @@ def anafield_scaling_compare(nrow=224, ncol=224, obs_sizes=(2000, 5000, 10000, 5
             f = os.path.join(model_d, "master_{0}_{1}".format(method, nobs), "anafield.phi.actual.csv")
             if (method, nobs) not in phis and os.path.exists(f):
                 phis[(method, nobs)] = pd.read_csv(f, index_col=0)
-    colors = {"ies": "tab:blue", "enif": "tab:red", "enif_lasso": "tab:green", "enif_lasso_col": "tab:purple"}
+    colors = {"ies": "tab:blue", "enif": "tab:red", "enif_lasso": "tab:green"}
     with PdfPages(os.path.join(model_d, "anafield_scaling.pdf")) as pdf:
-        labels = {"ies": "ies", "enif": "enif woodbury, implicit H", "enif_lasso": "enif woodbury, lasso H",
-                  "enif_lasso_col": "enif woodbury, lasso H by column"}
+        labels = {"ies": "ies", "enif": "enif woodbury, implicit H", "enif_lasso": "enif woodbury, lasso H"}
         fig, axes = plt.subplots(1, 4, figsize=(18, 4.5))
         for method in all_methods:
             d = summ.loc[summ.method == method]
@@ -393,8 +389,6 @@ def anafield_reach_compare(nrow=64, ncol=64, nobs=1000, num_reals=500, noptmax=8
       enif_wood_cur       woodbury, implicit H, current covariance (the control = ies)
       enif_graph_est      rook graph, lasso H, prior precision ESTIMATED from the prior ensemble
       enif_graph_model    lasso H, prior precision from the variogram (ies_enif_prec_file)
-      enif_graph_model_hybrid   as above with lambda on the current-ensemble precision
-      enif_graph_est_hybrid     estimated prior precision with the hybrid damping
 
     scoring: phi, rmse of the mean log field against the truth, spread, the
     fraction of the mean update that lies outside the span of the prior
@@ -441,13 +435,7 @@ def anafield_reach_compare(nrow=64, ncol=64, nobs=1000, num_reals=500, noptmax=8
         "enif_wood_cur": dict(enif, ies_enif_current_prec="true"),
         "enif_graph_est": dict(graph, ies_enif_graph="graph_rook.jcb"),
         "enif_graph_model": dict(graph, ies_enif_prec_file="prec_model.jcb"),
-        "enif_graph_model_hybrid": dict(graph, ies_enif_prec_file="prec_model.jcb", ies_enif_hybrid_damp="true"),
-        "enif_graph_est_hybrid": dict(graph, ies_enif_graph="graph_rook.jcb", ies_enif_hybrid_damp="true"),
     }
-    # the same graph runs with the lasso H fitted in column order (ies_enif_h_by_col).
-    # not in the default list: they are the row-order runs again, only faster
-    for tag in [t for t in all_variants if t.startswith("enif_graph")]:
-        all_variants[tag + "_col"] = dict(all_variants[tag], ies_enif_h_by_col="true")
     # and with the block localizer limiting which parameters each lasso H row can use.
     # H is saved so its pattern can be checked against the localizer
     for tag in [t for t in all_variants if t.startswith("enif_graph") and not t.endswith("_col")]:

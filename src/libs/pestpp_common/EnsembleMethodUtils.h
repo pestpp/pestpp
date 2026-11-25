@@ -381,10 +381,6 @@ public:
     void solve_enif_multimodal(int num_threads, double cur_lam, ParameterEnsemble& pe_upgrade);
     void solve_multimodal(int num_threads, double cur_lam, bool use_glm_form, ParameterEnsemble& pe_upgrade, unordered_map<string,pair<vector<string>, vector<string>>>& loc_map, double mm_alpha);
     void update_multimodal_components(const double mm_alpha);
-    //ies_use_prior_prec: the p x p prior precision the glm solve should use in place of
-    //the ensemble pseudo-inverse.  owned by EnsembleMethod (it outlives this solver, which
-    //is rebuilt every iteration) and null when the option is off
-    void set_prior_prec(const Eigen::SparseMatrix<double>* q) { prior_prec = q; }
 
 
 private:
@@ -418,7 +414,6 @@ private:
 	//the noise inflation report is the same for every lambda too, so once per iteration
 	bool enif_inflate_reported = false;
 	Eigen::MatrixXd& Am;
-	const Eigen::SparseMatrix<double>* prior_prec = nullptr;
 	L2PhiHandler& ph;
 	unordered_map<string, Eigen::VectorXd> par_resid_map, obs_resid_map, Am_map;
 	unordered_map<string, Eigen::VectorXd> par_diff_map, obs_diff_map, obs_err_map;
@@ -467,7 +462,7 @@ public:
         unordered_map<string, Eigen::SparseMatrix<double>>& _H_map,
         unordered_map<string, Eigen::VectorXd>& _unexp_map, bool _h_ready,
         const EnifGraph* _graph, const Eigen::SparseMatrix<double>* _C, const Eigen::MatrixXd* _Afac,
-        double _lasso, int _cv_folds, bool _by_col, bool _inflate, double _cur_lam, Eigen::MatrixXd& _upgrade);
+        double _lasso, bool _inflate, double _cur_lam, Eigen::MatrixXd& _upgrade);
     void work(int thread_id);
     //noise variance each realization ended up with, aligned with real_names, for the report
     vector<Eigen::VectorXd> noise_var;
@@ -491,8 +486,6 @@ protected:
     //the current ensemble anomalies when the covariance is C = A A^T; null means use C
     const Eigen::MatrixXd* Afac;
     double lasso;
-    int cv_folds;
-    bool by_col;
     bool inflate;
     double cur_lam;
     Eigen::MatrixXd& upgrade;
@@ -581,16 +574,6 @@ public:
                            const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& parcov_inv,
                            const vector<string>& act_obs_names,const vector<string>& act_par_names, double _reg_factor,
                            double mm_weight_sum = -1.0, PestppOptions::SVD_PACK svd_pack = PestppOptions::REDSVD);
-    //the same glm step with an explicit prior precision Q in both the hessian and the
-    //gradient (ies_use_prior_prec).  par_diff, par_resid are raw (unscaled) p x N, obs_diff,
-    //obs_resid n x N; upgrade_1 comes back N x p like ensemble_solution
-    static void ensemble_solution_prec(const int iter, const int verbose_level, const int maxsing,
-                           const bool use_approx, const double cur_lam, const double eigthresh,
-                           Eigen::MatrixXd& par_resid, Eigen::MatrixXd& par_diff,
-                           const Eigen::SparseMatrix<double>& Q, Eigen::MatrixXd& obs_resid,
-                           Eigen::MatrixXd& obs_diff, Eigen::MatrixXd& upgrade_1,
-                           const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& weights, double _reg_factor,
-                           PestppOptions::SVD_PACK svd_pack = PestppOptions::REDSVD);
 protected:
 	PerformanceLog* performance_log;
 	Localizer::How how;
@@ -1147,11 +1130,6 @@ protected:
 	vector<int> resolve_subset_idxs(const vector<string>& names, const vector<string>& current_names) const;
 
 	Eigen::MatrixXd get_Am(const vector<string>& real_names, const vector<string>& par_names);
-	//ies_use_prior_prec: the prior precision, built once (graph estimate from the prior
-	//ensemble, or the parcov inverse) and handed to every EnsembleSolver after that
-	Eigen::SparseMatrix<double> prior_prec;
-	bool prior_prec_ready = false;
-	void initialize_prior_prec();
 
 
 	void zero_weight_obs(vector<string>& obs_to_zero_weight, bool update_obscov = true, bool update_oe_base = true);

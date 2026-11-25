@@ -1213,35 +1213,15 @@ bool PestppOptions::assign_ies_value_by_key(const string& key, const string& val
         convert_ip(value,ies_enif_h_lasso);
         return true;
     }
-    else if (key == "IES_ENIF_H_CV_FOLDS")
-    {
-        convert_ip(value,ies_enif_h_cv_folds);
-        return true;
-    }
     else if (key == "IES_ENIF_CURRENT_PREC")
     {
         ies_enif_current_prec = pest_utils::parse_string_arg_to_bool(value);
-        return true;
-    }
-    else if (key == "IES_ENIF_DIRECT_NBRS")
-    {
-        ies_enif_direct_nbrs = pest_utils::parse_string_arg_to_bool(value);
-        return true;
-    }
-    else if (key == "IES_ENIF_H_BY_COL")
-    {
-        ies_enif_h_by_col = pest_utils::parse_string_arg_to_bool(value);
         return true;
     }
     else if (key == "IES_ENIF_PREC_FILE")
     {
         //org_value: filenames are case sensitive
         ies_enif_prec_file = org_value;
-        return true;
-    }
-    else if (key == "IES_ENIF_HYBRID_DAMP")
-    {
-        ies_enif_hybrid_damp = pest_utils::parse_string_arg_to_bool(value);
         return true;
     }
     else if (key == "IES_LOCALIZER_COMBINE_COMMON")
@@ -1254,20 +1234,9 @@ bool PestppOptions::assign_ies_value_by_key(const string& key, const string& val
         convert_ip(value,ies_enif_shrink);
         return true;
     }
-    else if (key == "IES_ENIF_ORDER")
-    {
-        //'amd' or 'natural'; the graph code lower-cases whatever arrives here
-        ies_enif_order = value;
-        return true;
-    }
     else if (key == "IES_ENIF_SAVE_H")
     {
         ies_enif_save_h = pest_utils::parse_string_arg_to_bool(value);
-        return true;
-    }
-    else if (key == "IES_USE_PRIOR_PREC")
-    {
-        ies_use_prior_prec = pest_utils::parse_string_arg_to_bool(value);
         return true;
     }
     else if (key == "IES_MULTIMODAL_ALPHA")
@@ -2426,17 +2395,11 @@ os << endl << "...pestpp-swp options:" << endl;
 	os << "ies_enif_resid_inflate: " << ies_enif_resid_inflate << endl;
 	os << "ies_enif_graph: " << ies_enif_graph << endl;
 	os << "ies_enif_h_lasso: " << ies_enif_h_lasso << endl;
-	os << "ies_enif_h_cv_folds: " << ies_enif_h_cv_folds << endl;
 	os << "ies_enif_shrink: " << ies_enif_shrink << endl;
 	os << "ies_enif_current_prec: " << ies_enif_current_prec << endl;
-	os << "ies_enif_direct_nbrs: " << ies_enif_direct_nbrs << endl;
-	os << "ies_enif_h_by_col: " << ies_enif_h_by_col << endl;
 	os << "ies_enif_prec_file: " << ies_enif_prec_file << endl;
-	os << "ies_enif_hybrid_damp: " << ies_enif_hybrid_damp << endl;
 	os << "ies_localizer_combine_common: " << ies_localizer_combine_common << endl;
-	os << "ies_enif_order: " << ies_enif_order << endl;
 	os << "ies_enif_save_h: " << ies_enif_save_h << endl;
-	os << "ies_use_prior_prec: " << ies_use_prior_prec << endl;
 	os << "ies_multimodal_alpha: " << ies_multimodal_alpha << endl;
 	os << "ies_multimodal_weight_exponent: " << ies_multimodal_weight_exponent << endl;
 	os << "ies_multimodal_phi_weight: " << ies_multimodal_phi_weight << endl;
@@ -2704,17 +2667,11 @@ void PestppOptions::set_defaults_legacy()
     set_ies_enif_resid_inflate(true);
     set_ies_enif_graph("");
     set_ies_enif_h_lasso(0.0);
-    set_ies_enif_h_cv_folds(0);
     set_ies_enif_shrink(-1.0);   //automatic: per-node ridge by cross-validation
     set_ies_enif_current_prec(false);
-    set_ies_enif_direct_nbrs(false);
-    set_ies_enif_h_by_col(false);
     set_ies_enif_prec_file("");
-    set_ies_enif_hybrid_damp(false);
     set_ies_localizer_combine_common(false);
-    set_ies_enif_order("amd");
     set_ies_enif_save_h(false);
-    set_ies_use_prior_prec(false);
     set_ies_multimodal_alpha(0.0);
     set_ies_multimodal_weight_exponent(0.0);
     set_ies_multimodal_phi_weight(0.5);

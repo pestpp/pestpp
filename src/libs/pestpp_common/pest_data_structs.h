@@ -700,28 +700,16 @@ public:
     void set_ies_enif_graph(string _s) { ies_enif_graph = _s; }
     double get_ies_enif_h_lasso() const { return ies_enif_h_lasso; }
     void set_ies_enif_h_lasso(double _f) { ies_enif_h_lasso = _f; }
-    int get_ies_enif_h_cv_folds() const { return ies_enif_h_cv_folds; }
-    void set_ies_enif_h_cv_folds(int _n) { ies_enif_h_cv_folds = _n; }
     double get_ies_enif_shrink() const { return ies_enif_shrink; }
     void set_ies_enif_shrink(double _f) { ies_enif_shrink = _f; }
     bool get_ies_enif_current_prec() const { return ies_enif_current_prec; }
     void set_ies_enif_current_prec(bool _f) { ies_enif_current_prec = _f; }
-    bool get_ies_enif_direct_nbrs() const { return ies_enif_direct_nbrs; }
-    void set_ies_enif_direct_nbrs(bool _f) { ies_enif_direct_nbrs = _f; }
-    bool get_ies_enif_h_by_col() const { return ies_enif_h_by_col; }
-    void set_ies_enif_h_by_col(bool _f) { ies_enif_h_by_col = _f; }
     string get_ies_enif_prec_file() const { return ies_enif_prec_file; }
     void set_ies_enif_prec_file(string _s) { ies_enif_prec_file = _s; }
-    bool get_ies_enif_hybrid_damp() const { return ies_enif_hybrid_damp; }
-    void set_ies_enif_hybrid_damp(bool _f) { ies_enif_hybrid_damp = _f; }
     bool get_ies_localizer_combine_common() const { return ies_localizer_combine_common; }
     void set_ies_localizer_combine_common(bool _f) { ies_localizer_combine_common = _f; }
-    string get_ies_enif_order() const { return ies_enif_order; }
-    void set_ies_enif_order(string _s) { ies_enif_order = _s; }
     bool get_ies_enif_save_h() const { return ies_enif_save_h; }
     void set_ies_enif_save_h(bool _f) { ies_enif_save_h = _f; }
-    bool get_ies_use_prior_prec() const { return ies_use_prior_prec; }
-    void set_ies_use_prior_prec(bool _flag) { ies_use_prior_prec = _flag; }
     double get_ies_multimodal_alpha() const { return ies_multimodal_alpha; }
     void set_ies_multimodal_alpha(double _flag) { ies_multimodal_alpha = _flag; }
     double get_ies_multimodal_weight_exponent() const { return ies_multimodal_weight_exponent; }
@@ -1128,27 +1116,18 @@ private:
 	bool ies_enif_resid_inflate;
 	string ies_enif_graph;
 	double ies_enif_h_lasso;
-	int ies_enif_h_cv_folds;
 	double ies_enif_shrink;
 	//hessian built from the CURRENT ensemble (precision re-estimated on the graph each
 	//iteration, or the ensemble covariance in place of parcov) instead of the prior.  only
 	//meaningful with ies_use_approx, where the prior enters the step through the hessian alone
 	bool ies_enif_current_prec;
-	//regress each node on its direct graph neighbours only when estimating the precision,
-	//ignoring the fill of the factorisation
-	bool ies_enif_direct_nbrs;
-	bool ies_enif_h_by_col;
 	//a sparse prior precision read from file (values, not just the pattern) in place of
 	//one estimated from the prior ensemble; the file is also the graph
 	string ies_enif_prec_file;
-	//lambda on the current-ensemble precision instead of the prior one on the graph path
-	bool ies_enif_hybrid_damp;
 	//merge localizer columns (or rows) with the same nonzero pattern into one local solve,
 	//the way a parameter group column already is one
 	bool ies_localizer_combine_common;
-	string ies_enif_order;
 	bool ies_enif_save_h;
-	bool ies_use_prior_prec;
 	double ies_multimodal_alpha;
 	double ies_multimodal_weight_exponent;
 	double ies_multimodal_phi_weight;
