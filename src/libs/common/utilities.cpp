@@ -1778,7 +1778,8 @@ ExternalCtlFile::ExternalCtlFile(const string& _line, bool _cast) :
 vector<string> pest_utils::ExternalCtlFile::get_row_vector(int idx, vector<string> include_cols)
 {
 	stringstream ss;
-	if (data.find(idx) == data.end())
+	int pos = row_pos(idx);
+	if (pos < 0)
 	{
 		ss.str("");
 		ss << "get_row_map() error: idx: " << idx << " not found";
@@ -1790,23 +1791,21 @@ vector<string> pest_utils::ExternalCtlFile::get_row_vector(int idx, vector<strin
 	//if no include_cols, then dont sweat missing vals...
 	if (include_cols.size() == 0)
 	{
-		for (auto col : col_names)
+		for (int icol = 0; icol < col_names.size(); icol++)
 		{
-			sval = data[idx][col];
-			rvector.push_back(sval);
+			rvector.push_back(cell(pos, icol));
 		}
 	}
 	else
 	{
-		set<string> cnames = get_col_set();
-		
 		for (auto col : include_cols)
 		{
 			//check exists
-			if (cnames.find(col) == cnames.end())
+			int icol = col_pos(col);
+			if (icol < 0)
 				throw_externalctrlfile_error("get_row_vector() error: include_col '" + col + "' not found in col names");
 			//check missing val
-			sval = data[idx][col];
+			sval = cell(pos, icol);
 			if (sval == missing_val)
 			{
 				ss.str("");
@@ -1823,18 +1822,13 @@ vector<string> pest_utils::ExternalCtlFile::get_row_vector(int idx, vector<strin
 
 vector<string> ExternalCtlFile::get_col_string_vector(string col_name)
 {
-	stringstream ss;
-	set<string> cnames = get_col_set();
-	if (cnames.find(col_name) == cnames.end())
+	int icol = col_pos(col_name);
+	if (icol < 0)
 		throw_externalctrlfile_error("get_col_string_vector() error: col_name '" + col_name + "' not in col_names");
-	string sval;
-	vector<string> col_vector;
-	for (auto ro : row_order)
-	{
-		sval = data[ro][col_name];
-		col_vector.push_back(sval);
-	}
-	return col_vector;
+	//a column that wasn't kept reads back as all empty
+	if (col_data[icol].size() != row_order.size())
+		return vector<string>(row_order.size(), "");
+	return col_data[icol];
 }
 
 map<string, string> pest_utils::ExternalCtlFile::get_row_map(string key, string col_name, vector<string> include_cols)
@@ -1859,8 +1853,8 @@ void ExternalCtlFile::set_data_value(const string& row_name, const string &col_n
 	int row_idx = idx_map[row_name];
 
 
-	set<string> col_names = get_col_set();
-	if (col_names.find(col_name) == col_names.end()) {
+	int icol = col_pos(col_name);
+	if (icol < 0) {
 		if (forgive) {
 			return;
 		}
@@ -1868,13 +1862,16 @@ void ExternalCtlFile::set_data_value(const string& row_name, const string &col_n
 			throw_externalctrlfile_error("set_data_value(): col_name '"+col_name + "' not found");
 		}
 	}
-	data.at(row_idx).at(col_name) = value;
+	if (col_data[icol].size() != row_order.size())
+		throw_externalctrlfile_error("set_data_value(): col_name '" + col_name + "' was not kept when the file was read");
+	col_data[icol].at(row_idx) = value;
 }
 
 map<string, string> pest_utils::ExternalCtlFile::get_row_map(int idx, vector<string> include_cols)
 {
 	stringstream ss;
-	if (data.find(idx) == data.end())
+	int pos = row_pos(idx);
+	if (pos < 0)
 	{
 		ss.str("");
 		ss << "get_row_map() error: idx: " << idx << " not found";
@@ -1884,20 +1881,27 @@ map<string, string> pest_utils::ExternalCtlFile::get_row_map(int idx, vector<str
 	//if no include_cols, dont sweat missing vals
 	if (include_cols.size() == 0)
 	{
-		return data[idx];
+		//just the columns that were kept, same as before
+		map<string, string> rmap;
+		for (int icol = 0; icol < col_names.size(); icol++)
+		{
+			if (col_data[icol].size() == row_order.size())
+				rmap[col_names[icol]] = col_data[icol][pos];
+		}
+		return rmap;
 	}
 	else
 	{
 		map<string, string> rmap;
-		set<string> cnames = get_col_set();
 		string sval;
 		for (auto col : include_cols)
 		{
 			//check exists
-			if (cnames.find(col) == cnames.end())
+			int icol = col_pos(col);
+			if (icol < 0)
 				throw_externalctrlfile_error("get_row_map() error: include_col '" + col + "' not found in col names");
 			//check missing val
-			sval = data[idx][col];
+			sval = cell(pos, icol);
 			if (sval == missing_val)
 			{
 				ss.str("");
@@ -1983,7 +1987,15 @@ void ExternalCtlFile::read_file(ofstream& f_rec)
 		}
 			
 	}
-	map<string, string> row_map;
+	//one list per column. only the columns asked for with set_read_cols() (all of them if
+	//none were asked for) get filled - the others stay empty and read back as ""
+	col_data.clear();
+	col_data.resize(hsize);
+	row_order.clear();
+	vector<bool> store(hsize, true);
+	if (read_cols.size() > 0)
+		for (int i = 0; i < hsize; i++)
+			store[i] = read_cols.find(col_names[i]) != read_cols.end();
 	vector<string> tokens, temp_tokens,quote_tokens;
 	string ddelim;
 	int lcount = 1,last_size;
@@ -2074,10 +2086,9 @@ void ExternalCtlFile::read_file(ofstream& f_rec)
             ss << "line:" << next_line;
 			throw_externalctrlfile_error(ss.str());
 		}
-		row_map.clear();
 		for (int i = 0; i < hsize; i++)
-			row_map[col_names[i]] = strip_cp(tokens[i], "both");
-		data[lcount - 1] = row_map;
+			if (store[i])
+				col_data[i].push_back(strip_cp(tokens[i], "both"));
 		row_order.push_back(lcount - 1);
 		lcount++;
 	}
@@ -2096,19 +2107,48 @@ void ExternalCtlFile::keep_cols(set<string>& keep_cols)
 		if (keep_upper.find(c) != keep_upper.end())
 			keep.push_back(c);
 	}
-	if (keep.size() == 0)
+	set<string> skeep(keep.begin(), keep.end());
+	for (int i = 0; i < col_names.size(); i++)
 	{
-		data.clear();
-		return;
+		if (skeep.find(col_names[i]) == skeep.end())
+			//swap with an empty list so the memory actually goes
+			vector<string>().swap(col_data[i]);
 	}
-	map<string, string> t;
-	for (auto& d : data)
-	{
-		t.clear();
-		for (auto k : keep)
-			t[k] = d.second[k];
-		d.second = t;
-	}
+}
+
+void ExternalCtlFile::set_read_cols(const set<string>& cols)
+{
+	read_cols.clear();
+	for (auto& c : cols)
+		read_cols.emplace(upper_cp(c));
+}
+
+int ExternalCtlFile::row_pos(int idx) const
+{
+	//row_order is always increasing (line numbers), and is just 0,1,2... unless the file had
+	//comment lines, so check the easy case first
+	if ((idx >= 0) && (idx < row_order.size()) && (row_order[idx] == idx))
+		return idx;
+	auto it = lower_bound(row_order.begin(), row_order.end(), idx);
+	if ((it == row_order.end()) || (*it != idx))
+		return -1;
+	return distance(row_order.begin(), it);
+}
+
+int ExternalCtlFile::col_pos(const string& col) const
+{
+	for (int i = 0; i < col_names.size(); i++)
+		if (col_names[i] == col)
+			return i;
+	return -1;
+}
+
+const string& ExternalCtlFile::cell(int pos, int icol) const
+{
+	static const string empty;
+	if (col_data[icol].size() != row_order.size())
+		return empty;
+	return col_data[icol][pos];
 }
 
 void ExternalCtlFile::parse_control_record()
@@ -2185,14 +2225,10 @@ bool ExternalCtlFile::isduplicated(string col_name)
 	if (cnames.find(col_name) == cnames.end())
 		throw_externalctrlfile_error("isduplicated() error: col_name '" + col_name + "' not in col_names");
 	cnames.clear();
-	for (const auto& kv : data)
-	{
-		// find, not [] - the row is const now, and a row missing this column used to insert
-		// an empty string into the copy and hand back "". same answer, no insert
-		auto it = kv.second.find(col_name);
-		cnames.insert(it == kv.second.end() ? string() : it->second);
-	}
-	if (cnames.size() != data.size())
+	int icol = col_pos(col_name);
+	for (int pos = 0; pos < row_order.size(); pos++)
+		cnames.insert(cell(pos, icol));
+	if (cnames.size() != row_order.size())
 		return true;
 	return false;
 }

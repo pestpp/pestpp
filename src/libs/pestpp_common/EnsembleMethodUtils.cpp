@@ -1037,7 +1037,7 @@ void EnsembleSolver::solve_multimodal(int num_threads, double cur_lam, bool use_
             upgrade_real_names.push_back(real_names[idx]);
 
         ParameterEnsemble pe_real(&pest_scenario, pe.get_rand_gen_ptr());
-        pe_real.reserve(upgrade_real_names, pe.get_var_names());
+        pe_real.reserve(upgrade_real_names, pe.get_shared_var_names());
 
         if (!localizer.get_use()) {
             performance_log->log_event("calculating nonlocalized multimodal upgrade for " + real_name);
@@ -3182,7 +3182,7 @@ vector<string> ViolationDetector::read_nominated(Pest& scenario)
 	return out;
 }
 
-void ViolationDetector::apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals,vector<string> &names)
+void ViolationDetector::apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, const vector<string> &names)
 {
 	if ((lt_obs_names.empty()) && (gt_obs_names.empty()) &&
             (lt_obs_bounds.empty()) && (gt_obs_bounds.empty()) &&
@@ -3201,9 +3201,18 @@ void ViolationDetector::apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::Ma
        (lt_obs_bounds.empty()) && (gt_obs_bounds.empty()) &&
             (double_obs_bounds.empty()))
 		return;
+	//only the obs that have an inequality or a bound need a column - with millions of obs a
+	//lookup of every name here cost about as much as the whole name list, on every call
+	set<string> wanted;
+	for (const auto& iv : lt_vals) wanted.insert(iv.first);
+	for (const auto& iv : gt_vals) wanted.insert(iv.first);
+	for (const auto& iv : lt_obs_bounds) wanted.insert(iv.first);
+	for (const auto& iv : gt_obs_bounds) wanted.insert(iv.first);
+	for (const auto& iv : double_obs_bounds) wanted.insert(iv.first);
 	map<string, int> idxs;
 	for (int i = 0; i < names.size(); i++)
-		idxs[names[i]] = i;
+		if (wanted.find(names[i]) != wanted.end())
+			idxs[names[i]] = i;
 	int idx;
 	double val,val2;
 	Eigen::VectorXd col, scol;
@@ -3470,7 +3479,7 @@ Eigen::MatrixXd L2PhiHandler::get_obs_resid_subset(ObservationEnsemble &oe, bool
     {
         real_names = oe.get_real_names();
     }
-	vector<string> names = oe.get_var_names();
+	const vector<string>& names = oe.get_var_names();
     Eigen::MatrixXd oe_vals = oe.get_eigen(real_names,vector<string>());
 	Eigen::MatrixXd resid = oe_vals - oe_base->get_eigen(real_names, names);
 	if (apply_ineq)
@@ -3722,7 +3731,7 @@ void L2PhiHandler::save_residual_cov(ObservationEnsemble& oe, int iter)
 {
 	Eigen::MatrixXd rmat = get_obs_resid(oe, false); //dont apply ineq constraints
 	ObservationEnsemble res(pest_scenario, oe.get_rand_gen_ptr());
-	res.reserve(oe.get_real_names(), oe_base->get_var_names());
+	res.reserve(oe.get_real_names(), oe_base->get_shared_var_names());
 	res.set_eigen(rmat);
 	pair<Covariance,Covariance> rcovs = res.get_empirical_cov_matrices(file_manager);
 	stringstream ss;
@@ -3979,8 +3988,7 @@ vector<string> L2PhiHandler::detect_simulation_data_conflict(ObservationEnsemble
 
     double smin, smax, omin, omax, smin_stat, smax_stat, omin_stat, omax_stat;
     map<string, int> smap, omap;
-    vector<string> snames = _oe.get_var_names();
-    vector<string> onames = oe_base->get_var_names();
+    const vector<string>& onames = oe_base->get_var_names();
     vector<string> temp = get_lt_obs_names();
     set<string> ineq_lt(temp.begin(), temp.end());
     //set<string>::iterator end = ineq.end();
@@ -3988,8 +3996,11 @@ vector<string> L2PhiHandler::detect_simulation_data_conflict(ObservationEnsemble
     set<string> ineq_gt(temp.begin(), temp.end());
     temp.resize(0);
 
-    for (int i = 0; i < snames.size(); i++) {
-        smap[snames[i]] = i;
+    //smap only needs the weighted obs, not every obs in _oe
+    for (auto& oname : pest_scenario->get_ctl_ordered_nz_obs_names()) {
+        int i = _oe.get_var_index(oname);
+        if (i >= 0)
+            smap[oname] = i;
     }
     for (int i = 0; i < onames.size(); i++) {
         omap[onames[i]] = i;
@@ -4805,7 +4816,7 @@ vector<string> L2PhiHandler::get_violating_realizations(ObservationEnsemble& oe,
 }
 
 
-void L2PhiHandler::apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, vector<string> &names)
+void L2PhiHandler::apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, const vector<string> &names)
 {
 	// forwards: phi's inequality treatment and the violation test are the same code
 	ineq.apply_ineq_constraints(resid, sim_vals, names);
@@ -6233,7 +6244,7 @@ int EnsembleMethod::initialize_prepare(int cycle, bool run, bool use_existing)
 				message(1, "calculating mean parameter values");
 				Parameters pars = pest_scenario.get_ctl_parameters();
 				pars.update(pe.get_var_names(), pe.get_mean_stl_var_vector());
-				_pe.reserve(vector<string>(), pe.get_var_names());
+				_pe.reserve(vector<string>(), pe.get_shared_var_names());
 				_pe.set_trans_status(pe.get_trans_status());
 				_pe.append("mean", pars);
 			}
@@ -7004,7 +7015,7 @@ int EnsembleMethod::initialize_prepare(int cycle, bool run, bool use_existing)
         ParamTransformSeq pts = pe.get_par_transform();
 
         ParameterEnsemble _pe(&pest_scenario, &rand_gen);
-        _pe.reserve(vector<string>(), pe.get_var_names());
+        _pe.reserve(vector<string>(), pe.get_shared_var_names());
         _pe.set_trans_status(pe.get_trans_status());
 
         if (rname != "mean") {
@@ -7022,7 +7033,7 @@ int EnsembleMethod::initialize_prepare(int cycle, bool run, bool use_existing)
         pe_base = _pe;
         pe_base.reorder(vector<string>(), act_par_names);
         ObservationEnsemble _oe(&pest_scenario, &rand_gen);
-        _oe.reserve(vector<string>(), oe_base.get_var_names());
+        _oe.reserve(vector<string>(), oe_base.get_shared_var_names());
         _oe.reserve(vector<string>(), pest_scenario.get_ctl_ordered_obs_names());
         _oe.append(org_rname, pest_scenario.get_ctl_observations());
         oe_base = _oe;
@@ -9981,7 +9992,7 @@ void EnsembleMethod::reinflate_par_ensemble(double reinflate_factor,int reinflat
     }
     // the residuals come from oe, so this has to happen before oe is reset below
     apply_structural_noise(structnoise_frac);
-    oe.reserve(oebase_real_names,oe.get_var_names());
+    oe.reserve(oebase_real_names,oe.get_shared_var_names());
     weights = weights_base;
     for (auto& oname : oe.get_var_names())
     {
@@ -10818,7 +10829,7 @@ bool EnsembleMethod::initialize_weights()
             wvec[i] = 0.0;
         }
         message(1, "setting weights ensemble to zeros - no non-zero weighted obs found");
-        weights.reserve(oe_base.get_real_names(), oe_base.get_var_names());
+        weights.reserve(oe_base.get_real_names(), oe_base.get_shared_var_names());
         weights.get_eigen_ptr_4_mod()->setZero();
         for (int i = 0; i < weights.shape().first; i++) {
             weights.get_eigen_ptr_4_mod()->row(i) = wvec;

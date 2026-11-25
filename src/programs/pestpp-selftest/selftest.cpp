@@ -1780,6 +1780,154 @@ static void test_ensemble_keep_rows_empty()
     }
 }
 
+// with millions of obs the name list and the name->column lookup are bigger than the numbers
+// in a lambda-test ensemble, so copies share them instead of each holding their own. these
+// checks fail if a copy of the names creeps back in, without having to measure memory
+static void test_ensemble_shared_names()
+{
+    cout << "[ensemble names: copies share one name list and lookup until their names change]" << endl;
+    Pest p; p.set_defaults();
+    std::mt19937 rgen(11);
+
+    int nvar = 100;
+    vector<string> rnames{"R0","R1","R2"};
+    vector<string> vnames;
+    for (int j = 0; j < nvar; j++)
+        vnames.push_back("V" + to_string(j));
+    Eigen::MatrixXd m(3, nvar);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < nvar; j++)
+            m(i, j) = 1000.0 * i + j;
+
+    ObservationEnsemble oe(&p, &rgen, m, rnames, vnames);
+
+    // get_var_names() hands back the ensemble's own list, not a copy
+    CHK(&oe.get_var_names() == &oe.get_var_names(), "get_var_names(): returns the ensemble's own list, not a copy");
+
+    // asking for a few columns out of many doesn't build the lookup of every name
+    {
+        ObservationEnsemble fresh(&p, &rgen, m, rnames, vnames);
+        Eigen::MatrixXd few = fresh.get_eigen(vector<string>(), vector<string>{"V7","V3","V7"});
+        CHK(!fresh.get_shared_var_names().has_lookup(), "get_eigen(few cols): no lookup of every name built");
+        CHK((few.cols() == 3) && (few(1, 0) == 1007.0) && (few(2, 1) == 2003.0) && (few(0, 2) == 7.0),
+            "get_eigen(few cols): right values, a column asked for twice comes back twice");
+        bool threw = false;
+        try { fresh.get_eigen(vector<string>(), vector<string>{"V7","NOT_THERE"}); }
+        catch (...) { threw = true; }
+        CHK(threw, "get_eigen(few cols): a name that isn't there still throws");
+    }
+
+    // a copy shares the names and the lookup
+    oe.update_var_map();
+    ObservationEnsemble c = oe;
+    CHK(c.get_shared_var_names().same_as(oe.get_shared_var_names()), "copy: shares the name list");
+    CHK(&c.get_var_names() == &oe.get_var_names(), "copy: get_var_names() is the very same list");
+    CHK(c.get_shared_var_names().has_lookup(), "copy: shares the lookup already built on the original");
+    CHK(c.get_var_index("V42") == 42, "copy: lookup gives the right column");
+
+    // assignment shares too
+    ObservationEnsemble a(&p, &rgen);
+    a = oe;
+    CHK(a.get_shared_var_names().same_as(oe.get_shared_var_names()), "assignment: shares the name list");
+
+    // changing the copy's names gives it its own list and leaves the original alone
+    vector<string> rev(vnames.rbegin(), vnames.rend());
+    c.reorder(vector<string>(), rev);
+    CHK(!c.get_shared_var_names().same_as(oe.get_shared_var_names()), "reorder on a copy: the copy gets its own names");
+    CHK((oe.get_var_names()[0] == "V0") && (oe.get_var_index("V0") == 0), "reorder on a copy: the original's names untouched");
+    CHK((c.get_var_names()[0] == "V" + to_string(nvar - 1)) && (c.get_var_index("V0") == nvar - 1),
+        "reorder on a copy: the copy's lookup matches its new order");
+    CHK((*oe.get_eigen_ptr())(1, 0) == 1000.0, "reorder on a copy: the original's values untouched");
+
+    // dropping columns on a copy: the lookup can never go stale (the old var_map could)
+    ObservationEnsemble d = oe;
+    d.drop_cols(vector<string>{"V0","V1"});
+    CHK(d.get_var_map().size() == (size_t)(nvar - 2), "drop_cols on a copy: lookup has just the names left");
+    CHK((d.get_var_index("V0") == -1) && (d.get_var_index("V2") == 0), "drop_cols on a copy: lookup matches the names left");
+    CHK(oe.get_var_index("V0") == 0, "drop_cols on a copy: original keeps all its names");
+
+    // an ensemble handed its own names (the list it's about to replace) still comes out right
+    ObservationEnsemble s(&p, &rgen, m, rnames, vnames);
+    s.reorder(vector<string>(), s.get_var_names());
+    CHK((s.get_var_names().size() == (size_t)nvar) && (s.get_var_names()[5] == "V5") && ((*s.get_eigen_ptr())(2, 5) == 2005.0),
+        "reorder with its own names: names and values unchanged");
+
+    // reserve() given a shared list shares it rather than copying
+    ObservationEnsemble r(&p, &rgen);
+    r.reserve(vector<string>{"A","B"}, oe.get_shared_var_names());
+    CHK(r.get_shared_var_names().same_as(oe.get_shared_var_names()), "reserve(shared names): shares the name list");
+    CHK((r.shape().first == 2) && (r.shape().second == nvar), "reserve(shared names): right shape");
+
+    // parameter ensembles get the same sharing
+    ParameterEnsemble pe(&p, &rgen);
+    pe.reserve(rnames, vnames);
+    ParameterEnsemble pc = pe;
+    CHK(pc.get_shared_var_names().same_as(pe.get_shared_var_names()), "par ensemble copy: shares the name list");
+}
+
+// the external obs data csv used to be held as a column-name -> value lookup for every row,
+// every column - 24 GB for a 7.5M obs file. now the obs file keeps one list per column, and
+// only the columns pest++ uses
+static void test_external_file_read_cols()
+{
+    cout << "[external file: only the asked-for columns are kept, the rest read back empty]" << endl;
+    string fname = "selftest_efile.csv";
+    {
+        ofstream f(fname);
+        f << "obsnme,obsval,weight,obgnme,extra1,standard_deviation,extra2" << endl;
+        f << "o1,1.5,1.0,g1,x,0.1,y" << endl;
+        f << "# a comment line in the middle" << endl;
+        f << "o2,2.5,0.0,g1,x,,y" << endl;
+        f << "o3,3.5,2.0,g2,x,0.3,y" << endl;
+    }
+    ofstream f_rec("selftest_efile.rec");
+    pest_utils::ExternalCtlFile efile(fname);
+    efile.set_read_cols(set<string>{"obsnme","obsval","weight","obgnme","standard_deviation"});
+    efile.read_file(f_rec);
+
+    set<string> cols = efile.get_col_set();
+    CHK((cols.size() == 7) && (cols.count("EXTRA1") == 1), "read_cols: every column still listed");
+    vector<string> e1 = efile.get_col_string_vector("EXTRA1");
+    CHK((e1.size() == 3) && (e1[0].empty()) && (e1[2].empty()), "read_cols: a column not asked for reads back empty");
+    vector<string> on = efile.get_col_string_vector("OBSNME");
+    CHK((on.size() == 3) && (on[0] == "O1") && (on[1] == "O2") && (on[2] == "O3"), "read_cols: asked-for column read right");
+    vector<string> sd = efile.get_col_string_vector("STANDARD_DEVIATION");
+    CHK((sd[0] == "0.1") && (sd[1].empty()) && (sd[2] == "0.3"), "read_cols: empty cells stay empty");
+
+    // rows are looked up by their key, which skips the comment line
+    vector<int> ro = efile.get_row_order();
+    CHK((ro.size() == 3) && (ro[0] == 0) && (ro[1] == 2) && (ro[2] == 3), "row keys skip the comment line");
+    vector<string> row = efile.get_row_vector(ro[2], vector<string>{"OBSNME","OBSVAL","WEIGHT","OBGNME"});
+    CHK((row.size() == 4) && (row[0] == "O3") && (row[1] == "3.5") && (row[3] == "G2"), "get_row_vector by key after a comment line");
+    vector<double> ov;
+    efile.fill_col_vector("OBSVAL", ov);
+    CHK((ov.size() == 3) && (ov[1] == 2.5), "fill_col_vector after a comment line");
+
+    // keep_cols drops what isn't kept, what's kept is untouched
+    set<string> keep{"obsnme","standard_deviation"};
+    efile.keep_cols(keep);
+    vector<string> ovs = efile.get_col_string_vector("OBSVAL");
+    CHK((ovs.size() == 3) && (ovs[0].empty()), "keep_cols: a dropped column reads back empty");
+    CHK(efile.get_col_string_vector("OBSNME")[1] == "O2", "keep_cols: a kept column untouched");
+    map<string, string> rm = efile.get_row_map(ro[0]);
+    CHK((rm.size() == 2) && (rm["STANDARD_DEVIATION"] == "0.1"), "get_row_map: just the kept columns");
+
+    // moved into the control file's list (as Pest does now) it keeps its data
+    vector<pest_utils::ExternalCtlFile> efiles;
+    efiles.push_back(std::move(efile));
+    CHK(efiles[0].get_col_string_vector("OBSNME")[2] == "O3", "moved into a list: data kept");
+
+    // with no read_cols set, every column is kept
+    pest_utils::ExternalCtlFile all(fname);
+    all.read_file(f_rec);
+    CHK(all.get_col_string_vector("EXTRA2")[1] == "Y", "no read_cols: every column kept");
+
+    f_rec.close();
+    std::error_code ec;
+    std::filesystem::remove(fname, ec);
+    std::filesystem::remove("selftest_efile.rec", ec);
+}
+
 static void test_ensemble_zero_copy_view()
 {
     cout << "[zero-copy ensemble view: borrowed window + invalidation]" << endl;
@@ -5953,6 +6101,8 @@ int main()
     run_test(test_tool_objects_track_live_options, "test_tool_objects_track_live_options");
     run_test(test_ensemble_zero_copy_view, "test_ensemble_zero_copy_view");
     run_test(test_ensemble_keep_rows_empty, "test_ensemble_keep_rows_empty");
+    run_test(test_ensemble_shared_names, "test_ensemble_shared_names");
+    run_test(test_external_file_read_cols, "test_external_file_read_cols");
     run_test(test_run_map_survives_resize, "test_run_map_survives_resize");
     run_test(test_subset_names_survive_membership_change, "test_subset_names_survive_membership_change");
     run_test(test_read_file_tail, "test_read_file_tail");

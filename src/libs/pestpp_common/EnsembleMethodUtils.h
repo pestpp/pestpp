@@ -84,7 +84,7 @@ public:
 
 	/// Zero the residuals of satisfied inequalities, in place. Moved here verbatim from
 	/// L2PhiHandler, which now forwards to it.
-	void apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, vector<string> &names);
+	void apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, const vector<string> &names);
 
 	/**
 	 * @brief Does ONE run violate a nominated observation?
@@ -209,7 +209,7 @@ public:
     /// The shared evaluator; mou and sqp use one directly.
     ViolationDetector& get_ineq() { return ineq; }
 
-	void apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, vector<string> &names);
+	void apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, const vector<string> &names);
 
 	void save_residual_cov(ObservationEnsemble& oe, int iter);
 
