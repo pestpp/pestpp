@@ -39,6 +39,7 @@
 #include <deque>
 #include <utility>
 #include <algorithm>
+#include <cmath>
 #include "network_wrapper.h"
 #include "network_package.h"
 #include "Transformable.h"
@@ -600,6 +601,7 @@ void RunManagerPanther::initialize(const Parameters &model_pars, const Observati
 {
 	RunManagerAbstract::initialize(model_pars, obs, _filename);
 	cur_group_id = NetPackage::get_new_group_id();
+	reset_host_screen();
 	
 }
 
@@ -648,6 +650,40 @@ void  RunManagerPanther::free_memory()
 	// iteration earlier.
 	user_cancelled_runs.clear();
 	partial_info_map.clear();
+	reset_host_screen();
+}
+
+/**
+ * @brief Start the host screen afresh for a new batch.
+ *
+ * Per batch, like the run ids its tallies are keyed by. A host quarantined in one batch gets a
+ * fresh hearing in the next - failure rates move with the parameters, and a host taken out early
+ * in a long run otherwise sat idle for every iteration after it. A host that really is broken is
+ * screened out again within a few runs, and those runs are forgiven when it is.
+ *
+ * Agents that were idle when quarantined go straight back to WAITING. One still on a run keeps
+ * its QUARANTINED state until the result comes in, and its READY then finds the host clear.
+ */
+void RunManagerPanther::reset_host_screen()
+{
+	run_fail_hosts.clear();
+	host_attempt_count.clear();
+	if (quarantined_hosts.empty())
+		return;
+	int n_back = 0;
+	for (auto& a : agent_info_set)
+	{
+		if ((a.get_state() == AgentInfoRec::State::QUARANTINED) && (a.get_run_id() == AgentInfoRec::UNKNOWN_ID))
+		{
+			a.set_state(AgentInfoRec::State::WAITING);
+			n_back++;
+		}
+	}
+	stringstream ss;
+	ss << quarantined_hosts.size() << " quarantined host(s) cleared for the new batch, " << n_back
+	   << " agent(s) back in service";
+	report(ss.str(), true);
+	quarantined_hosts.clear();
 }
 
 /**
@@ -1427,10 +1463,7 @@ bool RunManagerPanther::ping(int i_sock)
 	bool ping_sent = false;
 	list<AgentInfoRec>::iterator agent_info_iter = socket_to_iter_map.at(i_sock);
 	AgentInfoRec::State state = agent_info_iter->get_state();
-	if (state != AgentInfoRec::State::WAITING
-		&& state != AgentInfoRec::State::ACTIVE
-		&& state != AgentInfoRec::State::KILLED
-		&& state != AgentInfoRec::State::KILLED_FAILED)
+	if (!pingable_state(state))
 	{
 		return ping_sent;
 	}
@@ -1648,69 +1681,141 @@ void RunManagerPanther::close_agent(list<AgentInfoRec>::iterator agent_info_iter
 /**
  * @brief Quarantine any host that is an outlier source of run failures.
  *
- * The test is a SHARE, not a raw count. A host with four agents does roughly four times the work
- * of a host with one, so it should be expected to produce roughly four times the failures -
- * comparing raw counts would condemn the busiest node for being busy:
+ * The test is a failure RATE against the rest of the hosts still in service, not a share of the
+ * failures by agent count. Agents are not equal - a host with fast cpus does more runs per agent,
+ * so it also meets more of the model's own failures, and judging it by agent count condemned the
+ * fastest host for being fast (and then the next one, on the runs it was handed back):
  *
- *     expected(h) = total_fails * agents(h) / total_agents
- *     offending   = fails(h) > expected(h) + delta
+ *     rate(h)     = fails(h) / attempts(h)
+ *     rest        = the same over every other host in service
+ *     expected(h) = attempts(h) * rest
+ *     offending   = fails(h) > expected(h) + delta  AND  z > 3.5
  *
- * That shape also means a broken MODEL does not trigger it: when everything fails everywhere,
- * every host sits at its expected share and no one exceeds it. Only CONCENTRATION fires.
+ * z is the two-proportion z score of rate(h) against rest. The delta keeps a handful of
+ * failures from tripping it, and z keeps it from tripping on scatter: the check runs on every
+ * scheduling pass, so a cushion of a few failures alone is crossed by chance once the counts are
+ * in the tens. 0 disables the check outright.
  *
- * The delta is an absolute cushion so early, small counts cannot trip it - with the default of 3
- * and two single-agent hosts, one host needs four more failures than its share before it is
- * judged. 0 disables the check outright.
+ * Only failures that can be pinned on one host count. A run that failed on two different hosts
+ * is the model failing at those parameter values, not either host - which is exactly what a
+ * quarantined host's forgiven runs do when they are re-run somewhere else.
  *
- * Only meaningful with more than one host: with one host there is nothing to compare against and
- * its share is always the whole population. Evaluated fresh each call, so it starts applying the
- * moment a second host connects and stops if one goes away.
+ * At most one host per call, the worst, so the next comparison is made without it. Hosts already
+ * quarantined are out of it entirely, whatever state their agents are passing through.
  */
+vector<RunManagerPanther::QuarantineVerdict> RunManagerPanther::decide_quarantine(
+	const vector<QuarantineAgentView>& agents, const map<string, int>& host_attempts,
+	const map<int, map<string, int>>& run_fail_hosts, const set<string>& quarantined,
+	int max_failed_run_delta)
+{
+	vector<QuarantineVerdict> verdicts;
+	if (max_failed_run_delta <= 0)
+		return verdicts;
+	double z_crit = 3.5;
+
+	// hosts in service. an agent on a quarantined host is out whatever its own state says - one
+	// finishing the run it was on passes through COMPLETE, and counting it put the host back on
+	// trial as a one-agent host
+	map<string, int> agents_per_host;
+	for (auto& a : agents)
+	{
+		if ((a.state == AgentInfoRec::State::QUARANTINED) || (quarantined.find(a.host) != quarantined.end()))
+			continue;
+		agents_per_host[a.host]++;
+	}
+	if (agents_per_host.size() < 2)
+		return verdicts;
+
+	map<string, int> host_fails;
+	for (auto& rf : run_fail_hosts)
+	{
+		if (rf.second.size() != 1)
+			continue;
+		host_fails[rf.second.begin()->first] += rf.second.begin()->second;
+	}
+
+	auto get = [](const map<string, int>& m, const string& k)
+	{
+		auto it = m.find(k);
+		return (it == m.end()) ? 0 : it->second;
+	};
+	double tot_attempts = 0.0, tot_fails = 0.0;
+	for (auto& ah : agents_per_host)
+	{
+		tot_attempts += get(host_attempts, ah.first);
+		tot_fails += get(host_fails, ah.first);
+	}
+
+	QuarantineVerdict worst;
+	bool found = false;
+	for (auto& ah : agents_per_host)
+	{
+		double n_h = get(host_attempts, ah.first);
+		double f_h = min((double)get(host_fails, ah.first), n_h);
+		if ((n_h <= 0.0) || (f_h <= 0.0))
+			continue;
+		double n_r = tot_attempts - n_h;
+		double f_r = tot_fails - get(host_fails, ah.first);
+		// nothing finished anywhere else yet - nothing to compare against
+		if (n_r <= 0.0)
+			continue;
+		double rate_r = f_r / n_r;
+		double expected = n_h * rate_r;
+		if (f_h <= expected + (double)max_failed_run_delta)
+			continue;
+		double p = (f_h + f_r) / (n_h + n_r);
+		double se = sqrt(p * (1.0 - p) * ((1.0 / n_h) + (1.0 / n_r)));
+		if (se <= 0.0)
+			continue;
+		double z = ((f_h / n_h) - rate_r) / se;
+		if (z < z_crit)
+			continue;
+		if ((!found) || (z > worst.z))
+		{
+			worst.host = ah.first;
+			worst.fails = (int)f_h;
+			worst.attempts = (int)n_h;
+			worst.expected = expected;
+			worst.z = z;
+			found = true;
+		}
+	}
+	if (found)
+		verdicts.push_back(worst);
+	return verdicts;
+}
+
+bool RunManagerPanther::pingable_state(AgentInfoRec::State state)
+{
+	// quarantined agents too: they are kept connected so the next batch can put them back to
+	// work, and left unpinged every one of them gave up on its no-ping timeout and exited
+	return (state == AgentInfoRec::State::WAITING) || (state == AgentInfoRec::State::ACTIVE)
+		|| (state == AgentInfoRec::State::KILLED) || (state == AgentInfoRec::State::KILLED_FAILED)
+		|| (state == AgentInfoRec::State::QUARANTINED);
+}
+
 void RunManagerPanther::quarantine_offending_hosts()
 {
 	if (max_failed_run_delta <= 0)
 		return;
 
-	// agents per host, counting only those still in service - a host already quarantined must
-	// not keep inflating total_agents and diluting everyone else's expected share
-	map<string, int> agents_per_host;
-	int total_agents = 0;
+	vector<QuarantineAgentView> views;
 	for (auto it = agent_info_set.begin(); it != agent_info_set.end(); ++it)
+		views.push_back({ it->get_hostname(), it->get_state() });
+	set<string> quarantined;
+	for (auto& qh : quarantined_hosts)
+		quarantined.insert(qh.first);
+	vector<QuarantineVerdict> verdicts = decide_quarantine(views, host_attempt_count, run_fail_hosts,
+		quarantined, max_failed_run_delta);
+
+	for (auto& v : verdicts)
 	{
-		if (it->get_state() == AgentInfoRec::State::QUARANTINED)
-			continue;
-		agents_per_host[it->get_hostname()]++;
-		total_agents++;
-	}
-	if ((agents_per_host.size() < 2) || (total_agents == 0))
-		return;
-
-	int total_fails = 0;
-	for (auto& hf : host_failure_count)
-		total_fails += hf.second;
-	if (total_fails == 0)
-		return;
-
-	for (auto& ah : agents_per_host)
-	{
-		const string& host = ah.first;
-		auto fit = host_failure_count.find(host);
-		if (fit == host_failure_count.end())
-			continue;
-		double expected = (double)total_fails * (double)ah.second / (double)total_agents;
-		if ((double)fit->second <= expected + (double)max_failed_run_delta)
-			continue;
-
-		// never take out the last host still working - an empty roster stalls the batch for
-		// ever, which is a worse outcome than tolerating a bad node
-		if (agents_per_host.size() < 2)
-			break;
-
+		const string& host = v.host;
 		stringstream ss;
-		ss << "host:" << host << " quarantined - " << fit->second << " failures against an"
-		   << " expected share of " << setprecision(3) << expected << " over " << ah.second
-		   << " agent(s), exceeding panther_agent_max_failed_run_delta of "
-		   << max_failed_run_delta;
+		ss << "host:" << host << " quarantined - " << v.fails << " of " << v.attempts
+		   << " runs failed against an expected " << setprecision(3) << v.expected
+		   << " at the other hosts' rate (z " << setprecision(3) << v.z
+		   << "), exceeding panther_agent_max_failed_run_delta of " << max_failed_run_delta;
 		report(ss.str(), true);
 
 		// take every agent on it out of service, and gather what failed there
@@ -1731,8 +1836,20 @@ void RunManagerPanther::quarantine_offending_hosts()
 				to_requeue.insert(rid);
 			}
 			for (auto frid : it->get_failed_run_ids())
+			{
+				// a run that also failed on another host is the model's failure, not this
+				// host's - it keeps its strikes, or max_run_fail stops meaning anything
+				auto rf = run_fail_hosts.find(frid);
+				if ((rf != run_fail_hosts.end()) && (rf->second.size() > 1))
+					continue;
 				to_requeue.insert(frid);
-			it->set_state(AgentInfoRec::State::QUARANTINED);
+			}
+			// an agent that was mid-run keeps its run id until the result comes back; an idle
+			// one is marked idle, which is what lets the next batch put it back to work
+			if (it->get_state() == AgentInfoRec::State::ACTIVE)
+				it->set_state(AgentInfoRec::State::QUARANTINED, it->get_run_id(), it->get_group_id());
+			else
+				it->set_state(AgentInfoRec::State::QUARANTINED, AgentInfoRec::UNKNOWN_ID, AgentInfoRec::UNKNOWN_ID);
 			n_quar++;
 		}
 
@@ -1760,11 +1877,9 @@ void RunManagerPanther::quarantine_offending_hosts()
 		report(qs.str(), true);
 
 		stringstream why;
-		why << fit->second << " failures vs expected " << setprecision(3) << expected
+		why << v.fails << " failures vs expected " << setprecision(3) << v.expected
 		    << ", " << n_quar << " agents, " << n_requeued << " runs requeued";
 		quarantined_hosts[host] = why.str();
-
-		agents_per_host[host] = 0;   // no longer in service for the next host's comparison
 	}
 }
 
@@ -1828,14 +1943,20 @@ void RunManagerPanther::schedule_runs()
 		}
 	}
 
-	//check for overdue runs if there are no runs waiting to be processed
-	if (n_no_ops > 0)
+	//check for overdue runs when nothing arrived this pass, and in any case about once a
+	//second: in a busy batch quiet passes are rare and the hard bound would be late
+	auto now = std::chrono::steady_clock::now();
+	bool clock_due = (now - last_overdue_check) >= std::chrono::seconds(1);
+	if ((n_no_ops > 0) || clock_due)
 	{
+		last_overdue_check = now;
 		try
 		{
 			double duration, avg_runtime;
 			double global_avg_runtime = get_global_runtime_minute();
 			bool should_schedule = false;
+			int q = pest_utils::quit_file_found();
+			bool quit_requested = ((q == 1) || (q == 2) || (q == 4));
 
 			list<AgentInfoRec>::iterator it_agent, iter_e;
 			for (it_agent = agent_info_set.begin(), iter_e = agent_info_set.end();
@@ -1853,56 +1974,32 @@ void RunManagerPanther::schedule_runs()
 					avg_runtime = it_agent->get_runtime_minute();
 					if (avg_runtime <= 0) avg_runtime = global_avg_runtime;
 					if (avg_runtime <= 0) avg_runtime = 1.0E+300;
-					vector<int> overdue_kill_runs_vec = get_overdue_runs_over_kill_threshold(run_id);
-
-					if (failure_map.count(run_id) + overdue_kill_runs_vec.size() >= max_n_failure)
+					OverdueDecision decision = decide_overdue(duration, avg_runtime, (int)failure_map.count(run_id), n_concur,
+						!free_agent_list.empty(), overdue_giveup_minutes, overdue_giveup_fac, overdue_reched_fac,
+						max_n_failure, max_concurrent_runs, MIN_AVGRUNMINS_FOR_KILL, quit_requested);
+					stringstream ss;
+					ss << "overdue. duration:" << duration << ", avg:" << avg_runtime << " (" << decision.why << ")";
+					if (decision.action == OverdueAction::KILL_ALL)
 					{
-						// kill the overdue runs
-						//kill_runs(run_id, true, "overdue");
-						stringstream ss;
-						ss << "overdue. duration:" << duration << ", avg:" << avg_runtime;
-						//kill_run(it_slave, ss.str());
+						//the last attempt max_run_fail allows: every copy of this run dies and the run fails
 						record_timed_out(run_id);
 						kill_runs(run_id, true, ss.str());
 						should_schedule = false;
-						//update_run_failed(run_id, it_slave->get_socket_fd());
-						model_runs_timed_out += overdue_kill_runs_vec.size();
+						model_runs_timed_out += max(1, n_concur);
 					}
-					else if (overdue_kill_runs_vec.size() > max_concurrent_runs)
+					else if (decision.action == OverdueAction::KILL_COPY)
 					{
-						// kill the overdue runs
-						record_timed_out(run_id);
-						kill_runs(run_id, true, "overdue");
-						// reschedule runs as we still haven't reach the max failure threshold
-						// and there are not concurrent runs for this id because we just killed all of them
-						should_schedule = true;
-						model_runs_timed_out += overdue_kill_runs_vec.size();
-					}
-
-					else if (((duration > overdue_giveup_minutes) || ((duration > avg_runtime*overdue_giveup_fac) &&
-                                                                      (avg_runtime > MIN_AVGRUNMINS_FOR_KILL)))
-						&& free_agent_list.empty())
-					{
-						// If there are no free slaves kill the overdue ones
-						// This is necessary to keep runs with small numbers of slaves behaving
-						stringstream ss;
-						ss << "overdue. duration:" << duration << ", avg:" << avg_runtime;
+						//this copy dies, counted as a failure; the run goes back on the queue unless
+						//another copy of it is still running
 						record_timed_out(run_id);
 						kill_run(it_agent, ss.str());
 						update_run_failed(run_id, it_agent->get_socket_fd());
-
-						if (failure_map.count(run_id) + overdue_kill_runs_vec.size() <= max_n_failure)
-						{
-							should_schedule = true;
-						}
+						should_schedule = true;
 						model_runs_timed_out += 1;
 					}
-
-					else if ((duration > avg_runtime*overdue_reched_fac) && (avg_runtime > MIN_AVGRUNMINS_FOR_KILL))
+					else if (decision.action == OverdueAction::RESCHEDULE)
 					{
-						//check how many concurrent runs are going
-						if (n_concur < max_concurrent_runs) should_schedule = true;
-						else should_schedule = false;
+						should_schedule = true;
 					}
 
 					if ((!free_agent_list.empty()) && should_schedule)
@@ -2212,7 +2309,7 @@ void RunManagerPanther::process_message(int i_sock)
 		if (quarantined_hosts.find(agent_info_iter->get_hostname()) == quarantined_hosts.end())
 			agent_info_iter->set_state(AgentInfoRec::State::WAITING);
 		else
-			agent_info_iter->set_state(AgentInfoRec::State::QUARANTINED);
+			agent_info_iter->set_state(AgentInfoRec::State::QUARANTINED, AgentInfoRec::UNKNOWN_ID, AgentInfoRec::UNKNOWN_ID);
 		// an agent that can answer REQ_PARTIAL says so here. An older one never does, and
 		// that is what keeps us from sending it a message its in-run loop would treat as
 		// corrupt and kill the run over.
@@ -2789,6 +2886,7 @@ bool RunManagerPanther::process_model_run(int sock_id, NetPackage &net_pack)
 		use_run = true;
 		model_runs_done++;
 		agent_info_iter->add_completed_run_id(run_id);
+		host_attempt_count[agent_info_iter->get_hostname()]++;
 
 	}
 	else
@@ -2992,6 +3090,31 @@ void RunManagerPanther::kill_all_active_runs()
  *
  * @return Description.
  */
+RunManagerPanther::OverdueDecision RunManagerPanther::decide_overdue(double duration_min, double avg_min,
+	int n_failures, int n_concurrent, bool agent_free, double giveup_minutes, double giveup_fac,
+	double resched_fac, int max_n_failure, int max_concurrent, double min_avg_for_fac, bool quit_requested)
+{
+	OverdueDecision d;
+	bool have_avg = (avg_min > min_avg_for_fac);
+	bool over_minutes = (duration_min > giveup_minutes);
+	bool over_fac = have_avg && (duration_min > avg_min * giveup_fac);
+	if (quit_requested || over_minutes || over_fac)
+	{
+		d.why = quit_requested ? "quit file" : (over_minutes ? "giveup_minutes" : "giveup_fac");
+		//this copy dies and that is one failure of the run.  if max_run_fail allows no more
+		//attempts, the run is done; otherwise it goes back on the queue
+		d.action = (n_failures + 1 >= max_n_failure) ? OverdueAction::KILL_ALL : OverdueAction::KILL_COPY;
+		return d;
+	}
+	if (have_avg && (duration_min > avg_min * resched_fac) && agent_free && (n_concurrent < max_concurrent))
+	{
+		d.why = "resched_fac";
+		d.action = OverdueAction::RESCHEDULE;
+	}
+	return d;
+}
+
+
  vector<int> RunManagerPanther::get_overdue_runs_over_kill_threshold(int run_id)
  {
 	 vector<int> sock_id_vec;
@@ -3249,6 +3372,8 @@ void RunManagerPanther::kill_all_active_runs()
 	 // scattered single failures across several agents until they are added together.
 	 const string host = agent_info_iter->get_hostname();
 	 int n_host_fails = ++host_failure_count[host];
+	 run_fail_hosts[run_id][host]++;
+	 host_attempt_count[host]++;
 	 stringstream hss;
 	 hss << "run_id:" << run_id << " failed on host:" << host << " - " << n_host_fails
 	     << (n_host_fails == 1 ? " failure" : " failures") << " on this host so far";
@@ -3458,11 +3583,13 @@ void RunManagerYAMRCondor::parse_submit_file()
 	{
 		try
 		{
+			if (tokens.size() < 2)
+				throw runtime_error("no count found on line '" + q_line + "'");
 			pest_utils::convert_ip(tokens[1], max_condor_queue);
 		}
 		catch (exception &e)
 		{
-			runtime_error("error converting '" + tokens[2] + "' from line '" + q_line + "' to int");
+			throw runtime_error("error converting 'queue' count from line '" + q_line + "' in submit file " + submit_file + " to int: " + e.what());
 		}
 	}
 }

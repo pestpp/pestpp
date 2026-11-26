@@ -181,6 +181,16 @@ def _run_measured(cmd, cwd, log="run_stdout.txt"):
     return wall, peak
 
 
+def _h_fit_seconds(rec_file):
+    """total time pestpp spent fitting the lasso H, from the '...sparse H took' rec lines"""
+    tot = 0.0
+    if os.path.exists(rec_file):
+        for line in open(rec_file):
+            if "...sparse H took" in line:
+                tot += float(line.split("took")[1].split()[0])
+    return tot
+
+
 def anafield_scaling_compare(nrow=224, ncol=224, obs_sizes=(2000, 5000, 10000, 50000),
                              enif_max_obs=10000, num_reals=50, noptmax=3, range_cells=8.0, exe=None,
                              methods=("ies", "enif"), lasso_frac=0.01, num_threads=8):
@@ -253,7 +263,7 @@ def anafield_scaling_compare(nrow=224, ncol=224, obs_sizes=(2000, 5000, 10000, 5
             if method.startswith("enif"):
                 pst.pestpp_options["ies_use_enif"] = "true"
                 pst.pestpp_options["ies_enif_current_prec"] = "true"
-            if method == "enif_lasso":
+            if method.startswith("enif_lasso"):
                 pst.pestpp_options["ies_enif_h_lasso"] = lasso_frac
                 pst.pestpp_options["ies_num_threads"] = num_threads
             m_d = os.path.join(model_d, "master_{0}_{1}".format(method, nobs))
@@ -272,6 +282,7 @@ def anafield_scaling_compare(nrow=224, ncol=224, obs_sizes=(2000, 5000, 10000, 5
                     fwd += float(line.split("took")[1].split()[0])
             rows.append({"method": method, "nobs": nobs, "npar": nrow * ncol, "wall_s": wall,
                          "forward_s": fwd, "solve_s": wall - fwd, "peak_rss_gb": peak,
+                         "h_fit_s": _h_fit_seconds(os.path.join(m_d, "anafield.rec")),
                          "phi0": phi[0], "phi_final": phi[-1], "phi_final_per_obs": phi[-1] / nobs})
             print("{0} {1} obs: phi {2:.0f} -> {3:.0f}, wall {4:.0f} s (forward {5:.0f} s), peak rss {6:.2f} gb".format(
                 method, nobs, phi[0], phi[-1], wall, fwd, peak))
@@ -378,8 +389,6 @@ def anafield_reach_compare(nrow=64, ncol=64, nobs=1000, num_reals=500, noptmax=8
       enif_wood_cur       woodbury, implicit H, current covariance (the control = ies)
       enif_graph_est      rook graph, lasso H, prior precision ESTIMATED from the prior ensemble
       enif_graph_model    lasso H, prior precision from the variogram (ies_enif_prec_file)
-      enif_graph_model_hybrid   as above with lambda on the current-ensemble precision
-      enif_graph_est_hybrid     estimated prior precision with the hybrid damping
 
     scoring: phi, rmse of the mean log field against the truth, spread, the
     fraction of the mean update that lies outside the span of the prior
@@ -426,11 +435,13 @@ def anafield_reach_compare(nrow=64, ncol=64, nobs=1000, num_reals=500, noptmax=8
         "enif_wood_cur": dict(enif, ies_enif_current_prec="true"),
         "enif_graph_est": dict(graph, ies_enif_graph="graph_rook.jcb"),
         "enif_graph_model": dict(graph, ies_enif_prec_file="prec_model.jcb"),
-        "enif_graph_model_hybrid": dict(graph, ies_enif_prec_file="prec_model.jcb", ies_enif_hybrid_damp="true"),
-        "enif_graph_est_hybrid": dict(graph, ies_enif_graph="graph_rook.jcb", ies_enif_hybrid_damp="true"),
     }
+    # and with the block localizer limiting which parameters each lasso H row can use.
+    # H is saved so its pattern can be checked against the localizer
+    for tag in [t for t in all_variants if t.startswith("enif_graph") and not t.endswith("_col")]:
+        all_variants[tag + "_loc"] = dict(all_variants[tag], ies_localizer="loc.jcb", ies_enif_save_h="true")
     if variants is None:
-        variants = [v for v in all_variants if v != "ies_aal"]
+        variants = [v for v in all_variants if (v != "ies_aal") and (not v.endswith("_col")) and (not v.endswith("_loc"))]
 
     csv_name = os.path.join(model_d, "anafield_reach.csv")
     rows = []
@@ -494,6 +505,7 @@ def anafield_reach_compare(nrow=64, ncol=64, nobs=1000, num_reals=500, noptmax=8
                 except ValueError:
                     pass
         rows.append({"variant": tag, "failed": False, "iterations": last, "wall_s": wall, "peak_rss_gb": peak,
+                     "h_fit_s": _h_fit_seconds(os.path.join(m_d, "anafield.rec")),
                      "phi0": df["mean"].values[0], "phi_final": df["mean"].values[-1],
                      "phi_final_per_obs": df["mean"].values[-1] / nobs,
                      "rmse_prior_mean": np.sqrt(np.mean((m0 - truth) ** 2)),
@@ -511,7 +523,11 @@ def anafield_reach_compare(nrow=64, ncol=64, nobs=1000, num_reals=500, noptmax=8
     summ = pd.DataFrame(rows)
     order = [v for v in all_variants if v in set(summ.variant)]
     cmap = plt.get_cmap("tab10")
-    colors = {v: cmap(k) for k, v in enumerate(all_variants)}
+    colors = {v: cmap(k) for k, v in enumerate([t for t in all_variants if not t.endswith("_col")])}
+    for v in all_variants:
+        if v.endswith("_col") or v.endswith("_loc"):
+            colors[v] = colors[v[:-4]]
+    styles = {"_col": "--", "_loc": ":"}
     with PdfPages(os.path.join(model_d, "anafield_reach.pdf")) as pdf:
         fig, ax = plt.subplots(1, 1, figsize=(10, 6))
         for tag in order:
@@ -522,7 +538,8 @@ def anafield_reach_compare(nrow=64, ncol=64, nobs=1000, num_reals=500, noptmax=8
             reals = df.iloc[:, 5:]
             for c in reals.columns[::10]:
                 ax.plot(df.index, reals[c].values / nobs, color=colors[tag], lw=0.3, alpha=0.3)
-            ax.plot(df.index, df["mean"].values / nobs, color=colors[tag], lw=2.5, label=tag)
+            ax.plot(df.index, df["mean"].values / nobs, color=colors[tag], lw=2.5, label=tag,
+                    ls=styles.get(tag[-4:], "-"))
         ax.set_yscale("log")
         ax.set_xlabel("iteration")
         ax.set_ylabel("phi per observation (every 10th realization thin, mean thick)")

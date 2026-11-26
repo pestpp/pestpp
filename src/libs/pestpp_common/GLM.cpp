@@ -133,6 +133,16 @@ int GLM::initialize_prepare()
 {
 	check_scenario();
 
+	// noptmax and the termination criteria are read again here rather than kept from the
+	// constructor. the api builds this object when the handle is created, and options set
+	// after that (noptmax most of all) were accepted but never seen - the control file's
+	// values ran instead
+	const ControlInfo& ci = pest_scenario.get_control_info();
+	noptmax = ci.noptmax;
+	termination_ctl = TerminationController(ci.noptmax, ci.phiredstp, ci.nphistp, ci.nphinored,
+		ci.relparstp, ci.nrelpar, ensure_dynreg(pest_scenario).get_use_dynamic_reg(),
+		ensure_dynreg(pest_scenario).get_phimaccept());
+
 	const ParamTransformSeq& base_trans_seq = pest_scenario.get_base_par_tran_seq();
 
 	// The glm output files (.sen, .svd, the iteration summaries) and the svd output option.

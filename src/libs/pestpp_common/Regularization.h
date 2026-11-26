@@ -70,18 +70,19 @@ public:
 	virtual void set_defaults();
 	virtual void set_zero();
 protected:
-	bool use_dynamic_reg;
-	bool adj_grp_weights;
-	int max_reg_iter;
-	double phi_m_lim;
-	double phi_m_accept;
-	double frac_phi_m;
-	double wf_min;
-	double wf_max;
-	double wffac;
-	double wftol;
-	double wf_init;
-	double tikhonov_weight;
+	// initialised here so that a default-constructed object can be copied safely
+	bool use_dynamic_reg = false;
+	bool adj_grp_weights = false;
+	int max_reg_iter = 0;
+	double phi_m_lim = 0.0;
+	double phi_m_accept = 0.0;
+	double frac_phi_m = 0.0;
+	double wf_min = 0.0;
+	double wf_max = 0.0;
+	double wffac = 0.0;
+	double wftol = 0.0;
+	double wf_init = 0.0;
+	double tikhonov_weight = 0.0;
 	std::unordered_map<std::string, double> regul_grp_weights;
 	set<string> passed_args;
 };

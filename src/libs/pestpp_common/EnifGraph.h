@@ -50,7 +50,7 @@ public:
 	cover every adjustable parameter - a silently mis-aligned graph would be
 	worse than no graph at all. */
 	void from_file(const string& filename, const vector<string>& par_names,
-		ofstream& frec, const string& order = "amd");
+		ofstream& frec);
 
 	/* estimate the prior precision on the graph from ensemble anomalies
 	(p x N, already scaled by 1/sqrt(N-1)) by neighbourhood regression:
@@ -58,29 +58,15 @@ public:
 	of the cholesky-like factor.  shrink is a stein-type pull toward the
 	diagonal, needed when a node's neighbourhood approaches the ensemble size. */
 	void estimate_precision(const Eigen::MatrixXd& anomalies, double shrink,
-		ofstream& frec, bool direct_only = false, bool into_current = false);
-	//into_current estimates from the CURRENT ensemble into a second matrix that only
-	//the hybrid damping below uses; the prior precision is left alone
+		ofstream& frec);
 	/* read the prior precision itself from a file - values, not just the pattern.
 	the same file is the graph, so from_file() is called first with it.  a precision
 	that is model-based (from the variogram the prior was drawn from) rather than
 	estimated from the ensemble is the one thing the estimated graph path could not
 	supply at npar >> N.  the matrix must be symmetric and positive definite. */
 	void load_precision(const string& filename, ofstream& frec);
-	/* hybrid damping: lambda multiplies the CURRENT ensemble precision instead of
-	the prior one,  Lam_post = Lam_prior + lam Lam_cur + H^T Rinv H.  the curvature
-	keeps the prior's reach outside the ensemble span; the trust region shrinks with
-	the ensemble as it does in ies.  needs estimate_precision(..., into_current=true)
-	each iteration. */
-	void set_hybrid_damp(bool flag) { hybrid_damp = flag; }
-	bool get_hybrid_damp() const { return hybrid_damp; }
-	bool has_current_precision() const { return cur_ready; }
-	const Eigen::SparseMatrix<double>& current_precision() const { return prec_cur; }
 	//shrink < 0 (the default): ridge per node by 5-fold cross-validation over the
-	//realizations, k/(N-1) when there are fewer than 20.  direct_only regresses each
-	//node on its direct graph neighbours alone and ignores the fill the factorisation
-	//adds: the factor is then not exact, but every regression has a k the ensemble can
-	//support - on a 25x25 grid the fill turned a rook's 4 neighbours into 24
+	//realizations, k/(N-1) when there are fewer than 20
 
 	/* apply the implied prior covariance: returns C * M, computed as
 	solve(Lam, M) so the covariance is never formed */
@@ -118,18 +104,11 @@ private:
 	graph neighbours.  this is what graphite-maps does: it fits the pattern of the
 	cholesky factor of the PERMUTED graph, and the permutation is chosen to keep
 	that fill small. */
-	string order_method;
 	vector<int> solve_order;
 	vector<vector<int>> pred_sets;
-	//the direct graph neighbours that precede each node in the ordering: pred_sets
-	//without the fill
-	vector<vector<int>> direct_pred_sets;
 	int fill_edges = 0;
 	Eigen::SparseMatrix<double> adj;
 	Eigen::SparseMatrix<double> prec;
-	Eigen::SparseMatrix<double> prec_cur;
-	bool cur_ready = false;
-	bool hybrid_damp = false;
 	mutable Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
 };
 
@@ -149,25 +128,25 @@ whole row, so it is dimensionless and lives in (0,1).  unexplained returns the
 per-observation residual variance, which is the quantity the observation error is
 inflated by.  Rows are independent, so this parallelises over num_threads.
 
-cv_folds > 0 switches to the way the reference implementation fits H: every
-parameter and observation anomaly row is scaled to unit length first, and the
-penalty for each observation is picked by cv_folds-fold cross-validation over the
-realizations, along a path of penalties with warm starts, then refit on all of
-them.  lasso_frac is not used then.  on raw anomalies a fixed penalty lets
-parameters whose spread has collapsed in, and H ends up interpolating the
-ensemble, which leaves the unexplained-variance inflation with nothing to do.
-
 unexp_divisor is what the raw residual sum of squares is divided by to get the
 unexplained variance.  the default (anything <= 0) is the number of columns,
 which is what the mean-centred fit wants.  the realization-centred fit passes
 the number of columns that actually carry a deviation (its centre column is
 identically zero), or the weight sum when the columns are weighted.
 
+loc, when given, is an observations x parameters pattern: a stored entry says that
+observation may use that parameter, anything else is held at zero in H.  each row is
+then the lasso over just its listed parameters, penalty scaled by the row-zeroing
+value over those parameters too, and a row with none listed stays empty.  only the
+pattern is used, not the values.  with loc the lassos run in column order: the outer
+loop is over parameters and the inner loop over the rows still iterating.
+
 frec is any ostream, so threads can each write to their own stringstream. */
 Eigen::SparseMatrix<double> estimate_sparse_H(const Eigen::MatrixXd& A,
 	const Eigen::MatrixXd& B, double lasso_frac, int num_threads,
-	Eigen::VectorXd& unexplained, ostream& frec, int cv_folds = 0,
-	double unexp_divisor = -1.0);
+	Eigen::VectorXd& unexplained, ostream& frec,
+	double unexp_divisor = -1.0,
+	const Eigen::SparseMatrix<double>* loc = nullptr);
 
 /* the enif update with an explicit sparse H and the supplied prior covariance C,
 by woodbury, so no p x p inverse is formed:

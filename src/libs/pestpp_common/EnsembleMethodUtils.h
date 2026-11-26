@@ -5,6 +5,7 @@
 #include <random>
 #include <mutex>
 #include <thread>
+#include <atomic>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include "FileManager.h"
@@ -83,7 +84,7 @@ public:
 
 	/// Zero the residuals of satisfied inequalities, in place. Moved here verbatim from
 	/// L2PhiHandler, which now forwards to it.
-	void apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, vector<string> &names);
+	void apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, const vector<string> &names);
 
 	/**
 	 * @brief Does ONE run violate a nominated observation?
@@ -208,7 +209,7 @@ public:
     /// The shared evaluator; mou and sqp use one directly.
     ViolationDetector& get_ineq() { return ineq; }
 
-	void apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, vector<string> &names);
+	void apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, const vector<string> &names);
 
 	void save_residual_cov(ObservationEnsemble& oe, int iter);
 
@@ -372,17 +373,14 @@ public:
     //ensemble information filter upgrade: builds the gain from the supplied prior
     //covariance and an ensemble-regressed observation operator, instead of from
     //sample cross-covariances.  cur_lam damps the PRIOR precision.
-    void solve_enif(double cur_lam, ParameterEnsemble& pe_upgrade);
+    //with a localizer, loc_map limits which parameters each observation's lasso H row may use
+    void solve_enif(double cur_lam, ParameterEnsemble& pe_upgrade, unordered_map<string, pair<vector<string>, vector<string>>>& loc_map);
     //enif one realization at a time: H regressed on deviations centred on that realization
     //over its multimodal neighbourhood, then the enif step for that realization alone.
     //needs update_multimodal_components() to have run.  threaded over realizations
     void solve_enif_multimodal(int num_threads, double cur_lam, ParameterEnsemble& pe_upgrade);
     void solve_multimodal(int num_threads, double cur_lam, bool use_glm_form, ParameterEnsemble& pe_upgrade, unordered_map<string,pair<vector<string>, vector<string>>>& loc_map, double mm_alpha);
     void update_multimodal_components(const double mm_alpha);
-    //ies_use_prior_prec: the p x p prior precision the glm solve should use in place of
-    //the ensemble pseudo-inverse.  owned by EnsembleMethod (it outlives this solver, which
-    //is rebuilt every iteration) and null when the option is off
-    void set_prior_prec(const Eigen::SparseMatrix<double>* q) { prior_prec = q; }
 
 
 private:
@@ -416,7 +414,6 @@ private:
 	//the noise inflation report is the same for every lambda too, so once per iteration
 	bool enif_inflate_reported = false;
 	Eigen::MatrixXd& Am;
-	const Eigen::SparseMatrix<double>* prior_prec = nullptr;
 	L2PhiHandler& ph;
 	unordered_map<string, Eigen::VectorXd> par_resid_map, obs_resid_map, Am_map;
 	unordered_map<string, Eigen::VectorXd> par_diff_map, obs_diff_map, obs_err_map;
@@ -465,7 +462,7 @@ public:
         unordered_map<string, Eigen::SparseMatrix<double>>& _H_map,
         unordered_map<string, Eigen::VectorXd>& _unexp_map, bool _h_ready,
         const EnifGraph* _graph, const Eigen::SparseMatrix<double>* _C, const Eigen::MatrixXd* _Afac,
-        double _lasso, int _cv_folds, bool _inflate, double _cur_lam, Eigen::MatrixXd& _upgrade);
+        double _lasso, bool _inflate, double _cur_lam, Eigen::MatrixXd& _upgrade);
     void work(int thread_id);
     //noise variance each realization ended up with, aligned with real_names, for the report
     vector<Eigen::VectorXd> noise_var;
@@ -489,7 +486,6 @@ protected:
     //the current ensemble anomalies when the covariance is C = A A^T; null means use C
     const Eigen::MatrixXd* Afac;
     double lasso;
-    int cv_folds;
     bool inflate;
     double cur_lam;
     Eigen::MatrixXd& upgrade;
@@ -527,9 +523,9 @@ protected:
     unordered_map<string, Eigen::VectorXd>& par_resid_map, & par_diff_map;
     unordered_map<string, Eigen::VectorXd>& obs_resid_map, & obs_diff_map, & obs_err_map;
 
-    mutex ctrl_lock, weight_lock, loc_lock, parcov_lock;
-    mutex obs_resid_lock, obs_diff_lock, par_resid_lock;
-    mutex par_diff_lock, am_lock, put_lock, obs_err_lock;
+    //ctrl_lock: settings read at thread start; next_lock: hands out the realizations;
+    //put_lock: the write-back into the upgrade ensemble
+    mutex ctrl_lock, put_lock;
     mutex next_lock;
 
 };
@@ -558,6 +554,16 @@ public:
 	//optional per-realization weights (aligned to the realization columns) for the localized
 	//multimodal solve; empty means no realization weighting
 	void set_real_weights(const Eigen::VectorXd& w) { real_weights = w; }
+	/* the local solves write their results straight into the upgrade ensemble: each
+	parameter is one column, the localizer guarantees no parameter is in two cases, so the
+	threads write disjoint columns and need no lock.  prepare_writeback() runs on the calling
+	thread before any worker starts: it builds the read-only name -> column index and checks
+	the cases really are disjoint.  write_local_upgrade() is the per-case write, static so the
+	selftest can drive it.  it used to be Ensemble::add_2_cols_ip under a global lock, which
+	rebuilt a map and a set of every parameter name on every call */
+	void prepare_writeback();
+	static int write_local_upgrade(Eigen::MatrixXd& target, const unordered_map<string, int>& col_index,
+		const vector<string>& names, const Eigen::MatrixXd& upd);
 
 
     static void ensemble_solution(const int iter, const int verbose_level,const int maxsing,  const int thread_id,
@@ -567,16 +573,7 @@ public:
                            Eigen::MatrixXd& obs_err, const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& weights,
                            const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& parcov_inv,
                            const vector<string>& act_obs_names,const vector<string>& act_par_names, double _reg_factor,
-                           double mm_weight_sum = -1.0);
-    //the same glm step with an explicit prior precision Q in both the hessian and the
-    //gradient (ies_use_prior_prec).  par_diff, par_resid are raw (unscaled) p x N, obs_diff,
-    //obs_resid n x N; upgrade_1 comes back N x p like ensemble_solution
-    static void ensemble_solution_prec(const int iter, const int verbose_level, const int maxsing,
-                           const bool use_approx, const double cur_lam, const double eigthresh,
-                           Eigen::MatrixXd& par_resid, Eigen::MatrixXd& par_diff,
-                           const Eigen::SparseMatrix<double>& Q, Eigen::MatrixXd& obs_resid,
-                           Eigen::MatrixXd& obs_diff, Eigen::MatrixXd& upgrade_1,
-                           const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& weights, double _reg_factor);
+                           double mm_weight_sum = -1.0, PestppOptions::SVD_PACK svd_pack = PestppOptions::REDSVD);
 protected:
 	PerformanceLog* performance_log;
 	Localizer::How how;
@@ -594,10 +591,14 @@ protected:
 	unordered_map<string, Eigen::VectorXd>& par_resid_map, & par_diff_map, & Am_map;
 	unordered_map<string, Eigen::VectorXd>& obs_resid_map, & obs_diff_map, &obs_err_map;
 
-	mutex ctrl_lock, weight_lock, loc_lock, parcov_lock;
-	mutex obs_resid_lock, obs_diff_lock, par_resid_lock;
-	mutex par_diff_lock, am_lock, put_lock, obs_err_lock;
+	//ctrl_lock: settings read at thread start; next_lock: hands out the cases; put_lock: the
+	//multimodal thread's write-back (the localized one writes disjoint columns without one)
+	mutex ctrl_lock, put_lock;
 	mutex next_lock;
+	//read-only once prepare_writeback() has built it
+	unordered_map<string, int> col_index;
+	//the localized solve's case hand-out: each thread takes the next index with fetch_add
+	std::atomic<int> next_case{0};
 
 
 
@@ -645,13 +646,23 @@ public:
 	/// solver for the current reinflation cycle: "ies", "esmda" or "enif", or empty when
 	/// ies_reinflate_solver was not given and ies_use_mda / ies_use_enif decide as before
 	string get_solver() const { return current_solver; }
+	/// multimodal alpha for the current reinflation cycle, or negative when
+	/// ies_reinflate_multimodal_alpha was not given and ies_multimodal_alpha decides as before
+	double get_multimodal_alpha() const { return current_mm_alpha; }
+	/// structural noise fraction for this reinflation, walked like the factor (last entry held).
+	/// 0.0 means no structural noise at this reinflation
+	double get_structnoise_frac() const { return current_sn_frac; }
 
 private:
 	vector<int> n_iter_reinflate;
 	vector<double> reinflate_factor;
 	vector<int> reinflate_num_reals;
 	vector<string> reinflate_solver;
+	vector<double> reinflate_mm_alpha;
+	vector<double> reinflate_sn_frac;
+	double current_sn_frac = 0.0;
 	string current_solver;
+	double current_mm_alpha = -1.0;
 	int iters_since = 0;
 	int idx = 0;
 	int current_n_iter = 0;
@@ -939,13 +950,21 @@ public:
 	/// ensemble mean; positive forces the min-phi realization. The option version of this is a
 	/// schedule-wide flag derived from the SIGN of an unrelated setting, which a caller driving
 	/// one reinflation at a time has no way to express - hence the argument.
+    ///
+    /// structnoise_frac is this reinflation's ies_reinflate_structnoise_frac entry.  0 (the
+    /// default) leaves the noise alone unless the residuals were
+    /// already captured, in which case it puts the user's noise back for this cycle.  negative
+    /// recaptures the residuals at this reinflation and uses the magnitude as the fraction
     void reinflate_par_ensemble(double reinflate_factor,int reinflate_num_reals,
-                                int center_on_min_phi = -1);
+                                int center_on_min_phi = -1, double structnoise_frac = 0.0);
 
 	/// pick the solver for the solves that follow: "ies", "esmda", "enif", or empty to go back
 	/// to what ies_use_mda / ies_use_enif say.  set by the ies loop from ies_reinflate_solver
 	void set_active_solver(const string& solver) { active_solver = solver; }
 	string get_active_solver() const { return active_solver; }
+	/// multimodal alpha for the solves that follow, or negative to go back to what
+	/// ies_multimodal_alpha says.  set by the ies loop from ies_reinflate_multimodal_alpha
+	void set_active_multimodal_alpha(double alpha) { active_mm_alpha = alpha; }
 	/// start a fresh esmda inflation schedule at the next esmda solve, spread over seg_len
 	/// iterations.  used when the loop switches into esmda from another solver or after a
 	/// reinflation, so the schedule is not indexed from iteration 1 of the whole run
@@ -996,6 +1015,23 @@ protected:
 	bool mda_restart = false;
 	// empty means the solver comes from ies_use_mda / ies_use_enif
 	string active_solver;
+	// negative means alpha comes from ies_multimodal_alpha
+	double active_mm_alpha = -1.0;
+	// the multimodal alpha for this iteration's solve: the reinflation cycle's entry when
+	// ies_reinflate_multimodal_alpha is in use, otherwise the live ies_multimodal_alpha
+	double get_multimodal_alpha() const {
+		if (active_mm_alpha < 0.0)
+			return pest_scenario.get_pestpp_options().get_ies_multimodal_alpha();
+		return active_mm_alpha;
+	}
+	// true when any stage of the run uses the multimodal solve
+	bool any_multimodal_solve() const {
+		if (pest_scenario.get_pestpp_options().get_ies_reinflate_multimodal_alpha().empty())
+			return pest_scenario.get_pestpp_options().get_ies_multimodal_alpha() > 0.0;
+		for (auto a : pest_scenario.get_pestpp_options().get_ies_reinflate_multimodal_alpha())
+			if (a > 0.0) return true;
+		return false;
+	}
 	// true when the enif solve should be used for this iteration
 	bool use_enif_solve() const {
 		if (active_solver.empty())
@@ -1035,6 +1071,43 @@ protected:
 	Eigen::DiagonalMatrix<double, Eigen::Dynamic> obscov_inv_sqrt, parcov_inv_sqrt;
 	bool oe_drawn, pe_drawn;
     ObservationInfo org_obs_info;
+
+    // structural noise from the irreducible residuals (ies_reinflate_structnoise_frac).
+    // everything here is captured at the first reinflation with frac != 0 and reused after
+    // that, unless an entry is negative, which recaptures R, s2 and the coefficients at that
+    // reinflation - the user asks for it, since recapturing from a de-weighted fit can feed back.
+    // the user's noise (sn_meas) is only taken at the first capture
+    bool sn_captured = false;
+    // R: actual residuals (observed minus simulated, not centred), rows are the realizations
+    // of oe at the capture, columns are sn_obs_names
+    Eigen::MatrixXd sn_resid;
+    vector<string> sn_obs_names;
+    // mean over realizations of R^2 for each obs (uncentred) - the irreducible residual variance
+    Eigen::VectorXd sn_s2;
+    // the variance the correction is built on, ordered as sn_obs_names: sn_s2 as is, or with
+    // ies_structnoise_em the excess max(0, s2 - sig2) over the user's noise
+    Eigen::VectorXd sn_var;
+    // with ies_structnoise_em: the user's noise variance per obs (mean square of the noise
+    // draws) and the per obs scale sqrt(var / s2) put on the draws.  sn_scale is empty otherwise
+    Eigen::VectorXd sn_sig2;
+    Eigen::VectorXd sn_scale;
+    // one column of standard normals per noise realization, fixed for the run
+    map<string, Eigen::VectorXd> sn_coef;
+    // the user's noise realizations from before anything was added, by realization name,
+    // ordered as sn_meas_names
+    map<string, Eigen::VectorXd> sn_meas;
+    vector<string> sn_meas_names;
+    // capture R (first time frac != 0, or again when frac < 0) and rebuild
+    // oe_base = user noise + sqrt(abs(frac)) * draws
+    void apply_structural_noise(double frac);
+    // ies_structnoise_em: set sn_var, sn_sig2 and sn_scale from the em excess at a capture
+    void set_structural_em_variance();
+    // lower each obs weight by its irreducible residual variance (ies_structnoise_deweight),
+    // in the weight ensemble and the control file weights, from the user's weights every time
+    void apply_structural_deweight(double frac);
+    // write case.N.adjusted.weights.* and case.N.adjusted.obs_data.csv
+    void save_adjusted_weights();
+
     // not an option cache: this records a one-time resolved decision (the save_binary +
     // oversized-problem fallback flips save_dense on, erasing the state it was derived from)
     string dense_file_ext = ".bin";
@@ -1057,11 +1130,6 @@ protected:
 	vector<int> resolve_subset_idxs(const vector<string>& names, const vector<string>& current_names) const;
 
 	Eigen::MatrixXd get_Am(const vector<string>& real_names, const vector<string>& par_names);
-	//ies_use_prior_prec: the prior precision, built once (graph estimate from the prior
-	//ensemble, or the parcov inverse) and handed to every EnsembleSolver after that
-	Eigen::SparseMatrix<double> prior_prec;
-	bool prior_prec_ready = false;
-	void initialize_prior_prec();
 
 
 	void zero_weight_obs(vector<string>& obs_to_zero_weight, bool update_obscov = true, bool update_oe_base = true);

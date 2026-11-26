@@ -662,9 +662,13 @@ void ParetoObjectives::update(ObservationEnsemble& op, ParameterEnsemble& dp, Co
 	
 	if (all_infeas)
 	{
+		//one front per member, least infeasible first. fronts are numbered from 1, the same as
+		//sort_members_by_dominance_into_fronts(), because get_nsga2_pareto_dominance() takes
+		//front 1 as the nondominated set - starting at 0 handed the archive and pso the second
+		//least infeasible member instead of the least
 		front_map.clear();
 		for (int i = 0; i < infeas_ordered.size(); i++)
-			front_map[i].push_back(infeas_ordered[i]);	
+			front_map[i + 1].push_back(infeas_ordered[i]);
 	}
 		
 	else
@@ -693,6 +697,10 @@ map<string, double> ParetoObjectives::get_spea2_fitness(int generation, Observat
 	ofstream& frec = file_manager.rec_ofstream();
 	ss << "ParetoObjectives::get_spea2_fitness() for " << op.shape().first << " population members";
 	performance_log->log_event(ss.str());
+	// spea does not use probabilistic dominance. this has to be set before update() sorts, the
+	// same as get_nsga2_pareto_dominance() does - it was left unset, and whatever was in memory
+	// could send the sort down the ppd path and die looking for _sd entries that are not there
+	ppd_sort = false;
 	update(op, dp, constraints_ptr);
 
 	if (member_struct.size() == 0)
@@ -3156,6 +3164,9 @@ int MOEA::initialize_prepare()
 	}
 	else
 	{
+		// objectives has to be told too, the same as for nsga - otherwise its flag is never set
+		prob_pareto = false;
+		objectives.set_prob_pareto(prob_pareto);
 		message(1, "using 'spea2' env selector");
 	}
 
@@ -5401,7 +5412,7 @@ pair<ParameterEnsemble, ParameterEnsemble> MOEA::get_updated_pso_velocity(Parame
 		cog_const = cog_const_range[0];
 	else if (cog_const_range.size() == 2)
 	{
-		cog_const = cog_const_range[0] + (cog_const_range[1] - cog_const_range[0]) * (iter / pest_scenario.get_control_info().noptmax);
+		cog_const = cog_const_range[0] + (cog_const_range[1] - cog_const_range[0]) * ((double)iter / (double)pest_scenario.get_control_info().noptmax);
 		message(1, "computing pso velocity using cognitive const: ", cog_const);
 	}
 	else
@@ -5412,7 +5423,7 @@ pair<ParameterEnsemble, ParameterEnsemble> MOEA::get_updated_pso_velocity(Parame
 		social_const = social_const_range[0];
 	else if (social_const_range.size() == 2)
 	{
-		social_const = social_const_range[0] + (social_const_range[1] - social_const_range[0]) * (iter / pest_scenario.get_control_info().noptmax);
+		social_const = social_const_range[0] + (social_const_range[1] - social_const_range[0]) * ((double)iter / (double)pest_scenario.get_control_info().noptmax);
 		message(1, "computing pso velocity using social const: ", social_const);
 	}
 	else

@@ -13,12 +13,17 @@ jobs:
   pestpp-devenv:
     name: developer environment
     runs-on: ${{ matrix.os }}
+    # the mac binaries built here ship in the release (the diagnostic set), so they target
+    # the same macos as release.yml - without this they only run on the runner's macos or newer.
+    # cmake reads it on mac only
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.3"
     strategy:
       fail-fast: false
       matrix:
         include:
           #- {os: macos-latest, shell: bash}
-          - {os: macos-14, shell: bash}
+          - {os: macos-15, shell: bash}
           - {os: ubuntu-latest, shell: bash}
           - {os: ubuntu-22.04, shell: bash}
           - {os: windows-2022, shell: bash}
@@ -94,10 +99,12 @@ jobs:
               set -euo pipefail
               export PATH=/opt/python/cp312-cp312/bin:$PATH
               pip install --quiet cmake ninja
+              # INSTALL_LOCAL off - see the note on the non-linux step below
               cmake -G Ninja -S . -B _build-diag \
                 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
                 -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O2 -g" \
-                -DCMAKE_CXX_COMPILER_WORKS=1
+                -DCMAKE_CXX_COMPILER_WORKS=1 \
+                -DINSTALL_LOCAL=OFF
               cmake --build _build-diag -j$(nproc)
               cpack --config _build-diag/CPackConfig.cmake -G TGZ -B _build-diag \
                 -D CPACK_PACKAGE_FILE_NAME="pestpp-${{ steps.version.outputs.version }}-linux-debug" \
@@ -133,10 +140,15 @@ jobs:
             # why the option is off by default and only the diagnostic build asks for it.
             extra="-DPESTPP_MAC_DSYM=ON"
           fi
+          # INSTALL_LOCAL off. it is on by default, and then building this tree copies every
+          # diagnostic binary into bin/ and bin/<ostag>/ right on top of the release build, so
+          # the binaries-* artifact (uploaded from bin) was really the diagnostic build - pdbs,
+          # live asserts and all. cpack does its own install from _build-diag, so the
+          # diagnostic archive does not need bin/ at all.
           pixi run -- cmake -G Ninja -S . -B _build-diag \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="$diag_flags" \
-            -DCMAKE_CXX_COMPILER_WORKS=1 $extra
+            -DCMAKE_CXX_COMPILER_WORKS=1 -DINSTALL_LOCAL=OFF $extra
           pixi run -- cmake --build _build-diag
 
       # CPACK_INCLUDE_TOPLEVEL_DIRECTORY is ON here and OFF for the release archive on purpose:

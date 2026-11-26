@@ -56,7 +56,7 @@ from .pestpp_lib import (  # noqa: E402
     PestppLib, PestppError, _UNSET,
     PAR_EN, OBS_EN, NOISE_EN, WEIGHTS_EN,
     STACK_PAR_EN, STACK_OBS_EN, NESTED_PAR_EN, MEMBER_STACK_EN,
-    TOOL_IES, TOOL_DA, TOOL_MOU, TOOL_SQP, TOOL_GLM, TOOL_OPT,
+    TOOL_IES, TOOL_DA, TOOL_MOU, TOOL_SQP, TOOL_GLM, TOOL_OPT, TOOL_MODEL,
     RM_SERIAL, RM_PANTHER, RM_EXTERNAL,
     PHI_MEAS, PHI_COMPOSITE, PHI_REGUL, PHI_ACTUAL, PHI_NOISE,
     WORKER_COMPLETED, WORKER_FAILED, WORKER_TIMED_OUT,
@@ -71,7 +71,7 @@ from .pestpp_progress import Progress, auto as _progress_auto  # noqa: E402
 _ToolT = TypeVar("_ToolT", bound="_Tool")
 
 __all__ = [
-    "Ies", "Da", "Mou", "Sqp", "Glm", "Opt", "IterationStep", "Candidate", "PestppError", "ExpiredViewError",
+    "Ies", "Da", "Mou", "Sqp", "Glm", "Opt", "Model", "IterationStep", "Candidate", "PestppError", "ExpiredViewError",
     "Progress", "run_ies", "run_da", "run_mou", "run_sqp", "find_library",
     "PHI_MEAS", "PHI_COMPOSITE", "PHI_REGUL", "PHI_ACTUAL", "PHI_NOISE",
     "find_library", "api_info",
@@ -821,7 +821,8 @@ class _Tool:
             self.update_phi()
 
     def reinflate(self, factor: float = 1.0, num_reals: int = 0,
-                  center_on_min_phi: bool | None = None) -> None:
+                  center_on_min_phi: bool | None = None,
+                  structnoise_frac: float = 0.0) -> None:
         """Rebuild the parameter ensemble from the PRIOR's spread, re-centred on the current one.
 
         A smoother narrows the ensemble every iteration. After a few, the realizations can
@@ -856,11 +857,17 @@ class _Tool:
         ``ies_n_iter_reinflate`` the way the built-in loop does, ``False`` forces the ensemble
         mean, ``True`` forces the minimum-phi realization - the aggressive form.
 
+        ``structnoise_frac`` is this reinflation's ``ies_reinflate_structnoise_frac`` entry,
+        the value the built-in loop passes for each reinflation: 0 adds no structural noise,
+        positive adds that fraction of the captured residuals, negative recaptures the
+        residuals now and uses the magnitude. ``ies_structnoise_deweight`` and
+        ``ies_structnoise_em`` apply as they do in the built-in loop.
+
         This RUNS the reinflated ensemble, so it costs ``num_reals`` model runs.
         """
         center = -1 if center_on_min_phi is None else int(bool(center_on_min_phi))
         with self._q():
-            self._lib.reinflate_ensemble(factor, num_reals, center)
+            self._lib.reinflate_ensemble(factor, num_reals, center, structnoise_frac)
 
     def update_phi(self) -> None:
         """Recompute phi from the current ensembles and weights.
@@ -1971,6 +1978,120 @@ class Sqp(_ChanceMixin, _Tool):
         """The decision-variable ensemble. Alias of :meth:`par_df`."""
         return self.par_df(lower=lower)
 
+
+
+# ---- the model, without a tool ------------------------------------------------------------
+
+class Model:
+    """One model run at a time through the control file's model interface - no tool at all.
+
+    For when you already have the parameter values and just want pest++ to do the plumbing:
+    write the model input files from the templates, run the command line(s), read the outputs
+    back through the instruction files::
+
+        with pestpp.Model.from_pst("pest.pst", workdir="model_dir") as m:
+            sim = m.run({"hk1": 2.5, "rch": 1.1e-4})       # a pd.Series of simulated values
+
+    Values are control-file values, matched by name, and anything you do not name keeps its
+    control-file value - so ``m.run()`` runs the control file as it is. Tied parameters follow
+    their parents and fixed ones keep their control-file value; passing a different value for
+    either is refused rather than quietly ignored.
+
+    Serial and blocking, in ``workdir``: the files are real files there, and each run
+    overwrites the last one's, exactly like the serial run manager. Every tool call refuses -
+    there is nothing to initialize or iterate.
+    """
+
+    def __init__(self, lib: PestppLib, workdir: str, quiet: bool = True,
+                 pst_file: str = "pest.pst"):
+        self._lib = lib
+        self._workdir = workdir
+        self._quiet = quiet
+        self._log = os.path.join(workdir, "pestpp.stdout.log")
+        self._pst_file = pst_file
+        # see the note in _Tool.__init__ - no workers here, just the handle
+        self._finalizer = weakref.finalize(self, _release_session, [], self._lib)
+
+    @classmethod
+    def from_pst(cls, pst_file, workdir: str = ".", lib_path: str | None = None,
+                 quiet: bool = True, **options) -> "Model":
+        """Open a model session on a control file - a path, or a :class:`pyemu.Pst`.
+
+        Extra keyword arguments are set as pest++ options, so the model-interface ones
+        (``fill_tpl_zeros``, ``tpl_force_decimal``, ``additional_ins_delimiters``,
+        ``num_tpl_ins_threads``) work as they do for the tools.
+        """
+        workdir = os.path.abspath(workdir)
+        if hasattr(pst_file, "write") and hasattr(pst_file, "parameter_data"):
+            pst_obj = pst_file
+            name = os.path.basename(getattr(pst_obj, "filename", None) or "pest.pst")
+            if not name.lower().endswith(".pst"):
+                name += ".pst"
+            os.makedirs(workdir, exist_ok=True)
+            pst_obj.write(os.path.join(workdir, name), version=2)
+            pst_file = name
+        lib = PestppLib(find_library(lib_path), TOOL_MODEL, pst_file, workdir,
+                        run_manager=RM_SERIAL)
+        for key, value in options.items():
+            lib.set_option(key, value)
+        return cls(lib, workdir, quiet=quiet, pst_file=pst_file)
+
+    def _q(self):
+        return _capture_output(self._lib, self._log) if self._quiet else nullcontext()
+
+    def run(self, pars=None, lower: bool = False) -> pd.Series:
+        """Run the model once and return the simulated values, labelled, in control-file order.
+
+        ``pars`` is a Series or dict of name -> control-file value, or None for the control
+        file's own values. A failed model run, or an instruction file that cannot find what
+        it is looking for, raises :class:`PestppError` with the reason.
+        """
+        if pars is None:
+            names, vals = [], []
+        elif isinstance(pars, pd.Series):
+            names, vals = list(pars.index), pars.values
+        elif isinstance(pars, dict):
+            names, vals = list(pars.keys()), list(pars.values())
+        else:
+            raise TypeError("run wants a pandas Series or a dict of name -> value, not {0}; "
+                            "a bare array has no names to match on".format(type(pars).__name__))
+        with self._q():
+            onames, sim = self._lib.run_model(_up_all([str(n) for n in names]), vals)
+        idx = [n.lower() for n in onames] if lower else onames
+        return pd.Series(sim, index=idx, name="simulated")
+
+    @property
+    def obs_names(self) -> list:
+        """The observation names, in the order run() returns them."""
+        return self._lib.model_obs_names()
+
+    @property
+    def lib(self) -> PestppLib:
+        """The thin binding underneath, for anything this layer does not wrap."""
+        return self._lib
+
+    @property
+    def workdir(self) -> str:
+        return self._workdir
+
+    @property
+    def log_file(self) -> str:
+        """Where the library's console output went, when quiet."""
+        return self._log
+
+    def set_option(self, key: str, value) -> None:
+        self._lib.set_option(key, value)
+
+    def close(self) -> None:
+        """Release the handle. Idempotent; a dropped session is cleaned up by its finalizer."""
+        self._finalizer()
+        self._lib = None
+
+    def __enter__(self) -> "Model":
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 # ---- worker management --------------------------------------------------------------------

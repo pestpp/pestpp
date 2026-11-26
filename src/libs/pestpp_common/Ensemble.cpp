@@ -105,6 +105,15 @@ void Ensemble::reserve(vector<string> _real_names, vector<string> _var_names)
 {
 	reals.resize(_real_names.size(), _var_names.size());
 	reals.setZero();
+	var_names = std::move(_var_names);
+	real_names = std::move(_real_names);
+	org_real_names = real_names;
+}
+
+void Ensemble::reserve(const vector<string>& _real_names, const SharedNames& _var_names)
+{
+	reals.resize(_real_names.size(), _var_names.size());
+	reals.setZero();
 	var_names = _var_names;
 	real_names = _real_names;
 	org_real_names = real_names;
@@ -253,7 +262,7 @@ void Ensemble::add_2_cols_ip(Ensemble &other)
 	}
 	if (mismatch.size() > 0)
 	throw_ensemble_error("the following real_names don't match other", mismatch);
-	vector<string> other_var_names = other.get_var_names();
+	const vector<string>& other_var_names = other.get_var_names();
 	add_2_cols_ip(other_var_names, other.get_eigen());
 
 }
@@ -767,9 +776,8 @@ void Ensemble::fill_moment_maps(map<string, double>& mean_map, map<string, doubl
  */
 void Ensemble::replace_col(string var_name, Eigen::VectorXd& vec, bool update_map)
 {
-	if (update_map)
-		update_var_map();
-	if (var_map.find(var_name) == var_map.end())
+	int icol = var_names.find(var_name);
+	if (icol < 0)
 		throw_ensemble_error("replace_col(): var_name not found: " + var_name);
 	if (vec.size() != reals.rows())
 	{
@@ -777,7 +785,7 @@ void Ensemble::replace_col(string var_name, Eigen::VectorXd& vec, bool update_ma
 		ss << "replace_col(): vec of length " << vec.size() << " not aligned with reals first dimen " << reals.rows();
 		throw_ensemble_error(ss.str());
 	}
-	reals.col(var_map[var_name]) = vec;
+	reals.col(icol) = vec;
 }
 
 //Ensemble Ensemble::get_mean()
@@ -952,6 +960,14 @@ void Ensemble::keep_rows(const vector<string> &keep_names)
 			missing.push_back(n);
 	if (missing.size() > 0)
 		throw_ensemble_error("Ensemble::keep_rows() error: the following real names not found: ", missing);
+	//get_eigen() takes an empty row list as "all rows", so an empty keep list has to be
+	//handled here or the matrix keeps every row while the names are cleared
+	if (keep_names.size() == 0)
+	{
+		reals.resize(0, reals.cols());
+		real_names.clear();
+		return;
+	}
 	reals = get_eigen(keep_names, vector<string>());
 	real_names = keep_names;
 }
@@ -966,7 +982,7 @@ void Ensemble::keep_rows(const vector<string> &keep_names)
  *
  * @return Description.
  */
-Eigen::MatrixXd Ensemble::get_eigen(vector<string> row_names, vector<string> col_names, bool update_vmap)
+Eigen::MatrixXd Ensemble::get_eigen(const vector<string>& row_names, const vector<string>& col_names, bool update_vmap)
 {
 	//get a dense eigen matrix from reals by row and col names
 	vector<string> missing_rows,missing_cols;
@@ -997,21 +1013,52 @@ Eigen::MatrixXd Ensemble::get_eigen(vector<string> row_names, vector<string> col
 	}
 	if (col_names.size() > 0)
 	{
-		//map<string, int> var_map;
-		//for (int i = 0; i < var_names.size(); i++)
-		//	var_map[var_names[i]] = i;
-		if (update_vmap)
-			update_var_map();
-
-		//set<string> var_set(var_names.begin(), var_names.end());
-		map<string,int>::iterator end = var_map.end();
-		for (auto& name : col_names)
+		//when only a few columns are wanted from a lot of names (like the weighted obs out of
+		//millions of obs) and the name lookup hasn't been built, scan the names once against
+		//a small lookup of the wanted columns instead of building the big one.
+		//update_vmap is kept for callers but doesn't change anything now.
+		if ((!var_names.has_lookup()) && (col_names.size() * 4 < var_names.size()))
 		{
-			auto it = var_map.find(name);
-			if (it == end)
-				missing.push_back(name);
-			else
-				col_idxs.push_back(it->second);
+			std::unordered_map<std::string_view, int> want;
+			want.reserve(col_names.size());
+			for (int j = 0; j < col_names.size(); j++)
+				want.emplace(std::string_view(col_names[j]), j);
+			vector<int> found(col_names.size(), -1);
+			int ivar = 0;
+			for (auto& name : var_names)
+			{
+				auto it = want.find(std::string_view(name));
+				//first one wins if a name is in there twice
+				if ((it != want.end()) && (found[it->second] < 0))
+					found[it->second] = ivar;
+				ivar++;
+			}
+			for (int j = 0; j < col_names.size(); j++)
+			{
+				int icol = found[j];
+				//a name asked for twice only went in the small lookup once
+				if (icol < 0)
+				{
+					auto it = want.find(std::string_view(col_names[j]));
+					if (it != want.end())
+						icol = found[it->second];
+				}
+				if (icol < 0)
+					missing.push_back(col_names[j]);
+				else
+					col_idxs.push_back(icol);
+			}
+		}
+		else
+		{
+			for (auto& name : col_names)
+			{
+				int icol = var_names.find(name);
+				if (icol < 0)
+					missing.push_back(name);
+				else
+					col_idxs.push_back(icol);
+			}
 		}
 		if (missing.size() > 0)
 			throw_ensemble_error("Ensemble.get_eigen() error: the following variable names were not found:", missing);
@@ -1224,11 +1271,10 @@ Eigen::VectorXd Ensemble::get_real_vector(int ireal)
  */
 Eigen::VectorXd Ensemble::get_var_vector(const string& var_name)
 {
-	update_var_map();
-	auto vm_it = var_map.find(var_name);
-	if (vm_it == var_map.end())
+	int icol = var_names.find(var_name);
+	if (icol < 0)
 		throw_ensemble_error("Ensemble::get_var_vector(): var_name not found: " + var_name);
-	return reals.col(vm_it->second);
+	return reals.col(icol);
 
 }
 
@@ -1310,16 +1356,69 @@ void Ensemble::update_real_ip(const string & rname, Eigen::VectorXd & real)
  */
 void Ensemble::update_var_map()
 {
-	var_map.clear();
-	
-	//for (int i = 0; i < var_names.size(); i++)
-	int i = 0;
-	for (auto& name : var_names)
+	//the lookup lives with the (shared) names and always matches them, so this just makes
+	//sure it has been built
+	var_names.build_lookup();
+}
+
+vector<string>& SharedNames::mut()
+{
+	if (p.use_count() > 1)
+		p = std::make_shared<Data>(p->names);
+	else
+		p->lookup.reset();
+	return p->names;
+}
+
+const std::unordered_map<std::string_view, int>& SharedNames::get_lookup() const
+{
+	std::lock_guard<std::mutex> g(p->lookup_lock);
+	if (!p->lookup)
 	{
-		//var_map[var_names[i]] = i;
-		var_map.insert(make_pair(name, i));
+		auto lu = std::make_unique<std::unordered_map<std::string_view, int>>();
+		lu->reserve(p->names.size());
+		int i = 0;
+		for (auto& name : p->names)
+		{
+			//first one wins if a name is in there twice, same as the old map insert()
+			lu->emplace(std::string_view(name), i);
+			i++;
+		}
+		p->lookup = std::move(lu);
+	}
+	return *p->lookup;
+}
+
+bool SharedNames::has_lookup() const
+{
+	std::lock_guard<std::mutex> g(p->lookup_lock);
+	return p->lookup != nullptr;
+}
+
+void SharedNames::build_lookup() const
+{
+	get_lookup();
+}
+
+int SharedNames::find(const string& name) const
+{
+	const auto& lu = get_lookup();
+	auto it = lu.find(std::string_view(name));
+	if (it == lu.end())
+		return -1;
+	return it->second;
+}
+
+map<string, int> SharedNames::to_map() const
+{
+	map<string, int> m;
+	int i = 0;
+	for (auto& name : p->names)
+	{
+		m.insert(make_pair(name, i));
 		i++;
 	}
+	return m;
 }
 
 /**
@@ -1966,7 +2065,7 @@ map<string, int> Ensemble::from_binary(string file_name, vector<string> &names, 
 	var_names.clear();
 	real_names.clear();
 	reals.resize(0, 0);
-	bool is_new_format = pest_utils::read_binary(file_name, real_names, var_names, reals);
+	bool is_new_format = pest_utils::read_binary(file_name, real_names, var_names.mut(), reals);
 	if ((!is_new_format) && (transposed))
 	{
 		vector<string> temp = real_names;
@@ -2031,7 +2130,7 @@ map<string,int> Ensemble::from_binary_old(string file_name, vector<string> &name
 		in.seekg(n_nonzero*(sizeof(double) + sizeof(int) + sizeof(int)), ios_base::cur);
 
 		//read col names
-		vector<string>* col_names = &var_names;
+		vector<string>* col_names = &var_names.mut();
 		vector<string>* row_names = &real_names;
 		
 
@@ -2104,12 +2203,12 @@ map<string,int> Ensemble::from_binary_old(string file_name, vector<string> &name
 		in.seekg(n_nonzero*(sizeof(double) + sizeof(int)), ios_base::cur);
 
 		//read col names
-		vector<string>* col_names = &var_names;
+		vector<string>* col_names = &var_names.mut();
 		vector<string>* row_names = &real_names;
 		if (transposed)
 		{
 			col_names = &real_names;
-			row_names = &var_names;
+			row_names = &var_names.mut();
 		}
 
 		for (int i_rec = 0; i_rec < n_col; ++i_rec)
@@ -2579,6 +2678,33 @@ ParameterEnsemble ParameterEnsemble::zeros_like(int nrows)
 
 }
 
+bool ParameterEnsemble::per_par_transforms()
+{
+	TranTied* tied_ptr = par_transform.get_tied_ptr();
+	if ((tied_ptr != nullptr) && (tied_ptr->get_items().size() > 0))
+		return false;
+	const TranLog10* log_ptr = par_transform.get_log10_ptr();
+	const TranScale* scale_ptr = par_transform.get_scale_ptr();
+	const TranOffset* offset_ptr = par_transform.get_offset_ptr();
+	const TranFixed* fixed_ptr = par_transform.get_fixed_ptr();
+	//anything in the sequences beyond these five and the shortcut doesnt hold
+	size_t n_known = (log_ptr ? 1 : 0) + (scale_ptr ? 1 : 0) + (offset_ptr ? 1 : 0) + (fixed_ptr ? 1 : 0) + (tied_ptr ? 1 : 0);
+	vector<Transformation*> c2m = par_transform.get_ctl2model_tranformations();
+	size_t n_tran = c2m.size() + par_transform.get_ctl2active_ctl_tranformations().size() +
+		par_transform.get_active_ctl2numeric_tranformations().size();
+	if (n_tran != n_known)
+		return false;
+	//the shortcut applies scale then offset going to model space
+	if ((scale_ptr != nullptr) && (offset_ptr != nullptr))
+	{
+		auto is = find(c2m.begin(), c2m.end(), (Transformation*)scale_ptr);
+		auto io = find(c2m.begin(), c2m.end(), (Transformation*)offset_ptr);
+		if (is > io)
+			return false;
+	}
+	return true;
+}
+
 map<string,int> ParameterEnsemble::add_runs(RunManagerAbstract *run_mgr_ptr,const vector<int> &real_idxs,
                                          int da_cycle, string additional_tag)
 {
@@ -2627,7 +2753,118 @@ map<string,int> ParameterEnsemble::add_runs(RunManagerAbstract *run_mgr_ptr,cons
 	    info_txt = info_txt + " " + additional_tag;
     }
 	string rname,rinfo_txt;
-	//for (auto &rname : run_real_names)
+
+	//fast path: with only per-parameter transformations, each run's model-space vector is a
+	//base vector (every par not in the ensemble, already in model space) with the ensemble
+	//columns dropped in after their own log/scale/offset. this skips copying and transforming
+	//a name-keyed map of every parameter for every run, which is most of the queueing cost
+	//when there are lots of pars. the ops and their order match the map path exactly.
+	const TranFixed* fixed_ptr = par_transform.get_fixed_ptr();
+	bool fast = per_par_transforms();
+	if (fast && (fixed_ptr != nullptr))
+	{
+		//an ensemble column that is also a fixed par gets overwritten by the fixed value in
+		//the map path - rare enough to just use that path
+		for (auto& vname : var_names)
+			if (fixed_ptr->get_value(vname).first)
+			{
+				fast = false;
+				break;
+			}
+	}
+	if (fast)
+	{
+		const vector<string>& run_par_names = run_mgr_ptr->get_par_name_vec();
+		unordered_map<string, int> run_par_idx;
+		run_par_idx.reserve(run_par_names.size());
+		for (int k = 0; k < run_par_names.size(); k++)
+			run_par_idx[run_par_names[k]] = k;
+		Parameters base_pars = pars;
+		if (tstat == ParameterEnsemble::transStatus::CTL)
+			par_transform.active_ctl2model_ip(base_pars);
+		else if (tstat == ParameterEnsemble::transStatus::NUM)
+			par_transform.numeric2model_ip(base_pars);
+		vector<double> base_vec = base_pars.get_data_vec(run_par_names);
+
+		const TranLog10* log_ptr = par_transform.get_log10_ptr();
+		const TranScale* scale_ptr = par_transform.get_scale_ptr();
+		const TranOffset* offset_ptr = par_transform.get_offset_ptr();
+		int nvar = var_names.size();
+		vector<int> var_run_idx(nvar, -1);
+		vector<char> var_log(nvar, 0), var_has_scale(nvar, 0), var_has_offset(nvar, 0);
+		vector<double> var_scale(nvar, 1.0), var_offset(nvar, 0.0);
+		pair<bool, double> tv;
+		for (int j = 0; j < nvar; j++)
+		{
+			auto it = run_par_idx.find(var_names[j]);
+			if (it != run_par_idx.end())
+				var_run_idx[j] = it->second;
+			if (tstat == ParameterEnsemble::transStatus::MODEL)
+				continue;
+			if ((tstat == ParameterEnsemble::transStatus::NUM) && (log_ptr != nullptr) &&
+				(log_ptr->get_items().find(var_names[j]) != log_ptr->get_items().end()))
+				var_log[j] = 1;
+			if (scale_ptr != nullptr)
+			{
+				tv = scale_ptr->get_value(var_names[j]);
+				var_has_scale[j] = tv.first;
+				var_scale[j] = tv.second;
+			}
+			if (offset_ptr != nullptr)
+			{
+				tv = offset_ptr->get_value(var_names[j]);
+				var_has_offset[j] = tv.first;
+				var_offset[j] = tv.second;
+			}
+		}
+
+		vector<double> run_vec;
+		double v;
+		int k;
+		for (int i = 0; i < run_real_names.size(); i++)
+		{
+			rname = run_real_names[i];
+			idx = rmap[rname];
+			run_vec = base_vec;
+			for (int j = 0; j < nvar; j++)
+			{
+				k = var_run_idx[j];
+				if (k < 0)
+					continue;
+				v = reals(idx, j);
+				if (var_log[j])
+					v = pow(10.0, v);
+				if (var_has_scale[j])
+					v *= var_scale[j];
+				if (var_has_offset[j])
+					v += var_offset[j];
+				run_vec[k] = v;
+			}
+			//per-realization fixed values are already in model space, same as replace_fixed(...,true)
+			for (auto& r : pfinfo.get_real_fixed_values(rname))
+			{
+				auto it = run_par_idx.find(r.first);
+				if (it != run_par_idx.end())
+					run_vec[it->second] = r.second;
+			}
+			nn.clear();
+			for (k = 0; k < run_vec.size(); k++)
+				if ((!isnormal(run_vec[k])) && (run_vec[k] != 0.0))
+					nn.push_back(run_par_names[k]);
+			if (nn.size() > 0)
+			{
+				stringstream ss;
+				ss << "ParameterEnsemble:: add_runs() error: denormal values for realization " << rname << " : ";
+				for (auto n : nn)
+					ss << n << ",";
+				throw_ensemble_error(ss.str());
+			}
+			run_id = run_mgr_ptr->add_run(run_vec, info_txt + "  realization:" + rname);
+			real_run_ids[rname] = run_id;
+		}
+	}
+	//the general path, through a map of every parameter
+	else
 	for (int i=0;i<run_real_names.size();i++)
 	{
 	    rname = run_real_names[i];
@@ -3442,7 +3679,7 @@ void ParameterEnsemble::to_binary_unordered(string file_name)
 		for (auto& tname : t_names)
 		{
 			n = irow + 1 + (jcol * n_real);
-			data = t[var_map[tied_items.at(tname).first]] * tied_items.at(tname).second;
+			data = t[var_names.find(tied_items.at(tname).first)] * tied_items.at(tname).second;
 			n = irow;
 			fout.write((char*)&(n), sizeof(n));
 			n = jcol;
@@ -3681,7 +3918,87 @@ void ParameterEnsemble::to_dense_ordered(string file_name)
 		par_transform.ctl2model_ip(org_pars);
 	else if (tstat == transStatus::NUM)
 		par_transform.ctl2numeric_ip(org_pars);
-	
+
+	//fast path: with only per-parameter transformations, each row is a base vector (every par
+	//not in the ensemble, in ctl space) with the ensemble columns dropped in after undoing their
+	//own log. same ops and order as the map path below, without copying and transforming a
+	//name-keyed map of every parameter for every row.
+	bool fast = (tstat != transStatus::MODEL) && per_par_transforms();
+	const TranFixed* fixed_ptr = par_transform.get_fixed_ptr();
+	if (fast && (fixed_ptr != nullptr))
+	{
+		for (auto& vname : var_names)
+			if (fixed_ptr->get_value(vname).first)
+			{
+				fast = false;
+				break;
+			}
+	}
+	if (fast)
+	{
+		Parameters base_pars = org_pars;
+		if (tstat == transStatus::NUM)
+			par_transform.numeric2ctl_ip(base_pars);
+		vector<double> base_vec(n_var);
+		unordered_map<string, int> vidx;
+		vidx.reserve(n_var);
+		for (int jcol = 0; jcol < n_var; ++jcol)
+		{
+			base_vec[jcol] = base_pars[vnames[jcol]];
+			vidx[vnames[jcol]] = jcol;
+		}
+		const TranLog10* log_ptr = par_transform.get_log10_ptr();
+		int nvar = var_names.size();
+		vector<int> var_col(nvar, -1);
+		vector<char> var_log(nvar, 0);
+		for (int j = 0; j < nvar; j++)
+		{
+			auto it = vidx.find(var_names[j]);
+			if (it != vidx.end())
+				var_col[j] = it->second;
+			if ((tstat == transStatus::NUM) && (log_ptr != nullptr) &&
+				(log_ptr->get_items().find(var_names[j]) != log_ptr->get_items().end()))
+				var_log[j] = 1;
+		}
+		ParameterInfo* pinfo = pest_scenario_ptr->get_ctl_parameter_info_ptr_4_mod();
+		vector<double> row;
+		double v;
+		for (int irow = 0; irow < n_real; ++irow)
+		{
+			row = base_vec;
+			for (int j = 0; j < nvar; j++)
+			{
+				if (var_col[j] < 0)
+					continue;
+				v = reals(irow, j);
+				if (var_log[j])
+					v = pow(10.0, v);
+				row[var_col[j]] = v;
+			}
+			//same as replace_fixed(): per-realization fixed values back to ctl space
+			for (auto& r : pfinfo.get_real_fixed_values(real_names[irow]))
+			{
+				auto it = vidx.find(r.first);
+				if (it == vidx.end())
+					continue;
+				v = r.second;
+				v -= pinfo->get_parameter_rec_ptr(r.first)->offset;
+				v /= pinfo->get_parameter_rec_ptr(r.first)->scale;
+				row[it->second] = v;
+			}
+			string name = real_names[irow];
+			tmp = name.size();
+			char* real_name = new char[tmp];
+			fout.write((char*)&tmp, sizeof(tmp));
+			pest_utils::string_to_fortran_char(name, real_name, tmp);
+			fout.write(real_name, tmp);
+			delete[] real_name;
+			fout.write((char*)row.data(), sizeof(double) * n_var);
+		}
+		fout.close();
+		return;
+	}
+
 	for (int irow = 0; irow < n_real; ++irow)
 	{
 		Parameters pars = org_pars;
@@ -3840,7 +4157,7 @@ void ParameterEnsemble::to_dense_unordered(string file_name)
 
 		for (auto& tname : t_names)
 		{
-			data = t[var_map[tied_items.at(tname).first]] * tied_items.at(tname).second;
+			data = t[var_names.find(tied_items.at(tname).first)] * tied_items.at(tname).second;
 			fout.write((char*)&(data), sizeof(data));
 			jcol++;
 		}
@@ -4470,43 +4787,8 @@ void ObservationEnsemble::draw(int num_reals, Covariance &cov, PerformanceLog *p
 
 	Ensemble::draw(num_reals, cov, obs, sorted_var_names, grouper, plog, level);
 
-	//apply any bounds that were supplied
-	map<string, double> lower_bnd = pest_scenario_ptr->get_ext_file_double_map("observation data external", "lower_bound");
-	map<string, double> upper_bnd = pest_scenario_ptr->get_ext_file_double_map("observation data external", "upper_bound");
-	set<string> snames(var_names.begin(), var_names.end());
-	double v, lb, ub;
-	Eigen::VectorXd col;
-	string var_name;
-	if ((lower_bnd.size() > 0) || (upper_bnd.size() > 0))
-	{
-		frec << "Note: the following observations contain 'lower_bound' and/or 'upper_bound' information that will be" << endl;
-		frec << "      enforced on the additive noise realizations: " << endl;
-		for (int j = 0; j < reals.cols(); j++)
-		{
-			var_name = var_names[j];
-			lb = std::numeric_limits<double>::lowest();
-			ub = 1.79769e+308;//std::numeric_limits<double>::max();
-			if (auto lb_it = lower_bnd.find(var_name); lb_it != lower_bnd.end())
-			{
-				lb = lb_it->second;
-			}
-			if (auto ub_it = upper_bnd.find(var_name); ub_it != upper_bnd.end())
-			{
-				ub = ub_it->second;
-			}
-			frec << var_name << " " << lb << " " << ub << endl;
-			col = reals.col(j);
-
-			for (int i = 0; i < reals.rows(); i++)
-			{
-				v = col(i);
-				v = v < lb ? lb : v;
-				col(i) = v > ub ? ub : v;
-			}
-			reals.col(j) = col;
-			
-		}
-	}
+	//apply any bounds that were supplied (var_names is still just the nz obs here)
+	enforce_obs_bounds(frec, true);
 
 	//now fill in all the zero-weighted obs
 	Eigen::MatrixXd drawn = reals;
@@ -4532,7 +4814,82 @@ void ObservationEnsemble::draw(int num_reals, Covariance &cov, PerformanceLog *p
 		}
 	}
 	var_names = full_var_names;
-	
+
+}
+
+/**
+ * @brief Clamp realizations to the obs 'lower_bound' / 'upper_bound' external columns.
+ *
+ * this used to live inline in draw().  it is pulled out so the structural noise draws at a
+ * reinflation can be clamped the same way.  draw() calls it with report = true, which writes
+ * the same bounded-obs listing it always has.  whenever any value is actually clamped, a count
+ * per obs is written as well, whoever the caller is.
+ *
+ * @param frec the rec file stream.
+ * @param report list every bounded obs and its bounds.
+ * @param names the obs to clamp; empty means all of var_names.
+ *
+ * @return the number of values clamped.
+ */
+int ObservationEnsemble::enforce_obs_bounds(ofstream& frec, bool report, const vector<string>& names)
+{
+	map<string, double> lower_bnd = pest_scenario_ptr->get_ext_file_double_map("observation data external", "lower_bound");
+	map<string, double> upper_bnd = pest_scenario_ptr->get_ext_file_double_map("observation data external", "upper_bound");
+	if ((lower_bnd.size() == 0) && (upper_bnd.size() == 0))
+		return 0;
+	set<string> snames(names.begin(), names.end());
+	if (report)
+	{
+		frec << "Note: the following observations contain 'lower_bound' and/or 'upper_bound' information that will be" << endl;
+		frec << "      enforced on the additive noise realizations: " << endl;
+	}
+	double v, lb, ub;
+	Eigen::VectorXd col;
+	string var_name;
+	int total = 0, count;
+	vector<pair<string, int>> clamped;
+	for (int j = 0; j < reals.cols(); j++)
+	{
+		var_name = var_names[j];
+		if ((snames.size() > 0) && (snames.find(var_name) == snames.end()))
+			continue;
+		lb = std::numeric_limits<double>::lowest();
+		ub = 1.79769e+308;//std::numeric_limits<double>::max();
+		if (auto lb_it = lower_bnd.find(var_name); lb_it != lower_bnd.end())
+		{
+			lb = lb_it->second;
+		}
+		if (auto ub_it = upper_bnd.find(var_name); ub_it != upper_bnd.end())
+		{
+			ub = ub_it->second;
+		}
+		if (report)
+			frec << var_name << " " << lb << " " << ub << endl;
+		col = reals.col(j);
+		count = 0;
+		for (int i = 0; i < reals.rows(); i++)
+		{
+			v = col(i);
+			if ((v < lb) || (v > ub))
+				count++;
+			v = v < lb ? lb : v;
+			col(i) = v > ub ? ub : v;
+		}
+		reals.col(j) = col;
+		if (count > 0)
+		{
+			clamped.push_back(make_pair(var_name, count));
+			total += count;
+		}
+	}
+	if (total > 0)
+	{
+		frec << "Note: obs bound enforcement clamped " << total << " values in " << clamped.size()
+			 << " observations (obs name, number of realizations clamped):" << endl;
+		for (auto& c : clamped)
+			frec << "      " << c.first << " " << c.second << endl;
+	}
+	return total;
 }
 
 /**
@@ -4753,20 +5110,17 @@ void ObservationEnsemble::from_binary(string file_name)
     }
 	if (var_names.size() < names.size())
 	{
-		update_var_map();
-		map<string, int>::iterator end = var_map.end();
 		Eigen::MatrixXd full(reals.rows(), names.size());
 		full.setZero();
-		string name;
+		int icol;
 		for (int j = 0; j < names.size(); j++)
 		{
-			name = names[j];
-			if (var_map.find(name) != end)
-				full.col(j) = reals.col(var_map.at(name));
+			icol = var_names.find(names[j]);
+			if (icol >= 0)
+				full.col(j) = reals.col(icol);
 		}
 		var_names = names;
 		reals = full;
-		update_var_map();
 	}
 }
 

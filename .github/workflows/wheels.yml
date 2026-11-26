@@ -55,7 +55,7 @@ jobs:
           cp "$lib" python/pestpp/_binaries/
           # the command line tools go in too, so `pip install pestpp` puts pestpp-ies and
           # friends on PATH via the console scripts in pyproject.toml
-          for t in glm ies opt sen swp mou sqp da; do
+          for t in glm ies opt sen swp mou sqp da appl; do
             exe=$(find build -type f -name "pestpp-$t" | head -1)
             test -n "$exe" || { echo "::error::pestpp-$t was not built"; exit 1; }
             cp "$exe" python/pestpp/_binaries/
@@ -94,11 +94,21 @@ jobs:
   native:
     name: ${{ matrix.os }} wheel
     runs-on: ${{ matrix.os }}
+    # the library has to be built for an older macos than the runner's, or a user on anything
+    # older installs a wheel whose library will not load. cmake reads it on mac only. 13.3 and
+    # not lower because pestpp-appl uses floating point std::to_chars, which apple only ships
+    # from 13.3 on.
+    #
+    # the TAG is 14_0, not 13_3: from macos 11 on pip only matches tags with a 0 minor version,
+    # so a 13_3 wheel installs nowhere ("not a supported wheel on this platform"). 13_0 would
+    # install on 13.0-13.2 where the library cannot load, so it goes up to the next 0
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.3"
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14,     plat: macosx_11_0_arm64 }
+          - { os: macos-15,     plat: macosx_14_0_arm64 }
           - { os: windows-2022, plat: win_amd64 }
     defaults:
       run:
@@ -130,7 +140,7 @@ jobs:
           lib=$(find build -name 'pestpp-api.dylib' -o -name 'pestpp-api.dll' | head -1)
           test -n "$lib" || { echo "::error::the shared library was not built"; exit 1; }
           cp "$lib" python/pestpp/_binaries/
-          for t in glm ies opt sen swp mou sqp da; do
+          for t in glm ies opt sen swp mou sqp da appl; do
             exe=$(find build -type f \( -name "pestpp-$t" -o -name "pestpp-$t.exe" \) | head -1)
             test -n "$exe" || { echo "::error::pestpp-$t was not built"; exit 1; }
             cp "$exe" python/pestpp/_binaries/
@@ -162,7 +172,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, artifact: wheel-linux }
-          - { os: macos-14,      artifact: wheel-macos-14 }
+          - { os: macos-15,      artifact: wheel-macos-15 }
           - { os: windows-2022,  artifact: wheel-windows-2022 }
     steps:
       - uses: actions/setup-python@v6

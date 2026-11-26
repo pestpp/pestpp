@@ -366,7 +366,7 @@ set(_local_install_copies
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${_local_install_bin}")
 foreach(_tgt
     pestpp-glm pestpp-ies pestpp-opt pestpp-sen pestpp-swp
-    pestpp-mou pestpp-sqp pestpp-da pestpp-selftest pestpp_capi)
+    pestpp-mou pestpp-sqp pestpp-da pestpp-selftest pestpp-appl pestpp_capi)
   list(APPEND _local_install_copies
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
       "$<TARGET_FILE:${_tgt}>" "${_local_install_bin}/")
@@ -415,6 +415,7 @@ add_custom_target(local_install
     pestpp-mou
     pestpp-sqp
     pestpp-da
+    pestpp-appl
     pestpp_capi
     # not shipped, but installed so bin/ never serves a stale selftest - and listed HERE
     # because its install() rule would otherwise let ninja run cmake_install.cmake before the

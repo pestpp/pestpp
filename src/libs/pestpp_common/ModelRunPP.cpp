@@ -55,6 +55,8 @@ ModelRun::ModelRun(const ObjectiveFunc *_obj_func_ptr, const Observations &_sim_
 
 ModelRun& ModelRun::operator=(const ModelRun &rhs)
 {
+	if (this == &rhs)
+		return *this;
 	frozen_ctl_par_names = rhs.frozen_ctl_par_names;
 	obj_func_ptr = rhs.obj_func_ptr;
 	ctl_pars = rhs.ctl_pars;

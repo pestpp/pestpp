@@ -59,6 +59,7 @@ void IterEnsembleSmoother::iterate_2_solution()
 	// with ies_reinflate_solver the solver comes from the schedule and can change at each
 	// reinflation; without it get_solver() is empty and ies_use_mda / ies_use_enif decide
 	string last_solver;
+	double last_mm_alpha = -1.0;
 	bool new_cycle = true;
 	for (int i = 0; i < pest_scenario.get_control_info().noptmax; i++)
 	{
@@ -77,6 +78,13 @@ void IterEnsembleSmoother::iterate_2_solution()
 				begin_mda_segment(seg_len);
 			}
 		}
+		// multimodal alpha follows the schedule the same way; negative means the schedule
+		// is not in use and ies_multimodal_alpha decides
+		double mm_alpha = reinflation.get_multimodal_alpha();
+		set_active_multimodal_alpha(mm_alpha);
+		if ((mm_alpha >= 0.0) && (mm_alpha != last_mm_alpha || new_cycle))
+			message(1, "multimodal alpha for this reinflation cycle:", mm_alpha);
+		last_mm_alpha = mm_alpha;
 		new_cycle = false;
 		last_solver = solver;
 		bool mda_now = solver.empty() ? pest_scenario.get_pestpp_options().get_ies_use_mda()
@@ -108,7 +116,8 @@ void IterEnsembleSmoother::iterate_2_solution()
             message(2,"incrementing iteration count for reinflation cycle");
             iter++;
 
-            reinflate_par_ensemble(reinflation.get_factor(),reinflation.get_num_reals());
+            reinflate_par_ensemble(reinflation.get_factor(),reinflation.get_num_reals(),-1,
+                                   reinflation.get_structnoise_frac());
             //adjust_weights(true);
             reinflation.advance();
             new_cycle = true;

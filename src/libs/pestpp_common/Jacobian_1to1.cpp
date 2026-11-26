@@ -303,7 +303,7 @@ bool Jacobian_1to1::process_runs(ParamTransformSeq &par_transform,
 	string par_name_next;
 	int run_status_next;
 	double par_value_next;
-	double cur_numeric_par_value;
+	double cur_numeric_par_value = 0.0;
 	list<JacobianRun> run_list;
     int nfailed = 0;
 	

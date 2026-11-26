@@ -1,0 +1,77 @@
+name: mac runner retry
+
+# reruns a workflow when its macos jobs failed only because github never gave them a runner
+# ("The job was not acquired by Runner of type hosted even after multiple attempts"). those
+# jobs ran no steps, so there is nothing to fix - it is runner capacity on github's side.
+#
+# covers every workflow with macos jobs. the names below are the workflows' `name:` lines, so
+# a renamed workflow has to be renamed here too.
+#
+# this has to be its own workflow: a run cannot be rerun while it is still going, so a job
+# inside the workflow itself cannot do it. workflow_run fires once the watched run is done.
+#
+# note: github only fires workflow_run from the copy of this file on the DEFAULT branch, so it
+# does nothing until it is merged there.
+#
+# it only reruns when every failed or cancelled job was an unacquired macos job. a real
+# failure anywhere in the run, or a run cancelled because a newer push superseded it, is left
+# alone - rerunning would repeat the real failures too. at most two reruns (three attempts in
+# all) so a long capacity outage does not loop forever.
+on:
+  workflow_run:
+    workflows:
+      - continuous integration
+      - development environment continuous integration
+      - wheels
+      - Release Pest++
+    types: [completed]
+
+permissions:
+  actions: write
+  checks: read
+
+jobs:
+  retry:
+    if: >-
+      (github.event.workflow_run.conclusion == 'failure' ||
+       github.event.workflow_run.conclusion == 'cancelled') &&
+      github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      RUN_NAME: ${{ github.event.workflow_run.name }}
+    steps:
+      - name: Rerun if the only failures are unacquired macos runners
+        run: |
+          set -euo pipefail
+          echo "checking $RUN_NAME run $RUN_ID"
+          unacquired=0
+          other=0
+          # failed and cancelled jobs from the latest attempt of the run. skipped jobs (ones
+          # behind a failed job, like the wheel smoke tests) are not counted - the rerun brings
+          # them back
+          jobs=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?filter=latest" --paginate \
+            --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled")
+                  | "\(.id)\t\(.name)"')
+          while IFS=$'\t' read -r id name; do
+            [ -z "$id" ] && continue
+            # the job id is also its check run id, and the "not acquired" message is an
+            # annotation on it
+            msgs=$(gh api "repos/$GH_REPO/check-runs/$id/annotations" --jq '.[].message')
+            if grep -q "was not acquired by Runner" <<< "$msgs" && grep -qi "macos" <<< "$name"; then
+              echo "unacquired: $name"
+              unacquired=$((unacquired + 1))
+            else
+              echo "other failure: $name"
+              other=$((other + 1))
+            fi
+          done <<< "$jobs"
+
+          if [ "$unacquired" -gt 0 ] && [ "$other" -eq 0 ]; then
+            echo "rerunning the failed jobs of run $RUN_ID"
+            gh run rerun "$RUN_ID" --failed
+          else
+            echo "not rerunning: $unacquired unacquired macos job(s), $other other failure(s)"
+          fi

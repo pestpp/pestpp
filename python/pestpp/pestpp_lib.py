@@ -59,6 +59,9 @@ TOOL_GLM = 4
 #: population, so the ensemble and phi calls refuse - but it HAS the chance machinery, so the
 #: stack and risk calls work as they do for mou and sqp.
 TOOL_OPT = 5
+#: no tool - just the control file's model interface, for one model run at a time with
+#: run_model(). serial only, and every tool call refuses.
+TOOL_MODEL = 6
 PAR_EN, OBS_EN, NOISE_EN, WEIGHTS_EN = 0, 1, 2, 3
 #: the chance stacks, mou and sqp only. Empty - not an error - on a fosm or risk-neutral run;
 #: get_stack_status() is how you tell those apart from "not drawn yet"
@@ -514,6 +517,10 @@ class PestppLib:
         lib.pestpp_set_run_values.restype = c_int
         lib.pestpp_set_run_failed.argtypes = (c_void_p, c_int)
         lib.pestpp_set_run_failed.restype = c_int
+        lib.pestpp_run_model.argtypes = (c_void_p, POINTER(c_double), c_int, c_char_p,
+                                         POINTER(c_double), c_int, c_char_p, c_int,
+                                         POINTER(c_int))
+        lib.pestpp_run_model.restype = c_int
         lib.pestpp_get_run_values.restype = c_int
         lib.pestpp_request_partial_results.argtypes = (
             c_void_p, POINTER(c_int), c_int, POINTER(c_int))
@@ -631,7 +638,7 @@ class PestppLib:
         lib.pestpp_set_obs_weights.restype = c_int
         lib.pestpp_broadcast_weights.argtypes = (c_void_p,)
         lib.pestpp_broadcast_weights.restype = c_int
-        lib.pestpp_reinflate_ensemble.argtypes = (c_void_p, c_double, c_int, c_int)
+        lib.pestpp_reinflate_ensemble.argtypes = (c_void_p, c_double, c_int, c_int, c_double)
         lib.pestpp_reinflate_ensemble.restype = c_int
         lib.pestpp_update_phi.argtypes = (c_void_p,)
         lib.pestpp_update_phi.restype = c_int
@@ -1133,6 +1140,44 @@ class PestppLib:
         self._check(self.lib.pestpp_set_run_failed(self.handle, c_int(run_id)),
                     "pestpp_set_run_failed")
 
+    def model_obs_names(self) -> list[str]:
+        """The observation names run_model() returns, in its order. Runs nothing."""
+        n = c_int()
+        self._check(self.lib.pestpp_run_model(self.handle, None, 0, None, None, 0, None, 0,
+                                              byref(n)), "pestpp_run_model")
+        buf = create_string_buffer(max(n.value, 1) * self.name_len)
+        self._check(self.lib.pestpp_run_model(self.handle, None, 0, None, None, 0, buf,
+                                              n.value * self.name_len, byref(n)),
+                    "pestpp_run_model")
+        return self._unpack_names(buf.raw, n.value)
+
+    def run_model(self, names=None, values=None) -> tuple[list[str], np.ndarray]:
+        """One model run on a TOOL_MODEL handle: tpl -> command(s) -> ins, right here.
+
+        `names`/`values` are control-file parameter values matched by name; anything not
+        named keeps its control-file value, and None runs the control file as it is. Returns
+        the observation names and simulated values, in control-file order.
+        """
+        n = c_int()
+        self._check(self.lib.pestpp_run_model(self.handle, None, 0, None, None, 0, None, 0,
+                                              byref(n)), "pestpp_run_model")
+        nobs = n.value
+        names = [] if names is None else list(names)
+        vals = np.ascontiguousarray(np.asarray([] if values is None else values,
+                                               dtype=np.float64))
+        if len(names) != vals.size:
+            raise ValueError("names and values differ in length: {0} vs {1}"
+                             .format(len(names), vals.size))
+        pbuf = self._pack_names(names) if names else None
+        pptr = vals.ctypes.data_as(POINTER(c_double)) if names else None
+        obs = (c_double * max(nobs, 1))()
+        obuf = create_string_buffer(max(nobs, 1) * self.name_len)
+        self._check(self.lib.pestpp_run_model(self.handle, pptr, len(names), pbuf,
+                                              obs, nobs, obuf, nobs * self.name_len, byref(n)),
+                    "pestpp_run_model")
+        return (self._unpack_names(obuf.raw, n.value),
+                np.ctypeslib.as_array(obs)[:n.value].copy())
+
     def request_partial_results(self, run_ids=None) -> int:
         """Ask the workers running these runs for whatever they have. Returns requests sent."""
         n_req = c_int()
@@ -1626,11 +1671,12 @@ class PestppLib:
                     "pestpp_set_obs_weights")
 
     def reinflate_ensemble(self, factor: float = 1.0, num_reals: int = 0,
-                           center_on_min_phi: int = -1) -> None:
+                           center_on_min_phi: int = -1,
+                           structnoise_frac: float = 0.0) -> None:
         """Rebuild the parameter ensemble from the prior's spread, re-centred on the current."""
         self._check(self.lib.pestpp_reinflate_ensemble(
             self.handle, c_double(float(factor)), c_int(int(num_reals)),
-            c_int(int(center_on_min_phi))),
+            c_int(int(center_on_min_phi)), c_double(float(structnoise_frac))),
             "pestpp_reinflate_ensemble")
 
     def broadcast_weights(self) -> None:

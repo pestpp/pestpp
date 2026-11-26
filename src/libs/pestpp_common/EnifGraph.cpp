@@ -1,6 +1,7 @@
 #include <set>
 #include <thread>
 #include <atomic>
+#include <functional>
 #include <map>
 #include <algorithm>
 #include <cmath>
@@ -13,7 +14,7 @@ using namespace std;
 
 
 void EnifGraph::from_file(const string& filename, const vector<string>& par_names,
-	ofstream& frec, const string& order)
+	ofstream& frec)
 {
 	stringstream ss;
 	Mat m;
@@ -80,14 +81,6 @@ void EnifGraph::from_file(const string& filename, const vector<string>& par_name
 	//pattern is found by a symbolic factorisation.  this is what graphite-maps
 	//does (metis + a cholmod symbolic factorisation); amd is eigen's built-in
 	//equivalent.
-	order_method = order;
-	for (auto& c : order_method)
-		c = (char)tolower(c);
-	if (order_method.size() == 0)
-		order_method = "amd";
-	if ((order_method != "amd") && (order_method != "natural"))
-		throw runtime_error("EnifGraph::from_file(): unknown ies_enif_order '" +
-			order_method + "', should be 'amd' or 'natural'");
 
 	//a positive definite matrix carrying the graph pattern.  gershgorin: with
 	//the diagonal at max degree + 1 the matrix is strictly diagonally dominant,
@@ -103,18 +96,6 @@ void EnifGraph::from_file(const string& filename, const vector<string>& par_name
 
 	Eigen::SparseMatrix<double> Lp;
 	vector<int> orig_of_pos(p);
-	if (order_method == "natural")
-	{
-		Eigen::SimplicialLLT<Eigen::SparseMatrix<double>, Eigen::Lower,
-			Eigen::NaturalOrdering<int>> sym;
-		sym.compute(pattern);
-		if (sym.info() != Eigen::Success)
-			throw runtime_error("EnifGraph::from_file(): symbolic factorisation failed");
-		Lp = sym.matrixL();
-		for (int i = 0; i < p; i++)
-			orig_of_pos[i] = i;
-	}
-	else
 	{
 		Eigen::SimplicialLLT<Eigen::SparseMatrix<double>, Eigen::Lower,
 			Eigen::AMDOrdering<int>> sym;
@@ -145,32 +126,12 @@ void EnifGraph::from_file(const string& filename, const vector<string>& par_name
 		}
 	fill_edges = (lnnz - p) - (nnz_offdiag / 2);
 
-	//the same sets without the fill: direct graph neighbours that come earlier in the
-	//ordering.  pos_of_orig inverts solve_order
-	vector<int> pos_of_orig(p);
-	for (int pos = 0; pos < p; pos++)
-		pos_of_orig[orig_of_pos[pos]] = pos;
-	direct_pred_sets.assign(p, vector<int>());
-	int max_direct = 0;
-	for (int i = 0; i < p; i++)
-	{
-		for (Eigen::SparseMatrix<double>::InnerIterator it(adj, i); it; ++it)
-		{
-			int j = (int)it.row();
-			if ((j != i) && (pos_of_orig[j] < pos_of_orig[i]))
-				direct_pred_sets[i].push_back(j);
-		}
-		sort(direct_pred_sets[i].begin(), direct_pred_sets[i].end());
-		max_direct = max(max_direct, (int)direct_pred_sets[i].size());
-	}
-
 	initialized = true;
 	report(frec);
-	frec << "...solve ordering: " << order_method << "; cholesky factor carries "
+	frec << "...solve ordering: amd; cholesky factor carries "
 		<< (lnnz - p) << " off-diagonal entries, " << fill_edges << " of them fill "
 		<< "beyond the " << (nnz_offdiag / 2) << " graph edges" << endl;
-	frec << "...largest predecessor set with fill: " << [&]() { size_t m = 0; for (auto& v : pred_sets) m = max(m, v.size()); return m; }()
-		<< ", direct neighbours only: " << max_direct << endl;
+	frec << "...largest predecessor set with fill: " << [&]() { size_t m = 0; for (auto& v : pred_sets) m = max(m, v.size()); return m; }() << endl;
 }
 
 
@@ -203,7 +164,7 @@ void EnifGraph::report(ofstream& frec) const
 
 
 void EnifGraph::estimate_precision(const Eigen::MatrixXd& anomalies, double shrink,
-	ofstream& frec, bool direct_only, bool into_current)
+	ofstream& frec)
 {
 	stringstream ss;
 	if (!initialized)
@@ -244,8 +205,7 @@ void EnifGraph::estimate_precision(const Eigen::MatrixXd& anomalies, double shri
 	{
 		//walk the elimination ordering, not the parameter ordering
 		int i = solve_order.empty() ? pos : solve_order[pos];
-		vector<int> pred = direct_only ? (direct_pred_sets.empty() ? vector<int>() : direct_pred_sets[i])
-			: (pred_sets.empty() ? vector<int>() : pred_sets[i]);
+		vector<int> pred = pred_sets.empty() ? vector<int>() : pred_sets[i];
 
 		//A neighbourhood anywhere near the ensemble size overfits: the regression
 		//interpolates in-sample, the residual variance collapses, and since
@@ -386,17 +346,6 @@ void EnifGraph::estimate_precision(const Eigen::MatrixXd& anomalies, double shri
 
 	Eigen::SparseMatrix<double> L(p, p);
 	L.setFromTriplets(ltrips.begin(), ltrips.end());
-	if (into_current)
-	{
-		//the damping metric for the hybrid step, re-estimated each iteration.  it is
-		//never factored on its own, only as part of the posterior precision
-		prec_cur = (Eigen::SparseMatrix<double>)(L.transpose() * L);
-		prec_cur.makeCompressed();
-		cur_ready = true;
-		frec << "...estimated current-ensemble precision on the graph for the hybrid damping: "
-			<< prec_cur.nonZeros() << " non-zeros" << endl;
-		return;
-	}
 	prec = (Eigen::SparseMatrix<double>)(L.transpose() * L);
 	prec.makeCompressed();
 
@@ -410,8 +359,7 @@ void EnifGraph::estimate_precision(const Eigen::MatrixXd& anomalies, double shri
 		<< " non-zeros, density " << setprecision(4)
 		<< (100.0 * (double)prec.nonZeros() / ((double)p * (double)p)) << " percent" << endl;
 	frec << "...largest neighbourhood used: " << max_pred << " of " << nreal
-		<< " realizations" << (direct_only ? "  (direct graph neighbours only, fill ignored: the factor is "
-			"not exact, the regressions are sized to the ensemble)" : "") << endl;
+		<< " realizations" << endl;
 	if (!ridges.empty())
 	{
 		sort(ridges.begin(), ridges.end());
@@ -502,17 +450,7 @@ Eigen::MatrixXd EnifGraph::information_step(const Eigen::SparseMatrix<double>& H
 	}
 	Eigen::SparseMatrix<double> HtRH = (H.transpose() * Rinv * H).eval();
 
-	Eigen::SparseMatrix<double> lam_post;
-	if (hybrid_damp)
-	{
-		//lambda on the current-ensemble precision: the curvature keeps the prior, the
-		//trust region follows the ensemble
-		if (!cur_ready)
-			throw runtime_error("EnifGraph::information_step(): hybrid damping asked for but no current-ensemble precision estimated");
-		lam_post = (prec + (lam * prec_cur) + HtRH).eval();
-	}
-	else
-		lam_post = ((1.0 + lam) * prec + HtRH).eval();
+	Eigen::SparseMatrix<double> lam_post = ((1.0 + lam) * prec + HtRH).eval();
 	lam_post.makeCompressed();
 
 	Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> post_solver;
@@ -536,66 +474,193 @@ Eigen::MatrixXd EnifGraph::information_step(const Eigen::SparseMatrix<double>& H
 }
 
 
-//one coordinate descent sweep over the columns listed in cols for
-//    min 0.5||b - X x||^2 + alpha ||x||_1
-//X is realizations x parameters, so each parameter is a contiguous column; cnorm holds
-//the squared column norms.  x and the residual r = b - X x are updated in place.
-//returns the largest coefficient change.
-static double lasso_sweep(const Eigen::MatrixXd& X, const Eigen::VectorXd& cnorm,
-	double alpha, Eigen::VectorXd& x, Eigen::VectorXd& r, const vector<int>& cols)
+//column-order coordinate descent for a block of independent lassos that share the
+//design X (realizations x parameters, each parameter a contiguous column):
+//    min 0.5||b_i - X h_i||^2 + alpha_i ||h_i||_1     for each column i of R
+//R comes in as the b_i (realizations x rows) and leaves as the residuals.  H is kept
+//by parameter: hcol[j] holds the (row, value) nonzeros of column j, which is also the
+//set of rows parameter j is active in.  each row sees the parameters in the same
+//order as the row-order loop and stops once a full sweep moves none of its
+//coefficients by tol, so it takes the same steps.  rho is a plain dot per row, not
+//one matrix product over the block, so a row's arithmetic does not depend on which
+//block (or thread) it lands in.
+//
+//rows lists the rows to iterate; the others are left alone.  full sweeps until the
+//change drops under tol, at most max_sweeps of them.
+//
+//loc (observations x parameters, column major) limits which rows may use parameter j
+//to its stored entries; r0 is where this block's rows sit in loc.
+static void lasso_cd_cols(const Eigen::MatrixXd& X, const Eigen::VectorXd& cnorm,
+	const Eigen::VectorXd& alpha, Eigen::MatrixXd& R,
+	vector<vector<pair<int, double>>>& hcol, const vector<int>& rows,
+	int max_sweeps, double tol,
+	const Eigen::SparseMatrix<double>* loc = nullptr, int r0 = 0)
 {
-	double max_chg = 0.0;
-	for (int j : cols)
+	int p = (int)X.cols();
+	int nb = (int)R.cols();
+	vector<int> running = rows;
+	//dense scratch for the column being swept, zero outside it
+	Eigen::VectorXd hj = Eigen::VectorXd::Zero(nb);
+	Eigen::VectorXd chg = Eigen::VectorXd::Zero(nb);
+	//rows of this block the localizer lets use the current parameter
+	vector<char> ok(nb, 0);
+	for (int sweep = 0; (!running.empty()) && (sweep < max_sweeps); sweep++)
 	{
-		if (cnorm[j] <= 0.0)
-			continue;
-		double xj = x[j];
-		double rho = X.col(j).dot(r) + cnorm[j] * xj;
-		double nx = 0.0;
-		if (rho > alpha)
-			nx = (rho - alpha) / cnorm[j];
-		else if (rho < -alpha)
-			nx = (rho + alpha) / cnorm[j];
-		if (nx != xj)
+		for (int i : running)
+			chg[i] = 0.0;
+		for (int j = 0; j < p; j++)
 		{
-			r.noalias() -= X.col(j) * (nx - xj);
-			x[j] = nx;
-			max_chg = max(max_chg, abs(nx - xj));
+			if (cnorm[j] <= 0.0)
+				continue;
+			if (loc != nullptr)
+			{
+				bool any = false;
+				for (Eigen::SparseMatrix<double>::InnerIterator it(*loc, j); it; ++it)
+					if ((it.row() >= r0) && (it.row() < r0 + nb))
+					{
+						ok[it.row() - r0] = 1;
+						any = true;
+					}
+				if (!any)
+					continue;
+			}
+			vector<pair<int, double>>& col = hcol[j];
+			for (auto& e : col)
+				hj[e.first] = e.second;
+			bool changed = false;
+			for (int i : running)
+			{
+				if ((loc != nullptr) && (!ok[i]))
+					continue;
+				double xj = hj[i];
+				double rho = X.col(j).dot(R.col(i)) + cnorm[j] * xj;
+				double nx = 0.0;
+				if (rho > alpha[i])
+					nx = (rho - alpha[i]) / cnorm[j];
+				else if (rho < -alpha[i])
+					nx = (rho + alpha[i]) / cnorm[j];
+				if (nx != xj)
+				{
+					R.col(i).noalias() -= X.col(j) * (nx - xj);
+					hj[i] = nx;
+					chg[i] = max(chg[i], abs(nx - xj));
+					changed = true;
+				}
+			}
+			if (loc != nullptr)
+				for (Eigen::SparseMatrix<double>::InnerIterator it(*loc, j); it; ++it)
+					if ((it.row() >= r0) && (it.row() < r0 + nb))
+						ok[it.row() - r0] = 0;
+			//write the column back and clear the scratch
+			if (changed)
+			{
+				col.clear();
+				for (int i = 0; i < nb; i++)
+					if (hj[i] != 0.0)
+					{
+						col.push_back(pair<int, double>(i, hj[i]));
+						hj[i] = 0.0;
+					}
+			}
+			else
+				for (auto& e : col)
+					hj[e.first] = 0.0;
+		}
+		vector<int> still;
+		for (int i : running)
+			if (chg[i] >= tol)
+				still.push_back(i);
+		running.swap(still);
+	}
+}
+
+
+//split nobs rows into blocks and hand them to threads, a few blocks per thread so an
+//uneven block does not hold up the rest.  solve_block(b, r0, nb) owns rows r0..r0+nb-1
+static int run_row_blocks(int nobs, int num_threads, const std::function<void(int, int, int)>& solve_block)
+{
+	int nt = (num_threads < 2) ? 1 : min(num_threads, nobs);
+	int bsize = max(1, nobs / (4 * nt));
+	int nblock = (nobs + bsize - 1) / bsize;
+	auto one = [&](int b) { solve_block(b, b * bsize, min(bsize, nobs - b * bsize)); };
+	if (nt < 2)
+	{
+		for (int b = 0; b < nblock; b++)
+			one(b);
+	}
+	else
+	{
+		vector<thread> threads;
+		std::atomic<int> next(0);
+		for (int t = 0; t < nt; t++)
+			threads.push_back(thread([&]() {
+				int b;
+				while ((b = next.fetch_add(1)) < nblock)
+					one(b);
+				}));
+		for (auto& th : threads)
+			th.join();
+	}
+	return nblock;
+}
+
+
+//the block count run_row_blocks will use, so callers can size per-block storage first
+static int n_row_blocks(int nobs, int num_threads)
+{
+	int nt = (num_threads < 2) ? 1 : min(num_threads, nobs);
+	int bsize = max(1, nobs / (4 * nt));
+	return (nobs + bsize - 1) / bsize;
+}
+
+
+static Eigen::SparseMatrix<double> triplets_to_H(const vector<vector<Eigen::Triplet<double>>>& block_trips,
+	int nobs, int p)
+{
+	vector<Eigen::Triplet<double>> all;
+	for (auto& bt : block_trips)
+		all.insert(all.end(), bt.begin(), bt.end());
+	Eigen::SparseMatrix<double> H(nobs, p);
+	H.setFromTriplets(all.begin(), all.end());
+	H.makeCompressed();
+	return H;
+}
+
+
+//the smallest penalty that zeros each row of a block: the largest |x_j . b_i| over the
+//parameters the row may use - all of them without a localizer.  r0 is where the
+//block's rows sit in loc
+static Eigen::VectorXd row_zeroing_alpha(const Eigen::MatrixXd& X, const Eigen::MatrixXd& R,
+	const Eigen::SparseMatrix<double>* loc, int r0)
+{
+	int p = (int)X.cols();
+	int nb = (int)R.cols();
+	Eigen::VectorXd amax = Eigen::VectorXd::Zero(nb);
+	for (int j = 0; j < p; j++)
+	{
+		if (loc == nullptr)
+		{
+			for (int i = 0; i < nb; i++)
+				amax[i] = max(amax[i], abs(X.col(j).dot(R.col(i))));
+			continue;
+		}
+		for (Eigen::SparseMatrix<double>::InnerIterator it(*loc, j); it; ++it)
+		{
+			int i = (int)it.row() - r0;
+			if ((i >= 0) && (i < nb))
+				amax[i] = max(amax[i], abs(X.col(j).dot(R.col(i))));
 		}
 	}
-	return max_chg;
+	return amax;
 }
 
 
-//coordinate descent to convergence with an active set: a full sweep finds which
-//coefficients are nonzero, sweeps over just those run until they settle, and the next
-//full sweep checks nothing outside them wants in.  warm starts from x and r.
-static void lasso_cd(const Eigen::MatrixXd& X, const Eigen::VectorXd& cnorm,
-	double alpha, Eigen::VectorXd& x, Eigen::VectorXd& r, const vector<int>& all_cols,
-	int max_sweeps, double tol)
-{
-	vector<int> active;
-	for (int outer = 0; outer < max_sweeps; outer++)
-	{
-		double chg = lasso_sweep(X, cnorm, alpha, x, r, all_cols);
-		if (chg < tol)
-			break;
-		active.clear();
-		for (int j : all_cols)
-			if (x[j] != 0.0)
-				active.push_back(j);
-		for (int inner = 0; inner < max_sweeps; inner++)
-			if (lasso_sweep(X, cnorm, alpha, x, r, active) < tol)
-				break;
-	}
-}
-
-
-//the reference implementation's H: standardized rows, penalty per observation by
-//k-fold cross-validation, then a refit on every realization
-static Eigen::SparseMatrix<double> estimate_sparse_H_cv(const Eigen::MatrixXd& A,
-	const Eigen::MatrixXd& B, int cv_folds, int num_threads,
-	Eigen::VectorXd& unexplained, ostream& frec, double unexp_divisor)
+//the fixed-penalty H in column order.  same penalty, sweep cap and tolerance as the
+//row-order loop in estimate_sparse_H
+static Eigen::SparseMatrix<double> estimate_sparse_H_cols(const Eigen::MatrixXd& A,
+	const Eigen::MatrixXd& B, double lasso_frac, int num_threads,
+	Eigen::VectorXd& unexplained, ostream& frec, double unexp_divisor,
+	const Eigen::SparseMatrix<double>* loc)
 {
 	int p = (int)A.rows();
 	int nreal = (int)A.cols();
@@ -603,153 +668,54 @@ static Eigen::SparseMatrix<double> estimate_sparse_H_cv(const Eigen::MatrixXd& A
 	unexplained.setZero(nobs);
 	if (unexp_divisor <= 0.0)
 		unexp_divisor = (double)nreal;
-	int nfold = max(2, min(cv_folds, nreal));
-	const int n_alphas = 50;
-	const double alpha_eps = 1.0e-3;
-	const int max_sweeps = 1000;
-	//coefficients are in standardized units, so this is a relative tolerance
-	const double tol = 1.0e-6;
 
-	//unit-length parameter anomalies, stored realizations x parameters so each
-	//parameter is a contiguous column.  a parameter with no spread stays zero
-	Eigen::VectorXd asd = A.rowwise().norm();
-	Eigen::MatrixXd Xs(nreal, p);
-	for (int j = 0; j < p; j++)
-		Xs.col(j) = (asd[j] > 0.0) ? Eigen::VectorXd(A.row(j).transpose() / asd[j]) : Eigen::VectorXd::Zero(nreal);
-	vector<int> all_cols(p);
-	for (int j = 0; j < p; j++)
-		all_cols[j] = j;
+	//realizations x parameters, so each parameter's anomalies are contiguous
+	Eigen::MatrixXd X = A.transpose();
+	Eigen::VectorXd cnorm = X.colwise().squaredNorm().transpose();
+	vector<vector<Eigen::Triplet<double>>> block_trips(n_row_blocks(nobs, num_threads));
 
-	//contiguous folds over the realizations, as a plain k-fold split does
-	vector<vector<int>> test_idx(nfold), train_idx(nfold);
-	for (int k = 0; k < nreal; k++)
-		test_idx[(int)((long)k * nfold / nreal)].push_back(k);
-	vector<Eigen::MatrixXd> Xtr(nfold), Xte(nfold);
-	vector<Eigen::VectorXd> xtr_norm(nfold);
-	for (int f = 0; f < nfold; f++)
+	run_row_blocks(nobs, num_threads, [&](int b, int r0, int nb)
 	{
-		set<int> te(test_idx[f].begin(), test_idx[f].end());
-		for (int k = 0; k < nreal; k++)
-			if (te.find(k) == te.end())
-				train_idx[f].push_back(k);
-		Xtr[f].resize(train_idx[f].size(), p);
-		Xte[f].resize(test_idx[f].size(), p);
-		for (size_t c = 0; c < train_idx[f].size(); c++)
-			Xtr[f].row(c) = Xs.row(train_idx[f][c]);
-		for (size_t c = 0; c < test_idx[f].size(); c++)
-			Xte[f].row(c) = Xs.row(test_idx[f][c]);
-		xtr_norm[f] = Xtr[f].colwise().squaredNorm().transpose();
-	}
-	Eigen::VectorXd xs_norm = Xs.colwise().squaredNorm().transpose();
-
-	vector<vector<Eigen::Triplet<double>>> row_trips(nobs);
-	vector<double> chosen_frac(nobs, 0.0);
-
-	auto solve_row = [&](int i)
-	{
-		double bsd = B.row(i).norm();
-		if (bsd <= 0.0)
-			return;
-		Eigen::VectorXd bs = B.row(i).transpose() / bsd;
-
-		//penalty path from the value that zeros the whole row down to alpha_eps of it
-		double amax = (Xs.transpose() * bs).cwiseAbs().maxCoeff();
-		if (amax <= 0.0)
-			return;
-		vector<double> alphas(n_alphas);
-		for (int a = 0; a < n_alphas; a++)
-			alphas[a] = amax * pow(alpha_eps, (double)a / (double)(n_alphas - 1));
-
-		//held-out squared error summed over folds, per penalty
-		vector<double> cv_err(n_alphas, 0.0);
-		for (int f = 0; f < nfold; f++)
-		{
-			Eigen::VectorXd btr(train_idx[f].size()), bte(test_idx[f].size());
-			for (size_t c = 0; c < train_idx[f].size(); c++)
-				btr[c] = bs[train_idx[f][c]];
-			for (size_t c = 0; c < test_idx[f].size(); c++)
-				bte[c] = bs[test_idx[f][c]];
-			//the penalty is on the sum of squares, so scale it to the training size
-			//to keep the path comparable to the full fit
-			double nscale = (double)train_idx[f].size() / (double)nreal;
-			Eigen::VectorXd x = Eigen::VectorXd::Zero(p);
-			Eigen::VectorXd r = btr;
-			for (int a = 0; a < n_alphas; a++)
-			{
-				lasso_cd(Xtr[f], xtr_norm[f], alphas[a] * nscale, x, r, all_cols, max_sweeps, tol);
-				cv_err[a] += (bte - Xte[f] * x).squaredNorm();
-			}
-		}
-		int best = (int)(min_element(cv_err.begin(), cv_err.end()) - cv_err.begin());
-		chosen_frac[i] = alphas[best] / amax;
-
-		//refit on every realization, warm starting down the path to the chosen penalty
-		Eigen::VectorXd x = Eigen::VectorXd::Zero(p);
-		Eigen::VectorXd r = bs;
-		for (int a = 0; a <= best; a++)
-			lasso_cd(Xs, xs_norm, alphas[a], x, r, all_cols, max_sweeps, tol);
-
-		//back to original units: h_ij = x_j * ||b_i|| / ||a_j||, and the residual
-		//variance in original units is what the observation error is inflated by
-		Eigen::VectorXd h = Eigen::VectorXd::Zero(p);
+		Eigen::MatrixXd R = B.middleRows(r0, nb).transpose();
+		//penalty scaled by the smallest value that would zero each row
+		Eigen::VectorXd alpha = lasso_frac * row_zeroing_alpha(X, R, loc, r0);
+		vector<int> rows(nb);
+		for (int i = 0; i < nb; i++)
+			rows[i] = i;
+		vector<vector<pair<int, double>>> hcol(p);
+		lasso_cd_cols(X, cnorm, alpha, R, hcol, rows, 100, 1.0e-10, loc, r0);
+		//the anomalies carry a 1/sqrt(nreal-1), so r^2 (nreal-1) is the raw sum of squares
+		for (int i = 0; i < nb; i++)
+			unexplained[r0 + i] = R.col(i).squaredNorm() * (double)(nreal - 1) / unexp_divisor;
 		for (int j = 0; j < p; j++)
-			if ((x[j] != 0.0) && (asd[j] > 0.0))
-				h[j] = x[j] * bsd / asd[j];
-		Eigen::VectorXd res = B.row(i).transpose() - A.transpose() * h;
-		unexplained[i] = res.squaredNorm() * (double)(nreal - 1) / unexp_divisor;
-		for (int j = 0; j < p; j++)
-			if (h[j] != 0.0)
-				row_trips[i].push_back(Eigen::Triplet<double>(i, j, h[j]));
-	};
+			for (auto& e : hcol[j])
+				block_trips[b].push_back(Eigen::Triplet<double>(r0 + e.first, j, e.second));
+	});
+	Eigen::SparseMatrix<double> H = triplets_to_H(block_trips, nobs, p);
 
-	//ies_num_threads defaults to -1; take every core then, the rows are independent
-	if (num_threads < 1)
-		num_threads = max(1, (int)std::thread::hardware_concurrency());
-	if (num_threads < 2)
-	{
-		for (int i = 0; i < nobs; i++)
-			solve_row(i);
-	}
-	else
-	{
-		vector<thread> threads;
-		std::atomic<int> next(0);
-		int nt = min(num_threads, nobs);
-		for (int t = 0; t < nt; t++)
-			threads.push_back(thread([&]() {
-				int i;
-				while ((i = next.fetch_add(1)) < nobs)
-					solve_row(i);
-				}));
-		for (auto& th : threads)
-			th.join();
-	}
-
-	vector<Eigen::Triplet<double>> all;
-	for (auto& rt : row_trips)
-		all.insert(all.end(), rt.begin(), rt.end());
-	Eigen::SparseMatrix<double> H(nobs, p);
-	H.setFromTriplets(all.begin(), all.end());
-	H.makeCompressed();
-
-	vector<double> fr = chosen_frac;
-	sort(fr.begin(), fr.end());
-	frec << "...sparse H by " << nfold << "-fold cross-validated lasso on standardized anomalies: "
-		<< H.nonZeros() << " of " << ((long)nobs * (long)p) << " entries (" << setprecision(3)
-		<< (100.0 * (double)H.nonZeros() / ((double)nobs * (double)p)) << " percent)" << endl;
-	frec << "...chosen penalty as a fraction of the row-zeroing value, min / median / max: "
-		<< fr.front() << " / " << fr[fr.size() / 2] << " / " << fr.back() << endl;
-	frec << "...mean unexplained variance per observation: " << unexplained.mean() << endl;
+	frec << "...sparse H (column order" << ((loc != nullptr) ? ", localized" : "") << "): "
+		<< H.nonZeros() << " of " << ((long)nobs * (long)p)
+		<< " entries (" << setprecision(3)
+		<< (100.0 * (double)H.nonZeros() / ((double)nobs * (double)p))
+		<< " percent), lasso fraction " << lasso_frac << endl;
+	frec << "...mean unexplained variance per observation: "
+		<< unexplained.mean() << endl;
 	return H;
 }
 
 
 Eigen::SparseMatrix<double> estimate_sparse_H(const Eigen::MatrixXd& A,
 	const Eigen::MatrixXd& B, double lasso_frac, int num_threads,
-	Eigen::VectorXd& unexplained, ostream& frec, int cv_folds, double unexp_divisor)
+	Eigen::VectorXd& unexplained, ostream& frec, double unexp_divisor,
+	const Eigen::SparseMatrix<double>* loc)
 {
-	if (cv_folds > 0)
-		return estimate_sparse_H_cv(A, B, cv_folds, num_threads, unexplained, frec, unexp_divisor);
+	if (loc != nullptr)
+	{
+		if ((loc->rows() != B.rows()) || (loc->cols() != A.rows()))
+			throw runtime_error("estimate_sparse_H(): localizer pattern is the wrong shape");
+		//only the column-order fit knows about the localizer
+		return estimate_sparse_H_cols(A, B, lasso_frac, num_threads, unexplained, frec, unexp_divisor, loc);
+	}
 
 	int p = (int)A.rows();
 	int nreal = (int)A.cols();

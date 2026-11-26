@@ -218,6 +218,9 @@ void RunStorage::reset(const vector<string> &_par_names, const vector<string> &_
 	run_data_byte_size = run_par_byte_size + obs_names.size() * sizeof(double);
 	//compute the amount of memory required to store a single model run
 	// run_byte_size = size of run_status + size of info_txt + size of info_value + size of parameter oand observation data
+	// NOTE: info_txt_length * sizeof(double) is more than the info_txt and info_value need
+	// (info_txt_length + sizeof(double)).  Leave it: the extra space is relied on - pyemu's
+	// RunStor.update() writes a one byte flag directly after the observation data of each run.
 	run_byte_size =  sizeof(std::int8_t) + info_txt_length*sizeof(char) * sizeof(double) + run_data_byte_size;
 	std::int64_t  run_size_64 = run_byte_size;
 	beg_run0 = 4 * sizeof(std::int64_t) + serial_pnames.size() + serial_onames.size();
@@ -559,7 +562,7 @@ void RunStorage::copy(const RunStorage &rhs_rs)
 	beg_run0 = rhs_rs.beg_run0;
 	run_byte_size = rhs_rs.run_byte_size;
 	run_par_byte_size = rhs_rs.run_par_byte_size;
-	run_data_byte_size = rhs_rs.run_par_byte_size;
+	run_data_byte_size = rhs_rs.run_data_byte_size;
 	par_names = rhs_rs.par_names;
 	obs_names = rhs_rs.obs_names;
     if (!buf_stream)

@@ -78,7 +78,9 @@ def tenpar_superpar_restart_test():
                                  port=port)
     pst = pyemu.Pst(os.path.join(test_d, "pest_restart1.pst"))
     print(pst.phi)
-    assert pst.phi < 1.0e-10, pst.phi
+    #heads are saved to 3 decimals and the two nz obs have weight 10, so phi comes in steps of
+    #(10 * 0.001)^2 = 1e-4.  one head a single step off is converged - windows lands there
+    assert pst.phi <= 1.0e-4 + 1.0e-10, pst.phi
     assert os.path.exists(os.path.join(test_d, "pest_restart1.post.obsen.csv"))
     assert os.path.exists(os.path.join(test_d, "pest_restart1.post.obsen.csv"))
     par_unc1 = pd.read_csv(os.path.join(test_d, "pest_restart1.par.usum.csv"), index_col=0)

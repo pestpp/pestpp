@@ -478,7 +478,9 @@ private:
 	void sanity_checks();
 	bool isfullrank(const Eigen::MatrixXd& mat);
 
-	void add_current_as_bases(ParameterEnsemble& _dv, ObservationEnsemble& _oe);
+	//cur_tstat: the space current_ctl_dv_values is in at the call - ctl before the dv ensemble
+	//is initialized, numeric after (it is reset from the numeric base row and cma steps in numeric)
+	void add_current_as_bases(ParameterEnsemble& _dv, ObservationEnsemble& _oe, ParameterEnsemble::transStatus cur_tstat);
 
 	vector<int> get_subset_idxs(int size, int nreal_subset);
 };

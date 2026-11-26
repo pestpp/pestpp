@@ -562,8 +562,8 @@ void sequentialLP::iter_infeasible_report()
 	ofstream &f_rec = file_mgr_ptr->rec_ofstream();
 	int num_inf = model.numberPrimalInfeasibilities();
 
-	double * inf_ray = new double[num_dec_vars()];
-	inf_ray = model.infeasibilityRay(true);
+	//clp allocates the ray (or returns null if there is none); it is ours to release
+	double * inf_ray = model.infeasibilityRay(true);
 	//inf_ray = model.unboundedRay();
 
 	double sum_inf_primal = model.sumPrimalInfeasibilities();
@@ -577,9 +577,10 @@ void sequentialLP::iter_infeasible_report()
 	f_rec << "-->sum of primal infeasibilites: " << sum_inf_primal << endl;
 	//ClpSimplex::Status stat = model.getRowStatus(0);
 	//f_rec << "-->infeasibility cost: " << inf_cost << endl;
-	if (model.rayExists())
+	if ((model.rayExists()) && (inf_ray != nullptr))
 		for (int i=0;i<num_dec_vars();++i)
 			f_rec << inf_ray[i] << endl;
+	delete[] inf_ray;
 	f_rec << endl << endl;
 	return;
 }

@@ -58,6 +58,23 @@ public:
 	Localizer() { initialized=false; }
 	Localizer(Pest* _pest_scenario_ptr) { pest_scenario_ptr = _pest_scenario_ptr; initialized = false; }
 	bool initialize(PerformanceLog *performance_log, ofstream& frec, bool forgive_missing=false);
+	/* ies_localizer_combine_common: merge entries of a local-solve map that share the same
+	nonzero pattern - the same observation list when localizing by parameters, the same
+	parameter list when localizing by observations (deprecated, reset to parameters at run time)
+	- into one entry, the way a parameter group column already is one.  only the pattern matters: the matrix values are not used by the
+	solve.  static and pure so the selftest can table it.  the merged entry is named after
+	its first member (sorted) with "+n" for the n others folded in. */
+	struct CombineStats
+	{
+		int n_in = 0;
+		int n_out = 0;
+		int largest = 1;
+	};
+	/* frec gets the summary block: the reduction, the size distribution and the merged sets
+	with their members.  "when" labels the block (empty for the plain localizer).  any ostream
+	will do, so the selftest can read the text back. */
+	static CombineStats combine_common(unordered_map<string, pair<vector<string>, vector<string>>>& lmap, How how,
+		ostream& frec, const string& when = "", int max_sets = 50);
 	unordered_map<string, pair<vector<string>, vector<string>>> get_localanalysis_case_map(int iter, vector<string>& act_obs_names, vector<string>& act_par_names, 
 		ObservationEnsemble &oe, ParameterEnsemble &pe, PerformanceLog *performance_log, ofstream& frec);// { return localizer_map; }
 	

@@ -180,6 +180,11 @@ void SVDSolver::set_svd_package(PestppOptions::SVD_PACK _svd_pack)
 		delete svd_package;
 		svd_package = new SVD_EIGEN;
 	}
+	else if (_svd_pack == PestppOptions::BDCSVD)
+	{
+		delete svd_package;
+		svd_package = new SVD_EIGEN(1000000, 1.0e-7, true);
+	}
 	else if (_svd_pack == PestppOptions::REDSVD)
 	{
 		delete svd_package;

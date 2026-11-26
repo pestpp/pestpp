@@ -111,7 +111,7 @@ pair<double, size_t> sum_of_prod_missing_data(const std::vector<double> &x_vec, 
 		x_k = x_vec[k - 1];
 		y_k = y_vec[k - 1];
 
-		if (x_k != missing_val && x_k != missing_val)
+		if (x_k != missing_val && y_k != missing_val)
 		{
 			xy_k = x_k * y_k;
 			m_xy_k += (xy_k - m_xy_k) / k;

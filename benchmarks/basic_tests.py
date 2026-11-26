@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import shutil
 import platform
@@ -6,6 +7,7 @@ import subprocess
 import numpy as np
 import pandas as pd
 import platform
+import pytest
 import pyemu
 
 from fixture_utils import scratch_template
@@ -2879,6 +2881,12 @@ def _g07_sqp_sanity(m_d, base_d):
           "finite, obj {0:.6g}->{1:.6g} viol {2:.6g}->{3:.6g}".format(o0, o1, v0, v1))
 
 
+#: run as its OWN ci job rather than inside the bulk basic_tests collection: it drives five
+#: tools and takes about as long as everything else in this file put together, so a failure
+#: should name itself rather than showing up as "basic_tests.py failed".  own_job leaves it out
+#: when the whole file is run but still runs it when named, which is what the ci entry does
+#: (basic_tests.py::basic_xplat_g07_test) - see conftest.py
+@pytest.mark.own_job
 def basic_xplat_g07_test(base_d=XPLAT_G07_BASE, rtol=1.0e-6, atol=1.0e-8):
     """re-run all five tools from the frozen template and compare against the committed base.
 
@@ -3002,14 +3010,6 @@ def basic_xplat_g07_test(base_d=XPLAT_G07_BASE, rtol=1.0e-6, atol=1.0e-8):
         "{0} element(s) exceeded tolerance across the five tools - see the divergence summary above".format(
             n_fail_total)
     print("PASS: all five tools match the g07 base case within tolerance")
-
-
-#: run as its OWN ci job rather than inside the bulk basic_tests collection: it drives five
-#: tools and takes about as long as everything else in this file put together, so a failure
-#: should name itself rather than showing up as "basic_tests.py failed".  nose skips a function
-#: marked this way during bulk collection but still runs it when named explicitly, which is what
-#: the ci entry does (basic_tests.py:basic_xplat_g07_test).
-basic_xplat_g07_test.__test__ = False
 
 
 def _load_par_file(path):
@@ -3448,3 +3448,382 @@ def preemption_screening_test():
     assert saved_somewhere, \
         "screening saved no runs in any phi summary, so it did nothing measurable"
 
+
+
+# ---------------------------------------------------------------------------------------
+# run manager overdue handling: overdue_giveup_minutes and overdue_giveup_fac must give up
+# on a hung model run in every batch, and the tool must carry on.  the model, the per tool
+# control files, the rmr parsing and the checks live in overdue_utils.py, which also knows
+# how to set up glm, mou, da, sqp, opt, swp and sen; only ies runs here to keep the ci job
+# short (the full set is about 40 minutes, ies alone about 7).  these need panther workers.
+# ports: each function has its own so they can run side by side (5000-5010 are avoided:
+# macOS listens on 5000).
+
+def overdue_minutes_ies_test():
+    """giveup_minutes 0.25 with the factor disabled: every giveup at 0.25 minutes, in
+    several batches of a three iteration run, and ies finishes"""
+    import overdue_utils
+    overdue_utils.run_set(("ies",), "minutes", 4720)
+
+
+def overdue_fac_ies_test():
+    """giveup_fac 3 with the minutes disabled and a 2 second model: every giveup at three
+    times the running average, in several batches, and ies finishes"""
+    import overdue_utils
+    overdue_utils.run_set(("ies",), "fac", 4750)
+
+
+def overdue_giveup_with_free_agents_test():
+    """the hard bound must hold with max_run_fail above one and agents idle.  before the
+    fix the master only killed an overdue run when no agent was free (or when max_run_fail
+    was one), and with a fast model the reschedule path could not act either, so one hung
+    run held the whole batch forever.  here: ies, max_run_fail 3, 0.3 s model, one hang
+    pinned to global run 5.  the run must be killed at 0.25 minutes, requeued and finish on
+    the retry, so every realization survives.  a watchdog turns the old hang into a failure"""
+    import overdue_utils
+    model_d = "run_mgr_overdue"
+    tool, variant, port = "ies", "minutes", 4780
+    # write the case, then swap in a single pinned hang
+    kills, nbatch, done, err = _overdue_free_agents_case(overdue_utils, model_d, tool, variant, port,
+                                                         hang_at=5, hang_below=-1.0, max_run_fail=3)
+    errs = overdue_utils.check(tool, variant, kills, nbatch, done, single_batch=True)
+    if err is not None:
+        errs.append("master did not finish: {0}".format(err))
+    pe = pd.read_csv(os.path.join(model_d, "master_{0}_{1}".format(tool, variant), "overdue.3.par.csv"), index_col=0)
+    if pe.shape[0] != 20:
+        errs.append("expected all 20 realizations to survive a requeued run, got {0}".format(pe.shape[0]))
+    assert not errs, "\n".join(errs)
+
+
+def overdue_giveup_repeat_hang_test():
+    """a hang that belongs to the parameter set comes back on every retry.  with
+    max_run_fail 3 the run must be killed three times, each copy at the hard bound, and
+    then fail, dropping just that realization.  here one realization has p0 below the hang
+    threshold"""
+    import overdue_utils
+    model_d = "run_mgr_overdue"
+    tool, variant, port = "ies", "minutes", 4781
+    kills, nbatch, done, err = _overdue_free_agents_case(overdue_utils, model_d, tool, variant, port,
+                                                         hang_at=0, hang_below=0.02, max_run_fail=3)
+    errs = overdue_utils.check(tool, variant, kills, nbatch, done, single_batch=True)
+    if err is not None:
+        errs.append("master did not finish: {0}".format(err))
+    if kills.shape[0] < 3:
+        errs.append("expected the hanging realization to be killed 3 times before failing, got {0}".format(kills.shape[0]))
+    pe = pd.read_csv(os.path.join(model_d, "master_{0}_{1}".format(tool, variant), "overdue.3.par.csv"), index_col=0)
+    if pe.shape[0] != 19:
+        errs.append("expected exactly the hanging realization to be dropped (19 left), got {0}".format(pe.shape[0]))
+    assert not errs, "\n".join(errs)
+
+
+def _overdue_free_agents_case(overdue_utils, model_d, tool, variant, port, hang_at, hang_below, max_run_fail):
+    """shared body of the two max_run_fail > 1 cases: a 20 realization ies run with its own
+    prior ensemble so one realization can be given a p0 below the hang threshold"""
+    os.makedirs(model_d, exist_ok=True)
+    opts, base_sleep = overdue_utils.overdue_options(variant)
+    template_d = os.path.join(model_d, "template_{0}_{1}".format(tool, variant))
+    pst = overdue_utils.write_template(template_d, base_sleep, 0)
+    case, num_workers = overdue_utils.tool_setup(tool, pst, template_d)
+    overdue_utils.write_cfg(template_d, base_sleep, 0, hang_at=hang_at, hang_below=hang_below)
+    rng = np.random.default_rng(11)
+    pe = pd.DataFrame(rng.uniform(0.1, 0.9, (20, 4)), columns=pst.par_names,
+                      index=["r{0}".format(i) for i in range(20)])
+    if hang_below > 0:
+        pe.iloc[3, 0] = hang_below / 2.0
+    pe.to_csv(os.path.join(template_d, "prior.csv"))
+    pst.pestpp_options.update(opts)
+    #turn off rescheduling so only the giveup bound can clear the hang - with a slow python
+    #startup the avg run time clears the reschedule floor, a copy of the hung run finishes on
+    #a free agent and the original is killed as "completed on alternative node", not overdue
+    pst.pestpp_options.update({"ies_par_en": "prior.csv", "max_run_fail": max_run_fail,
+                               "panther_agent_freeze_on_fail": "false", "panther_ping_interval_secs": 1,
+                               "overdue_resched_fac": 1.0e10})
+    pst.write(os.path.join(template_d, case + ".pst"), version=2)
+    m_d = os.path.join(model_d, "master_{0}_{1}".format(tool, variant))
+    w_root = os.path.join(model_d, "workers_{0}_{1}".format(tool, variant))
+    if os.path.exists(w_root):
+        shutil.rmtree(w_root)
+    os.makedirs(w_root)
+    err = overdue_utils._run_with_watchdog(template_d, m_d, w_root, overdue_utils.exe_for(tool), case, num_workers,
+                                           port, watchdog_s=300)
+    shutil.rmtree(w_root, ignore_errors=True)
+    rmr = os.path.join(m_d, case + ".rmr")
+    kills, nbatch = overdue_utils.parse_rmr(rmr) if os.path.exists(rmr) else (pd.DataFrame(columns=["batch", "duration", "avg"]), 0)
+    done = overdue_utils.finished(tool, m_d, case, pst.control_data.noptmax) if os.path.exists(os.path.join(m_d, case + ".rec")) else False
+    return kills, nbatch, done, err
+
+
+# ---------------------------------------------------------------------------------------
+# ies_localizer_combine_common: localizer columns (or rows) with the same nonzero pattern
+# are merged into one local solve, the way a parameter group column already is one.  the
+# ten par xsec has nine adjustable k's and two nonzero weighted heads, so three patterns are
+# possible: {h01_04}, {h01_06}, {both}.  three runs with the same seed:
+#   per-parameter columns, combine off   - nine local solves
+#   per-parameter columns, combine on    - three local solves
+#   group columns (pargp = pattern)      - three local solves, the reference
+# the promise is combined == group-column, in both the approximate and the full form.  for
+# the approximate form combined == per-parameter must hold too, to round-off, because each
+# parameter's update is its own row of a gain built from the observation side alone.  in the
+# full form the prior term is factored over the parameters in the solve, so per-parameter
+# and group-column differ, and that difference is reported, not asserted away.
+
+def _combine_common_case(tool, use_approx, seed=1234, noptmax=2, port=None):
+    """returns {tag: (phi dataframe, final par ensemble, rec text)} for the three runs"""
+    model_d = "ies_10par_xsec"
+    base_d = scratch_template(os.path.join(model_d, "template"), suffix="_combine_{0}_{1}".format(tool, "approx" if use_approx else "full"))
+    pst = pyemu.Pst(os.path.join(base_d, "pest.pst"))
+    pars = pst.adj_par_names
+    obs = pst.nnz_obs_names
+    assert len(obs) == 2, obs
+    pattern = {}
+    for i, p in enumerate(pars):
+        pattern[p] = [obs[0]] if i < 3 else ([obs[1]] if i < 6 else list(obs))
+    pname = {p: ("a" if i < 3 else ("b" if i < 6 else "c")) for i, p in enumerate(pars)}
+    # per-parameter localizer
+    x = np.zeros((len(obs), len(pars)))
+    for j, p in enumerate(pars):
+        for o in pattern[p]:
+            x[obs.index(o), j] = 1.0
+    pyemu.Matrix(x=x, row_names=obs, col_names=pars).to_ascii(os.path.join(base_d, "loc_par.mat"))
+    # group-column localizer with the same patterns
+    gx = np.zeros((len(obs), 3))
+    for j, g in enumerate(["a", "b", "c"]):
+        for o in pattern[pars[[0, 3, 6][j]]]:
+            gx[obs.index(o), j] = 1.0
+    pyemu.Matrix(x=gx, row_names=obs, col_names=["a", "b", "c"]).to_ascii(os.path.join(base_d, "loc_grp.mat"))
+    exe = exe_path if tool == "ies" else exe_path.replace("pestpp-ies", "pestpp-da")
+    runs = {"par": ("loc_par.mat", False, False), "comb": ("loc_par.mat", True, False), "grp": ("loc_grp.mat", False, True)}
+    out = {}
+    for tag, (loc, combine, as_groups) in runs.items():
+        m_d = os.path.join(model_d, "master_combine_{0}_{1}_{2}".format(tool, "approx" if use_approx else "full", tag))
+        if os.path.exists(m_d):
+            shutil.rmtree(m_d)
+        shutil.copytree(base_d, m_d)
+        p = pyemu.Pst(os.path.join(m_d, "pest.pst"))
+        if as_groups:
+            p.parameter_data.loc[pars, "pargp"] = [pname[q] for q in pars]
+            p.rectify_pgroups()
+        p.pestpp_options = {"ies_num_reals": 10, "ies_include_base": "false", "random_seed": seed,
+                            "ies_lambda_mults": "1.0", "lambda_scale_fac": "1.0", "ies_subset_size": 10,
+                            "ies_localizer": loc, "ies_localize_how": "parameters",
+                            "ies_use_approx": str(use_approx).lower(), "ies_bad_phi_sigma": 1.0e10}
+        if combine:
+            p.pestpp_options["ies_localizer_combine_common"] = "true"
+        p.control_data.noptmax = noptmax
+        case = "pest"
+        if tool == "da":
+            # two cycles that share the one instruction file: every obs in every cycle,
+            # the weight table picks one head per cycle
+            p.observation_data.loc[:, "cycle"] = -1
+            p.parameter_data.loc[:, "cycle"] = -1
+            p.model_input_data.loc[:, "cycle"] = -1
+            p.model_output_data.loc[:, "cycle"] = -1
+            wt = pd.DataFrame(0.0, index=obs, columns=[0, 1])
+            wt.loc[obs[0], 0] = p.observation_data.loc[obs[0], "weight"]
+            wt.loc[obs[1], 1] = p.observation_data.loc[obs[1], "weight"]
+            wt.index.name = "obsnme"
+            wt.to_csv(os.path.join(m_d, "weight_cycle_tbl.csv"))
+            p.pestpp_options["da_weight_cycle_table"] = "weight_cycle_tbl.csv"
+            p.pestpp_options["da_num_reals"] = 10
+            p.control_data.noptmax = 1
+        p.write(os.path.join(m_d, case + ".pst"), version=2)
+        pyemu.os_utils.run("{0} {1}.pst".format(exe, case), cwd=m_d)
+        rec = open(os.path.join(m_d, case + ".rec")).read()
+        if tool == "ies":
+            phi = pd.read_csv(os.path.join(m_d, case + ".phi.actual.csv"))
+            pe = pd.read_csv(os.path.join(m_d, "{0}.{1}.par.csv".format(case, noptmax)), index_col=0)
+        else:
+            phi = pd.read_csv(os.path.join(m_d, case + ".global.phi.actual.csv"))
+            last = sorted([f for f in os.listdir(m_d) if f.startswith(case + ".") and f.endswith(".par.csv")
+                           and f.split(".")[1].isdigit() and f.split(".")[2].isdigit()],
+                          key=lambda f: (int(f.split(".")[1]), int(f.split(".")[2])))[-1]
+            pe = pd.read_csv(os.path.join(m_d, last), index_col=0)
+        out[tag] = (phi, pe.loc[:, pars], rec)
+    return out
+
+
+def _combine_common_compare(out, tool, use_approx):
+    def steps(rec):
+        m = re.search(r"localized solution with (\d+) sequential upgrade steps", rec)
+        return int(m.group(1)) if m else -1
+    errs = []
+    n_par, n_comb, n_grp = steps(out["par"][2]), steps(out["comb"][2]), steps(out["grp"][2])
+    print("{0} {1}: upgrade steps per-par {2}, combined {3}, group {4}".format(
+        tool, "approx" if use_approx else "full", n_par, n_comb, n_grp))
+    if n_par != 9:
+        errs.append("per-parameter localizer should give 9 local solves, got {0}".format(n_par))
+    if n_comb != 3 or n_grp != 3:
+        errs.append("combined and group localizers should give 3 local solves, got {0} and {1}".format(n_comb, n_grp))
+    if "9 local solves combined into 3" not in out["comb"][2]:
+        errs.append("the rec does not report the combine")
+    if "combined into" in out["par"][2]:
+        errs.append("the rec reports a combine with the option off")
+    # the promise: combined == group columns, both forms
+    pe_c, pe_g, pe_p = out["comb"][1], out["grp"][1], out["par"][1]
+    d_cg = np.abs(pe_c.values - pe_g.loc[pe_c.index, pe_c.columns].values).max()
+    d_cp = np.abs(pe_c.values - pe_p.loc[pe_c.index, pe_c.columns].values).max()
+    phi_c, phi_g, phi_p = out["comb"][0]["mean"].values, out["grp"][0]["mean"].values, out["par"][0]["mean"].values
+    print("   max |par diff| combined vs group {0:.2e}, combined vs per-par {1:.2e}; phi combined {2}, group {3}, per-par {4}".format(
+        d_cg, d_cp, np.round(phi_c, 4), np.round(phi_g, 4), np.round(phi_p, 4)))
+    if d_cg > 1.0e-8:
+        errs.append("combined differs from the group-column run by {0:.2e}".format(d_cg))
+    if np.abs(phi_c - phi_g).max() > 1.0e-6 * max(1.0, np.abs(phi_g).max()):
+        errs.append("combined phi differs from the group-column phi")
+    if use_approx:
+        # approximate form: each parameter's update is its own row of the same gain
+        if d_cp > 1.0e-8:
+            errs.append("approximate form: combined differs from per-parameter by {0:.2e}".format(d_cp))
+    else:
+        print("   full form: per-parameter vs group-column differ by {0:.2e} (the prior term is factored per solve)".format(d_cp))
+    return errs
+
+
+def ies_localizer_combine_common_test():
+    errs = []
+    for use_approx in (True, False):
+        out = _combine_common_case("ies", use_approx)
+        errs += _combine_common_compare(out, "ies", use_approx)
+    assert not errs, "\n".join(errs)
+
+
+def ies_localizer_combine_common_all_same_test():
+    """every column identical: nine local solves collapse to one, same answer.  (localizing
+    by observations is deprecated and reset to parameters by pestpp-ies, so rows are not a
+    separate case.)"""
+    model_d = "ies_10par_xsec"
+    base_d = scratch_template(os.path.join(model_d, "template"), suffix="_combine_allsame")
+    pst = pyemu.Pst(os.path.join(base_d, "pest.pst"))
+    pars, obs = pst.adj_par_names, pst.nnz_obs_names
+    x = np.ones((len(obs), len(pars)))
+    pyemu.Matrix(x=x, row_names=obs, col_names=pars).to_ascii(os.path.join(base_d, "loc_same.mat"))
+    out = {}
+    for tag, combine in (("off", False), ("on", True)):
+        m_d = os.path.join(model_d, "master_combine_allsame_" + tag)
+        if os.path.exists(m_d):
+            shutil.rmtree(m_d)
+        shutil.copytree(base_d, m_d)
+        p = pyemu.Pst(os.path.join(m_d, "pest.pst"))
+        p.pestpp_options = {"ies_num_reals": 10, "ies_include_base": "false", "random_seed": 1234,
+                            "ies_lambda_mults": "1.0", "lambda_scale_fac": "1.0", "ies_subset_size": 10,
+                            "ies_localizer": "loc_same.mat", "ies_localize_how": "parameters",
+                            "ies_localizer_combine_common": str(combine).lower(), "ies_bad_phi_sigma": 1.0e10}
+        p.control_data.noptmax = 1
+        p.write(os.path.join(m_d, "pest.pst"), version=2)
+        pyemu.os_utils.run("{0} pest.pst".format(exe_path), cwd=m_d)
+        rec = open(os.path.join(m_d, "pest.rec")).read()
+        m = re.search(r"localized solution with (\d+) sequential upgrade steps", rec)
+        out[tag] = (int(m.group(1)) if m else -1, pd.read_csv(os.path.join(m_d, "pest.1.par.csv"), index_col=0))
+    print("all columns identical: upgrade steps off {0}, on {1}".format(out["off"][0], out["on"][0]))
+    assert out["off"][0] == 9, out["off"][0]
+    assert out["on"][0] == 1, out["on"][0]
+    d = np.abs(out["on"][1].values - out["off"][1].loc[out["on"][1].index, out["on"][1].columns].values).max()
+    print("   max |par diff| {0:.2e}".format(d))
+    assert d < 1.0e-8, d
+
+
+def ies_localizer_combine_common_autoadaloc_test():
+    """with autoadaloc the map is rebuilt per parameter after the correlation screen, so the
+    merge is redone there; the run must complete and the rec must say what it combined"""
+    model_d = "ies_10par_xsec"
+    base_d = scratch_template(os.path.join(model_d, "template"), suffix="_combine_aal")
+    pst = pyemu.Pst(os.path.join(base_d, "pest.pst"))
+    pars, obs = pst.adj_par_names, pst.nnz_obs_names
+    x = np.ones((len(obs), len(pars)))
+    pyemu.Matrix(x=x, row_names=obs, col_names=pars).to_ascii(os.path.join(base_d, "loc_all.mat"))
+    m_d = os.path.join(model_d, "master_combine_aal")
+    if os.path.exists(m_d):
+        shutil.rmtree(m_d)
+    shutil.copytree(base_d, m_d)
+    p = pyemu.Pst(os.path.join(m_d, "pest.pst"))
+    p.pestpp_options = {"ies_num_reals": 20, "ies_include_base": "false", "random_seed": 1234,
+                        "ies_lambda_mults": "1.0", "lambda_scale_fac": "1.0", "ies_subset_size": 20,
+                        "ies_localizer": "loc_all.mat", "ies_localize_how": "parameters", "ies_autoadaloc": "true",
+                        "ies_autoadaloc_sigma_dist": 0.0, "ies_localizer_combine_common": "true", "ies_bad_phi_sigma": 1.0e10}
+    p.control_data.noptmax = 1
+    p.write(os.path.join(m_d, "pest.pst"), version=2)
+    pyemu.os_utils.run("{0} pest.pst".format(exe_path), cwd=m_d)
+    rec = open(os.path.join(m_d, "pest.rec")).read()
+    assert "ies_localizer_combine_common after autoadaloc" in rec, "no combine report after autoadaloc"
+    assert os.path.exists(os.path.join(m_d, "pest.1.par.csv"))
+
+
+def da_localizer_combine_common_test():
+    errs = []
+    out = _combine_common_case("da", True)
+    errs += _combine_common_compare(out, "da", True)
+    assert not errs, "\n".join(errs)
+
+
+def glm_svd_pack_bdcsvd_test():
+    """svd_pack(bdcsvd): the same solve as svd_pack(eigen) through Eigen's divide and conquer
+    svd.  on the ten par xsec the matrix is under 16 columns, where Eigen's BDCSVD hands off to
+    Jacobi itself, so the two runs must agree exactly; the selftest covers the divide and
+    conquer path on a larger matrix.  this checks the option reaches pestpp-glm and is reported"""
+    model_d = "ies_10par_xsec"
+    base_d = scratch_template(os.path.join(model_d, "template"), suffix="_svd_bdc")
+    glm = exe_path.replace("-ies", "-glm")
+    out = {}
+    for pack in ("eigen", "bdcsvd"):
+        m_d = os.path.join(model_d, "master_svd_" + pack)
+        if os.path.exists(m_d):
+            shutil.rmtree(m_d)
+        shutil.copytree(base_d, m_d)
+        p = pyemu.Pst(os.path.join(m_d, "pest.pst"))
+        p.pestpp_options = {"svd_pack": pack, "uncertainty": "false"}
+        p.control_data.noptmax = 3
+        p.write(os.path.join(m_d, "pest.pst"), version=2)
+        pyemu.os_utils.run("{0} pest.pst".format(glm), cwd=m_d)
+        rec = open(os.path.join(m_d, "pest.rec")).read()
+        iobj = pd.read_csv(os.path.join(m_d, "pest.iobj"))
+        par = pyemu.pst_utils.read_parfile(os.path.join(m_d, "pest.par"))
+        out[pack] = (rec, iobj, par)
+    assert "SVD_PACK: bdcsvd" in out["bdcsvd"][0], "the rec does not echo SVD_PACK: bdcsvd"
+    assert "Eigen BDCSVD" in out["bdcsvd"][0], "the iteration report does not name the BDCSVD package"
+    assert "Eigen JacobiSVD" in out["eigen"][0]
+    phi_e = out["eigen"][1]["total_phi"].values
+    phi_b = out["bdcsvd"][1]["total_phi"].values
+    print("phi eigen", phi_e, "bdcsvd", phi_b)
+    assert len(phi_e) == len(phi_b), (phi_e, phi_b)
+    assert np.abs(phi_e - phi_b).max() <= 1.0e-8 * max(1.0, np.abs(phi_e).max()), (phi_e, phi_b)
+    d = np.abs(out["eigen"][2].parval1.values - out["bdcsvd"][2].loc[out["eigen"][2].index, "parval1"].values).max()
+    assert d < 1.0e-10, d
+
+
+def ies_svd_pack_test():
+    """ies honours ++svd_pack in its ensemble solve.  eigen and bdcsvd are the same exact svd
+    (on matrices this small bdcsvd hands off to jacobi), so they must match exactly; redsvd is
+    randomized but at full rank on a matrix this small it must agree to round-off.  run with and
+    without the full solution so the get_Am path is exercised too"""
+    model_d = "ies_10par_xsec"
+    base_d = scratch_template(os.path.join(model_d, "template"), suffix="_svd_pack")
+    errs = []
+    for use_approx in (True, False):
+        out = {}
+        for pack in ("redsvd", "eigen", "bdcsvd"):
+            m_d = os.path.join(model_d, "master_ies_svd_{0}_{1}".format(pack, "approx" if use_approx else "full"))
+            if os.path.exists(m_d):
+                shutil.rmtree(m_d)
+            shutil.copytree(base_d, m_d)
+            p = pyemu.Pst(os.path.join(m_d, "pest.pst"))
+            p.pestpp_options = {"ies_num_reals": 10, "ies_include_base": "false", "random_seed": 1234,
+                                "ies_lambda_mults": "1.0", "lambda_scale_fac": "1.0", "ies_subset_size": 10,
+                                "ies_use_approx": str(use_approx).lower(), "svd_pack": pack, "ies_bad_phi_sigma": 1.0e10}
+            p.control_data.noptmax = 3
+            p.write(os.path.join(m_d, "pest.pst"), version=2)
+            pyemu.os_utils.run("{0} pest.pst".format(exe_path), cwd=m_d)
+            rec = open(os.path.join(m_d, "pest.rec")).read()
+            if "using svd package '{0}'".format(pack) not in rec:
+                errs.append("{0}: the rec does not name the svd package".format(pack))
+            out[pack] = (pd.read_csv(os.path.join(m_d, "pest.phi.actual.csv"))["mean"].values,
+                         pd.read_csv(os.path.join(m_d, "pest.3.par.csv"), index_col=0))
+        form = "approx" if use_approx else "full"
+        e, b, r = out["eigen"], out["bdcsvd"], out["redsvd"]
+        d_eb = np.abs(e[1].values - b[1].loc[e[1].index, e[1].columns].values).max()
+        d_er = np.abs(e[1].values - r[1].loc[e[1].index, e[1].columns].values).max()
+        print("{0}: phi redsvd {1} eigen {2} bdcsvd {3}; max |par diff| eigen-bdcsvd {4:.1e}, eigen-redsvd {5:.1e}".format(
+            form, np.round(r[0], 5), np.round(e[0], 5), np.round(b[0], 5), d_eb, d_er))
+        if d_eb > 1.0e-12:
+            errs.append("{0}: eigen and bdcsvd differ by {1:.1e}".format(form, d_eb))
+        if d_er > 1.0e-6:
+            errs.append("{0}: eigen and redsvd differ by {1:.1e}".format(form, d_er))
+    assert not errs, "\n".join(errs)

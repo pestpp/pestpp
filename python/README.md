@@ -149,6 +149,35 @@ the pattern behind it:
 
 this table came from actually calling everything on every tool, not from reading the source.
 
+## just running the model
+
+if you already have the parameter values and only want pest++ to do the plumbing - write the
+input files from the templates, run the command line(s), read the outputs through the
+instruction files - use `Model`. there is no tool behind it, so nothing to initialize or iterate:
+
+```python
+with pestpp.Model.from_pst("pest.pst", workdir="model_dir") as m:
+    sim = m.run({"hk1": 2.5})      # pd.Series of simulated values, control-file order
+    base = m.run()                 # the control file's own values
+```
+
+values are control-file values matched by name, and anything you dont name keeps its
+control-file value. tied parameters follow their parents and fixed ones keep their control-file
+value - passing a different value for either is an error, not something quietly ignored. it is
+one serial run, blocking, in `workdir`, and each run overwrites the last one's files. the c call
+underneath is `pestpp_run_model()` on a `PESTPP_MODEL` handle.
+
+a failed run raises `PestppError`. what counts as failed is the same as for the tools: the model
+command could not be started, or an output file is missing or the instruction file cannot read
+it. the model's exit code is not checked, so a model that exits with an error but still leaves
+readable outputs is not caught. the output files are deleted before each run, so a run that
+writes nothing can never hand back the last run's values.
+
+the installed package also puts `pestpp-appl` on the path (with the other executables). it is
+for forward run scripts: it applies the multiplier files pyemu's `PstFrom` sets up to the model
+input files, a compiled equivalent of `pyemu.helpers.apply_list_and_array_pars()`. see section
+5.6 of the user's manual.
+
 ## stability
 
 **version 0.x. expect breaking changes. pin to a commit.**

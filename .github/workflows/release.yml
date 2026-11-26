@@ -29,6 +29,11 @@ jobs:
   build:
     name: Build ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # without this the mac binaries only run on the runner's macos or newer - macos-15 at the
+    # moment. cmake reads it on mac only, so it does nothing to the linux and windows builds.
+    # 13.3 is the floor because pestpp-appl uses floating point std::to_chars
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.3"
     # Linux builds INSIDE manylinux, not on the runner. A binary compiled against the runner's
     # glibc only runs on that glibc or newer, which quietly excludes rhel/rocky 8, debian 11 and
     # ubuntu 20.04 - a lot of institutional and hpc machines. The image sets the floor at glibc
@@ -42,7 +47,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-22.04, container: 'quay.io/pypa/manylinux_2_28_x86_64' }
-          - { os: macos-14,     container: '' }
+          - { os: macos-15,     container: '' }
           - { os: windows-2022, container: '' }
     outputs:
       version: ${{ steps.version.outputs.version }}

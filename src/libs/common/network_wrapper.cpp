@@ -420,7 +420,7 @@ addrinfo* w_bind_first_avl(addrinfo *servinfo, int &sockfd)
 {
 	// loop through all the results and bind to the first we can
 	struct addrinfo *p;
-	char yes = '1';
+	int yes = 1;
 	for(p = servinfo; p != nullptr; p = p->ai_next)
 	{
 		if ((sockfd = w_socket(p->ai_family, p->ai_socktype,
@@ -428,8 +428,8 @@ addrinfo* w_bind_first_avl(addrinfo *servinfo, int &sockfd)
 		{
 			continue;
 		}
-		if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes,
-		sizeof(int)) == -1)
+		if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes,
+		sizeof(yes)) == -1)
 		{
 			return nullptr;
 		}

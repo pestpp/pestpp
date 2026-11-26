@@ -16,7 +16,7 @@ class Mat
 {
 public:
 	enum class MatType{ DIAGONAL, SPARSE, DENSE };
-	Mat(){ autoalign = true; };
+	Mat(){ autoalign = true; mattype = MatType::SPARSE; };
 	Mat(string filename);
 
 	Mat(vector<string> _row_names, vector<string> _col_names,

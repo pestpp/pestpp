@@ -3,7 +3,7 @@
 
 # <a id='s1' />PEST++ Users Manual
 
-Version 6.0.0a4
+Version 6.0.0a5
 
 <img src="./media/image2.png" style="width:6.26806in;height:3.05972in" />
 
@@ -202,6 +202,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         - [5.4.1 Failed Run Storage File](#s9-4-1)
         - [5.4.2 All Runs Storage File](#s9-4-2)
     - [5.5 PEST++ API](#s9-4-3)
+    - [5.6 PESTPP-APPL](#s9-4-4)
 - [6. PESTPP-GLM](#s10)
     - [6.1 Introduction](#s10-1)
     - [6.2 Highly Parameterized Inversion](#s10-1b)
@@ -2554,7 +2555,7 @@ The value of *overdue_giveup_fac()* is also a real number. Suppose that it is *r
 
 #### <a id='s9-3-5-4' />5.3.5.4 overdue_giveup_minutes()
 
-This control variable can be used to place a “hard” upper bound on the acceptable model run time. The value supplied for *overdue_giveup_minutes()*must be a real number. Suppose that it is *r*. Then a model run is deemed to have failed if it has been executing for more than *r* minutes. This model run time criterion works as an “or” condition with *overdue_giveup_fac()*; if the duration of a given model run exceeds *overdue_giveup_minutes()* or *overdue_giveup_fac()* times the average model run time, it is marked as a failure. The default value for *overdue_giveup_fac()* is 1.0E+30, this effectively disabling it.
+This control variable can be used to place a “hard” upper bound on the acceptable model run time. The value supplied for *overdue_giveup_minutes()*must be a real number. Suppose that it is *r*. Then a model run is deemed to have failed if it has been executing for more than *r* minutes. This model run time criterion works as an “or” condition with *overdue_giveup_fac()*; if the duration of a given model run exceeds *overdue_giveup_minutes()* or *overdue_giveup_fac()* times the average model run time, it is marked as a failure. The default value for *overdue_giveup_minutes()* is 1.0E+30, this effectively disabling it. The bound is applied to each model run on its own, whether or not other agents are idle and regardless of the average run time: a run that passes it is killed, counted as a failure of that parameter set, and requeued if *max_run_fail()* allows another attempt.
 
 #### <a id='s9-3-5-5' />5.3.5.5 max_run_fail()
 
@@ -2651,25 +2652,29 @@ The name of a file in an agent's working directory. The last few characters of t
 
 When several agents run on more than one machine, a single bad host - a failing disk, a missing model executable, a misconfigured environment - can consume a large share of a run batch. Each of its agents accepts work, fails it, and accepts more. Because the failures are spread across several agents, they can look like unrelated one-off problems rather than one machine at fault.
 
-PEST++ keeps a count of failed runs per host, summed across every agent on that host, and compares each host against the share of failures its size would lead you to expect:
+This check is off by default (earlier versions switched it on with a value of 3). When it is switched on by giving `panther_agent_max_failed_run_delta` a value above 0, PEST++ keeps, for each host, the number of runs it has finished or failed and the number that failed, summed across every agent on that host, and compares each host's failure rate with the failure rate of the other hosts still in service:
 
-> expected failures = (total failures) &times; (agents on host) &divide; (total agents)
+> expected failures = (runs on host) &times; (failures on other hosts) &divide; (runs on other hosts)
 
-A host is judged an outlier when its failures exceed that expected share by more than `panther_agent_max_failed_run_delta`. Scaling by agent count matters: a machine running eight agents does roughly eight times the work of one running a single agent, and should be expected to produce roughly eight times the failures. Comparing raw counts would penalise the largest machine simply for being the busiest.
+A host is judged an outlier when its failures exceed that expected number by more than `panther_agent_max_failed_run_delta`, *and* the difference between its failure rate and that of the other hosts is statistically significant (a two-proportion z score above 3.5). The comparison is made on runs rather than on agents because agents are not equal: a machine with faster processors completes more runs per agent, so it also meets more of the model's own failures. The significance test is there because the check is made continually as runs come back; a margin of a few failures on its own is crossed by chance once failures number in the tens.
 
-The comparison also means that a problem affecting all hosts equally - a model that fails for everyone, or badly chosen parameter bounds - does not trigger it. Every host then sits at its expected share and none is an outlier. Only a *concentration* of failures on one machine is flagged.
+Only failures that can be pinned on one host are counted. A run that has failed on two different hosts is taken to be a failure of the model at those parameter values, not of either host.
+
+The comparison also means that a problem affecting all hosts equally - a model that fails for some parameter values, or badly chosen parameter bounds - does not trigger it, however unevenly the runs are spread across hosts. Every host then fails at about the same rate and none is an outlier. Only a *concentration* of failures on one machine is flagged.
 
 When a host is judged an outlier, PEST++ does the following, and reports each step to the run management record file:
 
-- every agent on that host is moved to the QUARANTINED state. The agents remain connected and continue to respond, but are given no further runs. They are not disconnected: an agent that is disconnected simply reconnects and takes more work, and a closed connection reads like a network fault rather than a decision PEST++ made.
+- every agent on that host is moved to the QUARANTINED state. The agents remain connected and continue to respond to pings, but are given no further runs in the current batch. They are not disconnected: an agent that is disconnected simply reconnects and takes more work, and a closed connection reads like a network fault rather than a decision PEST++ made.
 - runs that failed on that host, together with any run active on it at the time, are returned to the waiting queue.
-- the failures recorded against those runs are forgiven, so that they are not counted towards `max_run_fail`. The runs failed because of where they were sent, not because of anything about the runs themselves.
+- the failures recorded against those runs on that host are forgiven, so that they are not counted towards `max_run_fail`. The runs failed because of where they were sent, not because of anything about the runs themselves. A run that has also failed on another host keeps its failures.
 
-A summary of quarantined hosts is written to the run management record file at the end of each set of runs, listing each host with its failure count, the expected share it exceeded, the number of agents removed, and the number of runs returned to the queue. A line is written when no host has been quarantined, so that its absence is not mistaken for the check not having run.
+At most one host is quarantined at a time, so each comparison is made without the hosts already removed. Quarantine lasts for the current batch of runs only: at the start of the next batch, the counts are reset and the agents on quarantined hosts are returned to service. A host that is genuinely at fault is quarantined again after a few failures, and those failures are forgiven when it is.
+
+A summary of quarantined hosts is written to the run management record file at the end of each batch, listing each host with its failure count, the expected number it exceeded, the number of agents removed, and the number of runs returned to the queue. A line is written when no host has been quarantined, so that its absence is not mistaken for the check not having run.
 
 The check applies only when agents are connected from more than one host, since a single host has nothing to be compared against. This is re-evaluated continually, so the check begins to apply as soon as a second host connects. PEST++ will not quarantine the last host still in service, as this would leave no agents to complete the batch.
 
-The default value is 3. A value of 0 disables the check entirely.
+The default value is 0, which disables the check. A value of 3 is a reasonable starting point when it is wanted.
 
 ## <a id='s9-4' />5.4 Run Book-Keeping Files
 
@@ -2692,6 +2697,24 @@ As well as the executables described above, the PEST++ suite can now be built as
 Using the shared library affords control over the loop the executables run internally, including initialization, solving algorithms, and run management. A caller program using the API can evaluate the initial ensemble, examine it, change it, and carry on; can take one iteration at a time, changing observation weights or algorithmic variables between iterations; and can take ownership of every batch of model runs, so no model run happens inside a library call that the caller did not ask for.  Users can change a number of PEST++ settings at runtime if desired.
 
 The API is at an early stage and is not yet published as a package on PyPI. See python/README.md in the release bundle for installation and a description of both layers, and the notebooks in examples for worked cases.
+
+## <a id='s9-4-4' />5.6 PESTPP-APPL
+
+PESTPP-APPL is a small utility for models set up with pyemu's *PstFrom* class. *PstFrom* writes a table, *mult2model_info.csv*, listing for each model input file the saved original file, the multiplier (or addend) files to apply to it and how to apply them; at model run time the forward run script normally calls *pyemu.helpers.apply_list_and_array_pars()* to read that table and write the model input files. PESTPP-APPL does the same job as a compiled program, which is quicker for large models. It is run from the model's forward run script, once per model run, in the agent's working folder:
+
+pestpp-appl [mult2model_info.csv] [--apply_order *value*] [--threads *n*] [--ignore_functions] [--skip_pilot_points]
+
+It handles array files (rows with an empty *index_cols* entry) and list files (rows with an *index_cols* entry), applies each row's operator, enforces the ultimate bounds, and makes pilot point multiplier arrays from text factor files (rows with a *pp_file* entry), as *pyemu.geostats.fac2real()* does. Rows that write the same pilot point multiplier file must agree on its pilot point file, factor file, fill value and limits, or PESTPP-APPL stops with an error.
+
+The command line arguments are:
+
+- *--apply_order value*: process only the rows with this *apply_order* value.
+- *--threads n*: the number of threads to use. The default is 1. Because PESTPP-APPL runs inside each model run, often with many agents on one machine, raise this only where the machine has cores to spare.
+- *--ignore_functions*: process the whole table even though it has entries in the *pre_apply_function* or *post_apply_function* columns. Those entries are Python code, which PESTPP-APPL cannot run.
+- *--skip_pilot_points*: do not make the pilot point multiplier arrays; the forward run script has already written them.
+- *-v* or *--version*: print the version number and stop.
+
+PESTPP-APPL does not run the Python in the *pre_apply_function* and *post_apply_function* columns, and does not read the binary factor files written by pypestutils. Where a table has either, the forward run script does that part itself, runs PESTPP-APPL once for each *apply_order* value in turn (with *--apply_order*), and uses *--skip_pilot_points* if it made the pilot point arrays itself. PESTPP-APPL stops with an error message and a non-zero exit code if anything is wrong, so a failed application shows up as a failed model run.
 
 # <a id='s10' />6. PESTPP-GLM
 
@@ -2879,13 +2902,15 @@ Like the solution calculated using equation 6.14, the solution to the inverse pr
 
 As stated above, PESTPP-GLM uses singular value decomposition, or variants thereof, to solve the inverse problem that is defined through the PEST control file with which it is provided. However, only one of the above options are available - Z<sup>t</sup>QZ. That is, singular value decomposition can only be undertaken on Z<sup>t</sup>QZ. (Actually, although not discussed in the present sub-section, the Marquardt lambda is included in these matrices before they are decomposed in order to enhance inversion performance in nonlinear contexts.)
 
-A PEST++ control variable governs the way in which singular value decomposition is undertaken by PESTPP-GLM - *svd_pack()*. Two choices are available for the *svd_pack()* control variable. These select the numerical library that is employed for implementing singular value decomposition. Options are as follows.
+A PEST++ control variable governs the way in which singular value decomposition is undertaken by PESTPP-GLM - *svd_pack()*. The same variable selects the decomposition used in the ensemble solve of PESTPP-IES and PESTPP-DA, and in the decision-variable covariance of PESTPP-SQP. Three choices are available for the *svd_pack()* control variable. These select the numerical library that is employed for implementing singular value decomposition. Options are as follows.
 
 - “eigen”. This uses a Jacobi method supplied with the Eigen library. Eigen is a C++ template library for linear algebra; see <http://eigen.tuxfamily.org>
 
+- “bdcsvd”. This uses the bidiagonal divide-and-conquer SVD supplied with the Eigen library. It computes the same exact decomposition as “eigen” to round-off, but is much faster for large matrices; for matrices with fewer than 16 columns Eigen uses the Jacobi method internally, so small problems see no difference.
+
 - “redsvd”. This uses the redsvd library available from <https://github.com/cequencer/redsvd>. Randomized methods are employed to undertake singular value decomposition. These are very fast; where matrices are large and sparse, their performance is outstanding. Furthermore, randomized methods only solve the factorization problem to the number of singular components needed. This means the variable MAXSING can be used to increase the efficient of large SVD factorizations.
 
-The default values for *svd_pack()* is “redsvd”. This is the method which PESTPP-GLM uses if you do not supply values for this control variable.
+The default value for *svd_pack()* is “bdcsvd”. This is the method all PEST++ tools use if you do not supply values for this control variable.
 
 Two variables that are recorded in the PEST control file can also affect PESTPP’s deployment of singular value decomposition to solve an inverse problem. These are the MAXSING and EIGTHRESH variables featured in the “singular value decomposition” section of that file. If a “singular value decomposition” section is not provided in the PEST control file that is read by PESTPP-GLM, then PESTPP-GLM assigns MAXSING a value that is equal to the number of adjustable parameters that define the current inverse problem; at the same time, EIGTHRESH is assigned a value of 1.0E-7. (Recall from section 4.7 that MAXSING and EIGTHRESH are used to define the singular value truncation point.) However, if the PEST control file includes a “singular value decomposition” section, then PESTPP-GLM employs values for MAXSING and EIGTHRESH that it reads from this file. Note also that if *glm_normal_form(prior)* is specified, then MAXSING and EIGTHRESH also function as the consolidated regularization controls.
 
@@ -3031,7 +3056,7 @@ Note also that the number of control variables may change with time. Refer to th
 | Variable                    | Type               | Role                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 |---------------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | *jac_scale(true)*               | Boolean                | Scale parameters by their sensitivities when calculating parameter upgrades. This can increase numerical precision; however, it may incur a numerical cost.                                                                                                                                                                                                                                                                                                                                                                                                              |
-| *svd_pack(redsvd)*              | text                   | This informs PESTPP-GLM of the package that it must employ to undertake singular value decomposition of the J<sup>t</sup>QJ matrix (appropriately modified to include the Marquardt lambda and regularization). Options are “eigen” and “redsvd”.                                                                                                                                                                                                                                                                                                                |
+| *svd_pack(bdcsvd)*              | text                   | This informs PESTPP-GLM of the package that it must employ to undertake singular value decomposition of the J<sup>t</sup>QJ matrix (appropriately modified to include the Marquardt lambda and regularization). Options are “eigen”, “bdcsvd” and “redsvd”.                                                                                                                                                                                                                                                                                                                |
 | *lambdas(0.1,1,10,100,1000)*    | set of real numbers    | Values for the Marquardt lambda used in calculation of parameter upgrades. Note that this base list is augmented with values bracketing the previous iteration’s best lambda. However, if a single value is specified, only that lambda (and no other lambda) is used in all iterations.                                                                                                                                                                                                                                                                                 |
 | *lambda_scale_fac(.75,1.0,1.1)* | set of real numbers    | These values are used to scale each parameter upgrade vector calculated using different values of lambda. This results in a line search along each upgrade vector direction. The number of tested parameter upgrades (and hence model runs) is equal to the number of lambdas times the number of scaling factors. Set *lambda_scale_fac()* to 1.0 to disable an upgrade direction line search.                                                                                                                                                                          |
 | *base_jacobian()*               | text                   | Provide the name of a JCO file. The Jacobian matrix contained in this file will be used for the first iteration of the inversion process.                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -3717,6 +3742,8 @@ When applying localization in a history-matching problem involving large numbers
 
 Through localization, a large-scale parameter estimation problem can be turned into a series of independent parameter estimation problems. Suppose, for example, that localization is employed in the most granular manner, so that the localization matrix contains one column for each adjustable parameter and that each column contains a single non-zero value, this pertaining to a single observation which that parameter is presumed to influence. If large numbers of parameters are being adjusted, the parameter upgrade calculation process for a given lambda will require as many truncated SVD solves as there are adjustable parameters. This can require considerable numerical effort. To overcome this problem, the localized upgrade solution process in PESTPP-IES has been multithreaded; this is possible in circumstances such as these where each local solve is independent of every other local solve. The use of multiple threads is invoked through the *ies_num_threads()* control variable. It should be noted that the optimal number of threads to use is problem-specific. Furthermore, it should not exceed the number of physical cores of the host machine on which the PESTPP-IES master instance is running. Note that pestpp-ies does not require that all adjustable parameters and all non-zero weighted observations be included in the localization matrix. In this case, pestpp-ies implicitly treats any adjustable parameters not in the localizer as “fixed” and any non-zero weighted observations not in the localizer as zero-weighted. However, users are strongly encouraged to explicitly include all adjustable parameters and all non-zero weighted observations in the localization matrix: explicit is better than implicit…
 
+If a localization matrix lists parameters individually but many of them share the same set of observations, each of those parameters is a separate local solve, and each local solve repeats the same factorization of the observation ensemble. Setting *ies_localizer_combine_common()* to *true* merges columns with the same nonzero pattern into one local solve, exactly as if those parameters had been listed through a parameter group. Only the pattern matters; the values in the matrix are not used by the solve. With the default approximate solution the result is unchanged to round-off; with the full solution it is the same as the group-column solve, which differs slightly from per-parameter solves because the prior term is factored over the parameters in the solve. The record file reports how many columns were combined into how many solves. The option is also honoured by PESTPP-DA.
+
 PESTPP-IES also supports correlation-based, automatic adaptive localization. Its algorithm is based on that of Luo et al (2018). This functionality is activated by setting the *ies_autoadaloc()* control variable to *true*. If this localization scheme is employed, a user does not need to provide a localization matrix to define which parameters can be informed by which observations. Instead, PESTPP-IES uses the parameter ensemble and resulting model-output observation ensemble to calculate a Pearson correlation coefficient between each adjustable parameter and each non-zero-weighted observation. Because the normal usage context of PESTPP-IES is that of numerically efficient parameter estimation and uncertainty quantification, it is expected that the number of realizations that constitute an ensemble will normally be considerably smaller than the number of adjustable parameters. The estimated correlation coefficient between any given parameter and any observation is therefore likely to be somewhat in error. This error decreases (eventually to zero) as the size of an ensemble rises.
 
 Automatic adaptive localization attempts to estimate and compensate for these errors. It assesses the statistical significance of each correlation coefficient against background “noise” induced by use of a small ensemble size. This is accomplished through repeated calculation of “background” correlation coefficients between all parameters and all observations. Background correlation coefficients are estimated by applying a circular shifting operation to observation ensemble realization names with respect to their respective parameter ensembles, thus effectively “scrambling” these two ensembles. PESTPP-IES then recalculates each correlation coefficient. Note that a circular shift is simply the advancement of realization names by one place while the last realization name moves to the front of the realization name list (while holding the realization values constant). Exactly *N-*1 circular-shifts of the observation ensemble can take place through this operation, this yielding *N*-1 background correlation coefficients, where *N* is the number of realizations comprising the ensemble. If N is large enough, these background correlation coefficients would be approximately zero because the shifting operation should yield two statistically independent random variables which, with enough samples (realizations), should exhibit zero correlation. However, if a small ensemble size is employed, these background correlation coefficients may appear to be significantly nonzero.
@@ -3795,6 +3822,10 @@ This option is implemented in PESTPP-IES via the *ies_n_iter_reinflate* option. 
 
 - Through the use of *ies_reinflate_num_reals*, which is supplied as a sequence of positive integers, users can adjust the number of realizations used during each reinflation cycle.  For example, a user can supply "10,1000", which results in 10 realizations being used before the first reinflation (including the prior), and them 1000 realizations being used after the first reinflation.  The *ies_reinflate_num_reals* maximum value is limited by the *ies_num_reals* and/or by the number of realizations supplied in an existing parameter ensemble. 
 
+- The multi-modal solution process (section 9.1.14) can also be changed at each reinflation cycle using *ies_reinflate_multimodal_alpha*, which takes a list of values between 0.0 and 1.0, one per cycle, with the last entry held for any remaining cycles. A value of 0.0 turns the multi-modal solution off for that cycle. For example, *ies_reinflate_multimodal_alpha(0.0,0.25)* with *ies_n_iter_reinflate(3)* runs the standard update for three iterations, reinflates, and then uses the multi-modal update with local groups of 25% of the ensemble. When supplied, *ies_multimodal_alpha* is ignored.
+
+- At each reinflation, the residuals the model cannot remove can be turned into extra noise on the observation targets, and optionally used to lower the weights, through *ies_reinflate_structnoise_frac* and *ies_structnoise_deweight*. See section 9.1.17.
+
 - In an effort to minimize the number of model evaluations required to apply PESTPP-IES, users may want to use a small(er) ensemble for a few iterations to hone in an acceptable mean parameter vector, then expand the ensemble to use more realizations, centered on the location of that mean vector.  Standard reinflation resets to the prior parameter variances and correlations (as described in the prior parameter ensemble), this prior reinflation can and should result in a large increase in phi for the reinflated realizations.  In some cases, where users want to better maintain the phi of the ensemble (that is keep the realizations more calibrated), new realiztions can be generated from the current ensemble, such that the variances and correlations in the current ensemble are preserved, which, depending on the linearity of the inverse problem, can result in the newly generated ensemble maintaining a lower phi value, that is, the new realizations are somewhat "calibrated".  This optional behavior is actived by supplying the *ies_reinflate_num_reals* value as negative.  Note that any new realization generated from this operation is essentially a linear combination of the current parameter realizations, which means at most the new realizations will occupy a limited dimensional subspace (at most, the dimensions occupied will be equal to the number of realziations in the current ensemble).  To help expand the subset dimensions of the new ensemble, users can supply *ies_reinflate_factor* as a negative value ranging from less than zero to -1.0 (inclusive).  With a negative *ies_reinflate_factor*, a randomly selected scaled, centered prior ensemble realization is added to each new realization, where the scaling amount is the absolute value of *ies_reinflate_factor*.  
 
 
@@ -3819,11 +3850,52 @@ where Λ<sub>prior</sub> is the prior parameter precision, H is a linear map fro
 
 Because the prior precision is an explicit, full-rank object, EnIF is not limited to the subspace spanned by the ensemble and it provides strong protection against spurious correlations - it does not need a localizer: a structural zero in the sparse H says that an observation carries no information about a parameter, and a structural zero in Λ<sub>prior</sub> says two parameters are conditionally independent. In the testing done to date, EnIF retains quite a bit more of the prior parameter variance than the standard PESTPP-IES update (that is, the posterior ensemble is less collapsed) but at the cost of not fittingthe observations as well as the IES solver for a given number of iterations and realizations. It also tends to need more iterations and more realizations than the standard update, and to operate at larger values of lambda. The trade-off between fit and retained variance is the point of the method, not a defect, but users should expect to run more iterations than they are used to.  Without the danger of spurious correlation, more iterations are not as dangerous as with IES.
 
-EnIF is activated with *ies_use_enif(true)*. A graph is supplied with *ies_enif_graph()*. PESTPP-IES also supports two hybrid modes that use parts of the EnIF machinery with the standard update:
+EnIF is activated with *ies_use_enif(true)*. A graph is supplied with *ies_enif_graph()*. PESTPP-IES also supports a hybrid mode that uses parts of the EnIF machinery with the standard update:
 
 - Through the reinflation process described in section 9.1.15, the solver can be switched at a reinflation cycle using *ies_reinflate_solver()*, which takes a list of solver names, one per cycle. For example *ies_reinflate_solver(ies,enif)* with *ies_n_iter_reinflate(4,999)* runs the standard update for four iterations, reinflates, and then hands the remaining iterations to EnIF. In testing this reached a considerably better fit than EnIF alone in the same number of iterations, because the standard update makes fast early progress and EnIF then refines while preserving spread. Centering the reinflated ensemble on the ensemble mean (a positive *ies_n_iter_reinflate* value) seems to work better than centering on the minimum-phi realization (a negative value) in this arrangement.
 
-- *ies_use_prior_prec(true)* keeps the standard Chen and Oliver update but replaces the ensemble estimate of the prior in it (both in the “Hessian” and in the prior-pull gradient term of the full solution) with the explicit prior precision, either estimated on *ies_enif_graph()* from the prior ensemble or, if no graph is supplied, the inverse of *parcov*. The upgrade is still confined to the ensemble subspace, but uses a full-rank prior instead of a low-rank diagonal approximation. This option requires *ies_use_approx(false)* to have any effect beyond the first iteration and cannot be combined with localization, the multimodal solution process, ESMDA or EnIF itself. Testing to date shows it behaves more like EnIF than like the standard update.
+
+### <a id='s13-1-17' />9.1.17 Structural Noise from Irreducible Residuals (experimental)
+
+*This section, and the functionality it describes, is experimental. The options described here have seen limited testing and may change.*
+
+When the model cannot reproduce part of what was observed - a missing process, a boundary in the wrong place, a stress that isn't in the model - the residuals that are left after fitting are much larger than the measurement noise the user stated through the weights. The standard update treats those residuals as information and keeps bending the parameters to try to remove them, which leads to biased parameters and a posterior that is too narrow. PESTPP-IES can instead take the residuals the model cannot remove and turn them into extra noise on the observation targets, so that the bias they carry becomes variance rather than something the parameters chase. This is tied to the reinflation process (section 9.1.15) and only does anything when reinflation is in use.
+
+At the first reinflation with a non-zero *ies_reinflate_structnoise_frac* entry, PESTPP-IES captures the actual residuals (observed minus simulated, without noise) of the current ensemble for all non-zero-weighted observations. These are not centred - the part shared across realizations is the bias that should become variance. By default they are captured once and held for the rest of the run. A negative entry in *ies_reinflate_structnoise_frac* tells PESTPP-IES to capture them again at that reinflation, from the ensemble as it stands, and to use the magnitude of the entry as the fraction; a positive entry reuses the residuals already captured. The user decides when residuals are captured: a run can capture once early, capture again at the end of a later cycle, or capture at every reinflation. Users should be aware that residuals captured from a fit made with lowered weights can feed back on the next capture. At that reinflation and every one after, each noise realization is rebuilt from the user's original noise realization plus a fixed random combination of the captured residuals, scaled by the square root of the fraction for that reinflation. The combinations have zero-mean coefficients, so the targets spread symmetrically around the observed values, and their covariance is the residual covariance (uncentred) times the fraction. Each observation only combines its own residuals, so no scaling by weights or standard deviations is involved. The "base" realization is not changed.
+
+*ies_reinflate_structnoise_frac* is a list, one entry per reinflation, walked like *ies_reinflate_factor*: the first entry is used at the first reinflation, the second at the second, and the last entry is held. A value of 0.0 turns the structural noise off at that reinflation (the user's noise realizations are put back), and if every entry is 0.0 nothing is done at all. A negative value recaptures the residuals at that reinflation (see above), and the first non-zero entry captures them whatever its sign. For example, *ies_reinflate_structnoise_frac(0,1,-1)* adds nothing at the first reinflation, captures and adds the full residual variance at the second, and recaptures at the third and every one after. Values with a magnitude above 1.0 are allowed but a warning is issued. The noise always starts from the user's original noise realizations, so the user's noise stays the floor however many times the residuals are captured.
+
+The structural draws alone widen the spread of the posterior but do little about the parameter bias. *ies_structnoise_deweight(true)* also lowers each observation's weight by its irreducible residual variance at each reinflation:
+
+w' = 1 / sqrt( w<sup>-2</sup> + frac × s<sup>2</sup> )
+
+where s<sup>2</sup> is the mean over realizations of the squared captured residuals for that observation. This is applied to every row of the weight ensemble from that row's own original weights, and to the control file weights, starting from the user's weights every time so nothing accumulates. It is what removes most of the parameter bias. The adjusted weight ensemble and observation data are saved as *case.N.adjusted.weights.csv* and *case.N.adjusted.obs_data.csv*, and the run record carries a per-group summary of the ratio of adjusted to original weights.
+
+At each reinflation where structural noise is in play, PESTPP-IES saves the rebuilt noise realizations (the user's noise plus the structural draws) as *case.N.obs+noise.csv*, where N is the iteration of the reinflation (*.jcb* or *.bin* if *save_binary* or *save_dense* is used). This can be set against *case.obs+noise.csv*, which holds the user's noise realizations, to see what the structural draws added. The run record also carries an extra phi report at each such reinflation, headed "phi report before the reinflation noise and weight reset": it is the ensemble as it stands, scored with the noise and weights it was fitted with, and can be compared with the "reinflation phi report" that follows, which is scored with the rebuilt noise and the adjusted weights.
+
+By default the structural correction is built on the whole captured residual variance s<sup>2</sup>. Because the actual residuals are measured against the observed values, that variance also holds the measurement error in those values, which the user's noise already accounts for. *ies_structnoise_em(true)* builds the correction instead on the excess of the residual variance over the user's noise:
+
+excess = max( 0, s<sup>2</sup> − σ<sup>2</sup> )
+
+where σ<sup>2</sup> is the mean square of the user's noise realizations for that observation (the base realization left out). This is the expectation-maximization (EM) update of a structural noise level per observation, with the observation's own residual variance as the shape. σ<sup>2</sup> is taken from the noise realizations, not from the weights, so a user whose weights and noise differ on purpose (for example through a *standard_deviation* column) keeps that difference: the same added variance, *ies_reinflate_structnoise_frac* × excess, goes onto the noise realizations (the structural draws are scaled per observation to that variance) and, with *ies_structnoise_deweight*, onto the weights, each from the user's own starting point. The fraction stays a user scale on the EM correction. An observation whose residuals are no larger than its noise gets no correction at all. One capture recovers roughly (1 − p<sub>eff</sub>/n) of the structural variance, because the realizations absorb part of it; recapturing at each reinflation (negative entries) repeats the EM update and moves it toward the full value. The run record carries a per-group table of the mean s<sup>2</sup>, mean σ<sup>2</sup>, mean excess and the number of observations with no excess at each capture.
+
+Two things are guaranteed. Weights are never increased above the user's weights (after any phi factor adjustment of the prior, see section 9.2.10), and where an observation's s<sup>2</sup> is zero (for example a satisfied inequality observation) its weight is left alone. And noise is never decreased below the user's level - the structural part is added on top of the user's noise realizations.
+
+Some other behavioural characteristics:
+
+- The measured phi gets large from the reinflation where the structural noise comes in, because the noisy targets now carry the structural draws. The actual phi is the one to watch.
+
+- If the observations have *lower_bound* and/or *upper_bound* values in the external observation data, the rebuilt noise realizations are clamped to them at each reinflation, and the number of values clamped is reported in the run record. Near a bound this makes the draws one-sided, and because the structural draws are usually larger than the measurement noise this shows more than it does for the noise alone. The de-weighting is computed from the captured residuals, not the clamped draws.
+
+- The phi factors (*ies_phi_factor_file*) are applied to the prior weights only and are not applied again at a reinflation, since that would count the structure twice. The de-weighting starts from the phi factor weights.
+
+- The same s<sup>2</sup> cuts a large weight proportionally more than a small one, so where the structure is large, the realizations' weights for that observation move toward each other. This is intended - a large structural variance swamps whatever precision the user's weight implied.
+
+- The de-weighting is per observation (diagonal); it does not follow the patterns of the residuals across observations, while the noise draws do. As a result the posterior ensemble tends to be too wide, even though the parameter correction holds up.
+
+- The ESMDA solve does not use the weights, so *ies_structnoise_deweight* has no effect there; the structural noise draws do reach it, through the noise ensemble.
+
+- Structure that the parameters have already absorbed before the residuals are captured never shows up in the residuals, and compensation that leaves no residual (e.g. a parameter fixed at a wrong value that the others make up for exactly) cannot be seen. Real signal that looks like the bias is discounted along with it. The forecasts get the benefit of the corrected parameters, but not any structural error of their own.
 
 ## <a id='s13-2' />9.2 Using PESTPP-IES
 
@@ -4037,15 +4109,14 @@ EnIF is activated with *ies_use_enif(true)*. It needs a precision matrix. If no 
 
 The recommended approach is to supply a conditional-dependence graph with *ies_enif_graph()*. The graph is a square matrix, with rows and columns named by adjustable parameters, in any of the formats PESTPP-IES reads for matrices (binary JCO/JCB, ASCII matrix, or CSV). A nonzero entry means the two parameters are directly related; the diagonal is implied. Every adjustable parameter must appear, or PESTPP-IES will stop. For parameters defined on a model grid or a pilot-point network the natural graph is the nearest-neighbor (i.e. a “rook”, four neighbors) or eight-neighbor (i.e. a “queen”) relation between locations; both worked in testing, with the rook graph performing at least as well as the denser queen graph. A graph can also be obtained by inverting the prior covariance matrix and keeping only the largest partial correlations, which for a geostatistical prior recovers a nearest-neighbor lattice. Parameters that are not spatially distributed (for example a single global multiplier) should be connected to the parameters they interact with, or left with no edges, in which case they are treated as independent of everything else in the prior (the standard assumption - remember parameters can still be "linked" through the H matrix if they are correlated in the response to data).
 
-The precision matrix is estimated on the graph from the prior ensemble once, at the start of the run, and is not re-estimated as the ensemble changes. The estimate involves, for each parameter, a small regression on its graph neighbors (more precisely, on its predecessors in an elimination ordering chosen to keep fill-in small; *ies_enif_order()* selects that ordering and should normally be left at its default). The number of realizations therefore has to be large enough to support the size of the neighborhoods, more realizations, bigger neighborhoods are supported. If a parameter has more predecessors than half the ensemble size, its neighborhood is truncated to the strongest half and a warning is written to the run record file; if many parameters trigger this warning the ensemble is too small for the graph, and the estimated precision matrix will be suboptimal. In the testing done to date, a 25-by-25 grid of pilot points with the rook graph needed about 200 realizations before this truncation stopped mattering. *ies_enif_shrink()* adds a small ridge to each local regression and rarely needs changing.
+The precision matrix is estimated on the graph from the prior ensemble once, at the start of the run, and is not re-estimated as the ensemble changes. The estimate involves, for each parameter, a small regression on its graph neighbors (more precisely, on its predecessors in an elimination ordering chosen to keep fill-in small). The number of realizations therefore has to be large enough to support the size of the neighborhoods, more realizations, bigger neighborhoods are supported. If a parameter has more predecessors than half the ensemble size, its neighborhood is truncated to the strongest half and a warning is written to the run record file; if many parameters trigger this warning the ensemble is too small for the graph, and the estimated precision matrix will be suboptimal. In the testing done to date, a 25-by-25 grid of pilot points with the rook graph needed about 200 realizations before this truncation stopped mattering. *ies_enif_shrink()* adds a small ridge to each local regression and rarely needs changing.
 
-The sparse H is estimated once per iteration by lasso regression. *ies_enif_h_lasso()* sets the penalty as a fraction of the value that would zero the entire row for that observation, so it is dimensionless; the default of zero means a fixed penalty of 0.01 is used. A better choice, at some cost in run time, is to have PESTPP-IES choose the penalty for each observation by cross-validation over the realizations, which is turned on by giving *ies_enif_h_cv_folds()* a value of about 10. Without cross-validation and with a large ensemble, H can erroneously fit the ensemble almost exactly, in which case the unexplained-variance inflation described in section 9.1.16 does nothing and lambda can climb to very large values; the cross-validated penalty prevents this. *ies_enif_resid_inflate()* turns the inflation off, which is not recommended. *ies_enif_save_h(true)* writes the estimated H at each iteration to *case.N.enif_H.jcb* with observation and parameter names on the axes, which is the object to inspect when the fit is poor: a structural zero says that observation is carrying no information about that parameter. What the inflation did is reported every iteration regardless: *case.N.enif_obs_inflate.csv* lists, for each observation, the noise variance, the unexplained variance, the variance the update used, their ratio and the resulting effective weight, and the run record file carries a per-observation-group summary of the same in the shape of the group phi summary. If the ratios are all close to one, H is fitting the ensemble to roundoff and the inflation is doing nothing (see the note on cross-validation above); if they are large for a group, that group is being down-weighted in the update relative to its control file weights.
+The sparse H is estimated once per iteration by lasso regression. *ies_enif_h_lasso()* sets the penalty as a fraction of the value that would zero the entire row for that observation, so it is dimensionless; the default of zero means a fixed penalty of 0.01 is used. With too small a penalty and a large ensemble, H can erroneously fit the ensemble almost exactly, in which case the unexplained-variance inflation described in section 9.1.16 does nothing and lambda can climb to very large values; a larger *ies_enif_h_lasso()* prevents this. *ies_enif_resid_inflate()* turns the inflation off, which is not recommended. What the inflation did is reported every iteration regardless: *case.N.enif_obs_inflate.csv* lists, for each observation, the noise variance, the unexplained variance, the variance the update used, their ratio and the resulting effective weight, and the run record file carries a per-observation-group summary of the same in the shape of the group phi summary. If the ratios are all close to one, H is fitting the ensemble to roundoff and the inflation is doing nothing (see the note on the penalty above); if they are large for a group, that group is being down-weighted in the update relative to its control file weights.
 
 Everything else about the run is the same as for the standard update. EnIF returns a parameter upgrade, and the surrounding lambda search, backtracking, subset testing, bounds enforcement, phi accounting, termination criteria and reinflation all apply unchanged. The Marquardt lambda damps the prior precision, not the observation precision, so large lambdas leave the ensemble where it is rather than pulling it back to the prior; expect the lambdas that PESTPP-IES accepts to be larger (hundreds to thousands) than for the standard update. *ies_use_approx()* has the same meaning as for the standard update: *true* (the default) drops the prior-pull term from the gradient, *false* keeps each realization anchored to its own prior draw. EnIF is not supported with localization, the multimodal solution process, ESMDA or observation noise covariance matrices, and at the time of writing it does not refuse these combinations, so users should not combine them.
 
 Any important but valuable by-product on using EnIF is that it produces a sparse Jacobian matrix that represents the relation between parameters and observations in the standard nobs X npar space, similar to PESTPP-GLM and PEST_HP (as opposed to IES, which works in the ensemble space for this relation).  This means that influence diagrams of how observations are pulling and pushing parameters can be made even in very high dimensional problems.
 
-*ies_use_prior_prec(true)*, described in section 9.1.16, takes the same graph and the same *ies_enif_shrink()* and *ies_enif_order()* options, but is an option of the standard update: it should be used with *ies_use_enif(false)* and *ies_use_approx(false)*, and it refuses localization, the multimodal solve, ESMDA and EnIF.
 
 ## <a id='s13-3' />9.3 PESTPP-IES Output Files
 
@@ -4062,6 +4133,9 @@ As always, it is assumed that the filename base of the PEST control file on whic
 | *case.N.par.csv/jcb*              | Values of all parameters in all realizations comprising an ensemble. For N=0, this is the initial ensemble, sampled from the prior parameter probability distribution. Otherwise, it is the parameter realizations at the end of iteration N                                                                                                                                                                                                                   |
 | *case.N.obs.csv/jcb*              | The ensemble of model outputs values which correspond to observations listed in the “observation data” section of the PEST control file. These are calculated using all realizations comprising the parameter ensemble.                                                                                                                                                                                                                                        |
 | *case.obs+noise.csv/jcb*          | Base observation values. These are calculated by generating realizations of measurement noise and adding this noise to measured values listed in the “observation data” section of the PEST control file.                                                                                                                                                                                                                                                      |
+| *case.N.obs+noise.csv/jcb*        | Written at each reinflation where structural noise is in play (section 9.1.17): the noise realizations rebuilt with the structural draws added, for iteration N. Compare with *case.obs+noise.csv*. |
+| *case.N.adjusted.weights.csv*     | Written at each reinflation with *ies_structnoise_deweight(true)* (section 9.1.17): the weight ensemble after the structural de-weighting, for iteration N. |
+| *case.N.adjusted.obs_data.csv*    | Written with *case.N.adjusted.weights.csv*: the observation data with the de-weighted control file weights, for iteration N. |
 | *case.N.L.lambda.F.scale.csv/jcb* | These files are produced if the *ies_save_lambda_ensembles()* control variable is set to *true*. They record parameter values used in testing the effects of different Marquardt lambdas and line search factors. *L* is the value of the Marquardt lambda; *F* is the value of the line search factor.                                                                                                                                                            |
 | *case.phi.actual.csv*             | Objective functions calculated during all iterations of the ensemble smoother process for all members of the ensemble. Objective functions are computed from differences between model outputs and measurements recorded in the “observation data” section of the PEST control file using weights that are also provided in this section.                                                                                                                      |
 | *case.phi.group.csv*              | Objective function components pertaining to different observation groups calculated for all iterations of the ensemble smoother process. Progression of the regularization objective function is also recorded; this measures discrepancies between current and initial parameter values. Contributions by different parameter groups to the regularization objective function are also listed.                                                                |
@@ -4417,35 +4491,60 @@ Note also that the number of control variables may change with time. Refer to th
 <td>Text</td>
 <td>The name of a parameter realization in an external parameter ensemble file to run. Only used if noptmax = -2.</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td><em>ies_reinflate_num_reals</em></td>
 <td>list of ints</td>
 <td>The number of realizations to use between reinflation cycles.  If negative, new realizations are drawn from the current ensemble.</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td><em>ies_reinflate_solver(ies)</em></td>
 <td>list of strings</td>
 <td>The solver to use in each reinflation cycle, one entry per cycle; the last entry is held for any remaining cycles. Accepted values are “ies”, “esmda” and “enif”. Overrides <em>ies_use_mda</em> and <em>ies_use_enif</em> when supplied. For example “ies,enif” runs the standard update until the first reinflation and the ensemble information form after it. See sections 9.1.15 and 9.1.16.</td>
 </tr>
+<tr class="odd">
+<td><em>ies_reinflate_multimodal_alpha</em></td>
+<td>list of floats</td>
+<td>The <em>ies_multimodal_alpha</em> to use in each reinflation cycle, one entry per cycle; the last entry is held for any remaining cycles. Each entry must be between 0.0 and 1.0, and 0.0 turns the multimodal solve off for that cycle. Overrides <em>ies_multimodal_alpha</em> when supplied. For example “0.0,0.25” runs the standard update until the first reinflation and the multimodal update after it. See sections 9.1.14 and 9.1.15.</td>
+</tr>
 <tr class="even">
+<td><em>ies_reinflate_structnoise_frac</em></td>
+<td>list of floats</td>
+<td>The fraction of the irreducible residual variance added to the noise realizations as structural noise, one entry per reinflation, walked like <em>ies_reinflate_factor</em> (last entry held). The residuals are captured at the first reinflation with a non-zero entry; a negative entry recaptures them at that reinflation and uses the magnitude as the fraction. 0.0 turns it off for that reinflation, and entirely if every entry is 0.0. Default is 0.0. PESTPP-IES only: PESTPP-DA reads it but does not use it. Experimental; see section 9.1.17.</td>
+</tr>
+<tr class="odd">
+<td><em>ies_structnoise_deweight</em></td>
+<td>bool</td>
+<td>Also lower each observation weight by its irreducible residual variance at each reinflation where <em>ies_reinflate_structnoise_frac</em> is non-zero, in the weight ensemble and the control file weights. Weights are never increased. Has no effect on the ESMDA solve. Default is false. Experimental; see section 9.1.17.</td>
+</tr>
+<tr class="even">
+<td><em>ies_structnoise_em</em></td>
+<td>bool</td>
+<td>Build the structural correction on the excess of each observation's captured residual variance over the user's noise variance (taken from the noise realizations, not the weights), max(0, s<sup>2</sup> − σ<sup>2</sup>), instead of the whole residual variance. This is the EM update of the structural noise level; <em>ies_reinflate_structnoise_frac</em> scales it. Default is false. Experimental; see section 9.1.17.</td>
+</tr>
+<tr class="odd">
 <td><em>ies_use_phi_lambda_iters</em></td>
 <td>bool</td>
 <td>Flag to use phi-based lambda each iteration (instead just for the initial phi).</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td><em>ies_loc_type(local)</em></td>
 <td>string</td>
 <td>The form of localization to apply. Only “local”, meaning local analysis, is supported; “covariance” is deprecated and is reset to local analysis with a warning. Also accepted as <em>ies_localization_type</em>. Default is “local”.</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td><em>ies_localize_how(parameters)</em></td>
 <td>string</td>
 <td>Whether the localized solve is decomposed by parameters or by observations. Only “parameters” is supported; “observations” is deprecated and is reset to “parameters” with a warning. Default is “parameters”.</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td><em>ies_localizer_forgive_missing(false)</em></td>
 <td>bool</td>
 <td>Tolerate a localizer matrix whose rows or columns name parameters or observations that are not in the active set, rather than stopping. Useful when one localizer is reused across analyses, or when observations are activated part way through. Also accepted as <em>ies_localizer_forgive_extra</em>. Default is false.</td>
+</tr>
+<tr class="odd">
+<td><em>ies_localizer_combine_common(false)</em></td>
+<td>bool</td>
+<td>Merge localizer columns that have the same nonzero pattern into one local solve, the way a parameter group column already is one. Only the pattern matters; the matrix values are not used by the solve. Unchanged results in the approximate form, the group-column result in the full form, and the observation-side factorization done once per pattern instead of once per parameter. Default is false.</td>
 </tr>
 <tr class="even">
 <td><em>ies_use_enif(false)</em></td>
@@ -4455,27 +4554,17 @@ Note also that the number of control variables may change with time. Refer to th
 <tr class="odd">
 <td><em>ies_enif_graph</em></td>
 <td>string</td>
-<td>The name of a square matrix file (JCO/JCB, ASCII matrix or CSV, recognized by extension) whose rows and columns are adjustable parameter names and whose nonzero entries say which parameters are directly related in the prior. The prior precision is estimated on this sparsity pattern from the prior ensemble. Used by <em>ies_use_enif</em> and <em>ies_use_prior_prec</em>. Every adjustable parameter must appear.</td>
+<td>The name of a square matrix file (JCO/JCB, ASCII matrix or CSV, recognized by extension) whose rows and columns are adjustable parameter names and whose nonzero entries say which parameters are directly related in the prior. The prior precision is estimated on this sparsity pattern from the prior ensemble. Used by <em>ies_use_enif</em>. Every adjustable parameter must appear.</td>
 </tr>
 <tr class="even">
-<td><em>ies_enif_order(amd)</em></td>
-<td>string</td>
-<td>The elimination ordering used when estimating the sparse prior precision on <em>ies_enif_graph</em>. “amd” (approximate minimum degree, the default) keeps fill-in small; “natural” uses the order the parameters appear in. Rarely needs changing.</td>
-</tr>
-<tr class="odd">
 <td><em>ies_enif_shrink(0.001)</em></td>
 <td>double</td>
 <td>Ridge added to each local regression when estimating the sparse prior precision, as a fraction of the local variance. Automatically increased for parameters whose graph neighbourhood is large relative to the ensemble size. Rarely needs changing.</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td><em>ies_enif_h_lasso(0.0)</em></td>
 <td>double</td>
-<td>The L1 penalty used to estimate the sparse parameter-to-observation map H when a graph is supplied, as a dimensionless fraction of the penalty that would zero the whole row. Zero (the default) means a fixed 0.01. Ignored when <em>ies_enif_h_cv_folds</em> is greater than zero.</td>
-</tr>
-<tr class="odd">
-<td><em>ies_enif_h_cv_folds(0)</em></td>
-<td>int</td>
-<td>If greater than zero, the lasso penalty for each observation row of H is chosen by k-fold cross-validation over the realizations with this many folds, instead of the fixed <em>ies_enif_h_lasso</em> value. A value of about 10 is recommended for larger problems; it costs run time but stops H over-fitting the ensemble.</td>
+<td>The L1 penalty used to estimate the sparse parameter-to-observation map H when a graph is supplied, as a dimensionless fraction of the penalty that would zero the whole row. Zero (the default) means a fixed 0.01.</td>
 </tr>
 <tr class="even">
 <td><em>ies_enif_resid_inflate(true)</em></td>
@@ -4486,16 +4575,6 @@ Note also that the number of control variables may change with time. Refer to th
 <td><em>ies_enif_ridge(1.0e-6)</em></td>
 <td>double</td>
 <td>Ridge used in the dense ensemble regression for H when no graph is supplied (the covariance mode), as a fraction of the mean ensemble variance. Rarely needs changing.</td>
-</tr>
-<tr class="even">
-<td><em>ies_enif_save_h(false)</em></td>
-<td>bool</td>
-<td>Save the estimated sparse H at each iteration to <em>case.N.enif_H.jcb</em>, with observation and parameter names on the axes.</td>
-</tr>
-<tr class="odd">
-<td><em>ies_use_prior_prec(false)</em></td>
-<td>bool</td>
-<td>Use an explicit prior precision matrix in place of the ensemble estimate of the prior in the standard (Chen and Oliver) update, in both the Hessian and the prior-pull term of the full solution. The precision is estimated on <em>ies_enif_graph</em> from the prior ensemble if a graph is supplied, otherwise it is the inverse of <em>parcov</em>. Should be used with <em>ies_use_approx(false)</em>. Cannot be combined with localization, <em>ies_multimodal_alpha</em>, ESMDA or <em>ies_use_enif</em>. Experimental; see section 9.1.16.</td>
 </tr>
 
 </tbody>
@@ -5243,7 +5322,7 @@ Users are encouraged to google these to find out more about their behavior.
 
 In contrast to PESTPP-OPT, which operates on a single solution, PESTPP-MOU uses a population of decision variable sets, which means there is no single point in decision variable space to evaluate chances, so some decisions must be made about how to evaluate model-based constraints and/or objective uncertainty (and ultimately risk). Similar to PESTPP-OPT, PESTPP-MOU support both FOSM and stack-based chance processes. However, given that the expected use of PESTPP-MOU is in more nonlinear settings that PESTPP-OPT, it is expected that the stack-based chance formulation will be more appropriate.
 
-Stack-based chances can be evaluated in two ways with PESTPP-MOU: at each population individual (*opt_chance_points(all)*) or at a single representative point in decision variable space and then broadcast to each population individual (*opt_chance_points(single)*). Additionally, chances can be reused across generations or evaluated anew each generation via the *opt_reuse_chance* integer argument. Each of these options has implications for rigorousness and computational burden. For example, evaluating the population stack at a single representative point during evaluation of the initial population and then reusing this chance for all remaining generations is the computationally cheapest option: you only have to evaluate the parameter stack once for the entire analysis. On the other extreme, you can evaluate the stack at each population individual for each generation. This results in running the full parameter stacks hundreds if not thousands of times. The choice of how and when to evaluate chances in very problem specific and depends on many factors like nonlinearity of the problem, model run time, and available computational resources. Preliminary testing has indicated that evaluating the stack at each population individual of the initial population and then reusing the stack or subsequent generations might be an appropriate compromise in some settings (how’s that for vague…). Note that because of the potential for coupling between the chance estimates and the optimization problem, when chances are re-evaluated, pestpp-mou will re-evaluate all past solutions for dominance using the current chance estimates and will also reset the archive of nondominated solutions. This is necessary to avoid spurious early chance estimates yielding implausible domination relations or spurious infeasibilities for later generations.
+Stack-based chances can be evaluated in two ways with PESTPP-MOU: at each population individual (*opt_chance_points(all)*) or at a single representative point in decision variable space and then broadcast to each population individual (*opt_chance_points(single)*). Additionally, chances can be reused across generations or evaluated anew: *opt_recalc_chance_every* re-evaluates them every N generations (the default of 1 re-evaluates them every generation), and *opt_chance_schedule* names a file that sets, generation by generation, when they are re-evaluated. Chances are always evaluated for the initial population. Each of these options has implications for rigorousness and computational burden. For example, evaluating the population stack at a single representative point during evaluation of the initial population and then reusing this chance for all remaining generations is the computationally cheapest option: you only have to evaluate the parameter stack once for the entire analysis. On the other extreme, you can evaluate the stack at each population individual for each generation. This results in running the full parameter stacks hundreds if not thousands of times. The choice of how and when to evaluate chances in very problem specific and depends on many factors like nonlinearity of the problem, model run time, and available computational resources. Preliminary testing has indicated that evaluating the stack at each population individual of the initial population and then reusing the stack or subsequent generations might be an appropriate compromise in some settings (how’s that for vague…). Note that because of the potential for coupling between the chance estimates and the optimization problem, when chances are re-evaluated, pestpp-mou will re-evaluate all past solutions for dominance using the current chance estimates and will also reset the archive of nondominated solutions. This is necessary to avoid spurious early chance estimates yielding implausible domination relations or spurious infeasibilities for later generations.
 
 When chances are reused for generations, the PDFs/CDFs of the constraints/objectives are translated from the points in decision variable space where they were evaluated to the new population individuals using simple inverse-distance weighting. This assumes that points near each other in decision-variable space yield more similar chance results than points that are distance. The translation of PDFs/CDFs is done by differencing the simulated constraint/objective values between two points, assuming these values represent the mean of the PDFs.
 
@@ -5256,7 +5335,7 @@ Robust optimization needs two things. First, there must be uncertain parameters 
 
 PESTPP-MOU commences execution by either generating or loading a decision variable population, depending on whether an existing population was supplied. It then evaluates this initial population by running the model once for each population individual. PESTPP-MOU then generates a new population of offspring from the initial population using the specified *mou_generator*. This new population is then evaluated by running it through the model.
 
-If chances processes are active (via the *opt_risk* argument) and chances should be evaluated this generation (as indicated by the *opt_reuse_chance* argument), then any chance-related model runs are also evaluated at the same time as the offspring population.
+If chances processes are active (via the *opt_risk* argument) and chances should be evaluated this generation (as set by *opt_recalc_chance_every* and *opt_chance_schedule*), then any chance-related model runs are also evaluated at the same time as the offspring population.
 
 Once all requested runs have finished, PESTPP-MOU uses the designated environmental selector (via *mou_env_selector* argument) to keep only the best individual s from the parent and offspring populations, combining these best individuals into the new population to use as the parent population for the next generation.
 
@@ -5722,7 +5801,7 @@ Variables discussed in section 5.3.5 that control parallel run management are no
 | *sqp_solve_method(NULL)*              | text     | KKT subproblem solver: NULL (null-space method, default) or DIRECT (direct KKT solve). |
 | *sqp_rescale_search_dir(true)*        | boolean  | Rescale the KKT search direction by parameter ranges prior to the line search. |
 | *sqp_subset_size(-10)*                | integer  | Number of ensemble members used in the line search. Negative values are interpreted as a percentage of the current ensemble size. |
-| *sqp_enforce_bounds(false)*           | boolean  | Enforce parameter bounds on ensemble members during initialization. |
+| *sqp_enforce_bounds(true)*            | boolean  | Clamp line search candidate decision variables to their bounds before they are run. |
 | *opt_use_robust(false)*               | boolean  | Robust optimization: each decision-variable realization is paired with its own uncertain-parameter realization and the ensemble is optimized as it stands. **No risk shifting is done**, so this cannot be combined with a non-neutral *opt_risk*. Supported by PESTPP-SQP and PESTPP-MOU; PESTPP-OPT rejects it. For PESTPP-SQP, a supplied *sqp_dv_en* must contain the uncertain parameters. For PESTPP-MOU, see section 13.2.2. |
 | ~~*sqp_risk*~~                        | —        | **Retired.** It was both a risk value and a switch selecting ensemble-based shifting, and it silently overrode *opt_risk*. Use *opt_risk* for chance constraints, or *opt_use_robust* for robust optimization. |
 | *sqp_max_consec_infeas_ies(3)*        | integer  | Number of consecutive infeasible iterations before switching to IES-based feasibility recovery. |

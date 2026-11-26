@@ -197,7 +197,7 @@ Eigen::SparseMatrix<double> get_diag_matrix(const Eigen::SparseMatrix<double> &m
 	assert(ncols == nrows);
 	if (nrows != ncols)
 	{
-		PestError("Error in get_diag_matrix: Can not return the diagonal of a non-square matrix");
+		throw PestError("Error in get_diag_matrix: Can not return the diagonal of a non-square matrix");
 	}
 	VectorXd diag_vec = mat.diagonal();
 	std::vector<Eigen::Triplet<double> > triplet_list;

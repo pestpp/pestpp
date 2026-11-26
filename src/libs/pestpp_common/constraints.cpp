@@ -3475,6 +3475,17 @@ void Constraints::add_runs(int iter, ParameterEnsemble& current_pe, Observations
 	stringstream ss;
 	
 	vector<string> names1, names2;
+	//size the nested stack once and fill each member's block in place - appending one
+	//member at a time reallocated and copied the whole (members * stack) x npar matrix
+	//every time
+	names1 = stack_pe.get_real_names();
+	int n_stack = names1.size();
+	for (const auto& real_info : current_pe.get_real_map())
+		for (auto n : names1)
+			names2.push_back(n + NESTED_STACK_NAME_SEP + real_info.first);
+	nested_pe = stack_pe;
+	nested_pe.reserve(names2, stack_pe.get_var_names());
+	Eigen::MatrixXd* nested_ptr = nested_pe.get_eigen_ptr_4_mod();
 	for (const auto& real_info : current_pe.get_real_map())
 	{
 
@@ -3482,25 +3493,10 @@ void Constraints::add_runs(int iter, ParameterEnsemble& current_pe, Observations
 		real_pars.update_without_clear(par_names, par_vec);
 		_stack_pe_run_map = add_stack_runs(iter, stack_pe, real_pars, current_obs, run_mgr_ptr);
 		population_stack_pe_run_map[real_info.first] = _stack_pe_run_map;
-		
+
 		stack_pe_map[real_info.first] = real_pars;
-		names1 = stack_pe.get_real_names();
-		names2.clear();
-		for (auto n : names1)
-			names2.push_back(n + NESTED_STACK_NAME_SEP + real_info.first);
-		stack_pe.set_real_names(names2,true);
 		//TODO: add a flag to decide if saving
-		if (i == 0)
-		{
-			//stack_pe.to_csv_by_reals(fstack, true);
-			nested_pe = stack_pe;
-		}
-		else
-		{
-			//stack_pe.to_csv_by_reals(fstack, false);
-			nested_pe.append_other_rows(stack_pe,true);
-		}
-		stack_pe.set_real_names(names1,true);
+		nested_ptr->middleRows(i * n_stack, n_stack) = *stack_pe.get_eigen_ptr();
 		//save_pe_stack(iter, real_info.first, stack_pe);
 		f_rec << "...added " << stack_pe.shape().first << " runs for decision variable solution '" << real_info.first << "'" << endl;
 		count = count + _stack_pe_run_map.size();

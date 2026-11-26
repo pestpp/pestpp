@@ -48,14 +48,21 @@ protected:
 class SVD_EIGEN : public SVDPackage
 {
 public:
-	SVD_EIGEN(int _n_max_sing = 1000000, double _eign_thres = 1.0e-7) : SVDPackage("Eigen JacobiSVD", _n_max_sing, _eign_thres)  {}
-	SVD_EIGEN(const SVD_EIGEN &rhs) : SVDPackage(rhs) {}
+	//use_bdc: Eigen's divide-and-conquer BDCSVD instead of JacobiSVD.  same exact SVD to
+	//round-off, much faster on large matrices (Eigen itself falls back to Jacobi below 16
+	//columns).  selected with svd_pack(bdcsvd)
+	SVD_EIGEN(int _n_max_sing = 1000000, double _eign_thres = 1.0e-7, bool _use_bdc = false) :
+		SVDPackage(_use_bdc ? "Eigen BDCSVD" : "Eigen JacobiSVD", _n_max_sing, _eign_thres), use_bdc(_use_bdc) {}
+	SVD_EIGEN(const SVD_EIGEN &rhs) : SVDPackage(rhs), use_bdc(rhs.use_bdc) {}
+	bool get_use_bdc() const { return use_bdc; }
 	virtual void solve_ip(Eigen::SparseMatrix<double>& A, Eigen::VectorXd &Sigma, Eigen::SparseMatrix<double>& U, Eigen::SparseMatrix<double>& VT, Eigen::VectorXd &Sigma_trunc);
 	virtual void solve_ip(Eigen::SparseMatrix<double>& A, Eigen::VectorXd &Sigma, Eigen::SparseMatrix<double>& U, Eigen::SparseMatrix<double>& VT, Eigen::VectorXd &Sigma_trunc, double _eigen_thres);
 	virtual SVD_EIGEN *clone() const{ return new SVD_EIGEN(*this); }
 	virtual void solve_ip(Eigen::MatrixXd& A, Eigen::MatrixXd &Sigma, Eigen::MatrixXd& U, Eigen::MatrixXd& VT, double _eigen_thres, double _max_sing);
 
 	virtual ~SVD_EIGEN(void) {}
+private:
+	bool use_bdc;
 };
 
 

@@ -599,8 +599,9 @@ bool SeqQuadProgram::initialize_dv(Covariance &cov)
  *
  * @param _dv Description.
  * @param _oe Description.
+ * @param cur_tstat the space current_ctl_dv_values is in
  */
-void SeqQuadProgram::add_current_as_bases(ParameterEnsemble& _dv, ObservationEnsemble& _oe)
+void SeqQuadProgram::add_current_as_bases(ParameterEnsemble& _dv, ObservationEnsemble& _oe, ParameterEnsemble::transStatus cur_tstat)
 {
 	//check that 'base' isn't already in ensemble
 	vector<string> rnames = _dv.get_real_names();
@@ -614,9 +615,18 @@ void SeqQuadProgram::add_current_as_bases(ParameterEnsemble& _dv, ObservationEns
 	else
 	{
 		message(1, "adding 'base' parameter values to ensemble");
+		//current_ctl_dv_values is ctl at the first call but numeric once the dv ensemble is
+		//initialized.  transforming it unconditionally logged numeric values a second time, so
+		//a value below one went negative and the next pass made it nan.  the non-dv columns
+		//come from the control file and always need the transform; the dv values only when ctl
 		Parameters pars = pest_scenario.get_ctl_parameters();
-		pars.update_without_clear(dv_names,current_ctl_dv_values.get_data_vec(dv_names));
+		if (cur_tstat == ParameterEnsemble::transStatus::CTL)
+			pars.update_without_clear(dv_names, current_ctl_dv_values.get_data_vec(dv_names));
 		_dv.get_par_transform().active_ctl2numeric_ip(pars);
+		if (cur_tstat == ParameterEnsemble::transStatus::NUM)
+			pars.update_without_clear(dv_names, current_ctl_dv_values.get_data_vec(dv_names));
+		//pars is numeric now - make sure the ensemble is too (no-op when it already is)
+		_dv.transform_ip(ParameterEnsemble::transStatus::NUM);
 		//BASE simply added, no dropping/replacement of last row -- BASE not counted in num_reals for StoSAG
 		//vector<int> drop{ _dv.shape().first - 1 };
 		//_dv.drop_rows(drop);
@@ -1776,7 +1786,7 @@ void SeqQuadProgram::make_gradient_runs(Parameters& _current_dv_vals, Observatio
 		
 		ObservationEnsemble _oe(&pest_scenario, &rand_gen);
 		_oe.reserve(_dv.get_real_names(), constraints.get_obs_constraint_names());
-		add_current_as_bases(_dv, _oe);
+		add_current_as_bases(_dv, _oe, ParameterEnsemble::transStatus::NUM);
 
 		Eigen::VectorXd base_dv_vec;
 		Eigen::VectorXd base_obs_vec;
@@ -1914,7 +1924,7 @@ int SeqQuadProgram::prep_4_ensemble_grad_prepare()
         message(1, "Warning: even though `sqp_include_base` is true, you passed a restart obs en, not adding 'base' realization...");
     }
     else
-        add_current_as_bases(dv, oe);
+        add_current_as_bases(dv, oe, ParameterEnsemble::transStatus::CTL);
 
 	if (!dv_drawn || !oe_drawn)
 	{
@@ -2258,9 +2268,10 @@ void SeqQuadProgram::dvcov_svd(const Eigen::MatrixXd& dv_anoms, Eigen::MatrixXd&
 	Eigen::MatrixXd dv_cov_matrix = 1.0 / (dv_anoms.rows() - 1.0) * (dv_anoms.transpose() * dv_anoms);
 	// honor the ++svd_pack option so a run can pin to the deterministic EIGEN (JacobiSVD)
 	// package; RedSVD is a randomized SVD and is not bit-reproducible across platforms.
-	if (pest_scenario.get_pestpp_options().get_svd_pack() == PestppOptions::EIGEN)
+	PestppOptions::SVD_PACK svd_choice = pest_scenario.get_pestpp_options().get_svd_pack();
+	if ((svd_choice == PestppOptions::EIGEN) || (svd_choice == PestppOptions::BDCSVD))
 	{
-		SVD_EIGEN svd;
+		SVD_EIGEN svd(1000000, 1.0e-7, svd_choice == PestppOptions::BDCSVD);
 		svd.set_performance_log(performance_log);
 		svd.solve_ip(dv_cov_matrix, s, U, V, pest_scenario.get_svd_info().eigthresh, pest_scenario.get_svd_info().maxsing);
 	}
@@ -2681,6 +2692,8 @@ bool SeqQuadProgram::update_hessian(string how)
 
 void SeqQuadProgram::update_scaling(const Eigen::VectorXd& step, const Eigen::VectorXd& grad) {
 	if (iter % scaling_update_frequency != 0) return;
+	if ((step.size() != (Eigen::Index)dv_names.size()) || (grad.size() != step.size()) ||
+		(diagonal_scaling.size() != step.size())) return;
 	Eigen::VectorXd rel_step = (step.array().abs() / (grad.array().abs() + 1e-10)).matrix();
 
 	double avg_step = rel_step.mean();
@@ -4449,6 +4462,8 @@ FilterRec SeqQuadProgram::line_search(map<string, Eigen::VectorXd>& search_d_map
 
 	}
 
+	//sqp_enforce_bounds defaults to true: a near-singular ensemble hessian gives line search
+	//steps far outside the bounds (k at 1000x its upper bound in the 10par_xsec case)
 	if (pest_scenario.get_pestpp_options().get_sqp_enforce_bounds())
 		dv_candidates.enforce_bounds(performance_log, false);
 

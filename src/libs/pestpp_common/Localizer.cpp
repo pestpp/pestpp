@@ -3,6 +3,7 @@
  * @brief Implementation of Localizer.
  */
 #include <random>
+#include <algorithm>
 #include <iomanip>
 #include <unordered_set>
 #include <iterator>
@@ -119,6 +120,28 @@ bool Localizer::initialize(PerformanceLog *performance_log, ofstream& frec, bool
 	
 	performance_log->log_event("processing localizer matrix");
 	_localizer_map = process_mat(performance_log,org_mat,forgive_missing);
+	if ((filename.size() > 0) && (pest_scenario_ptr->get_pestpp_options().get_ies_localizer_combine_common()))
+	{
+		CombineStats st = combine_common(_localizer_map, how, frec);
+		ss.str("");
+		ss << "...ies_localizer_combine_common: " << st.n_in << " local solves combined into " << st.n_out
+		   << " by common nonzero pattern (largest combined set " << st.largest << ")";
+		frec << ss.str() << endl;
+		cout << ss.str() << endl;
+		performance_log->log_event(ss.str());
+		if (!pest_scenario_ptr->get_pestpp_options().get_ies_use_approx())
+		{
+			//with the full solution the prior term is factored over the parameters in each
+			//local solve, so a combined solve is the group-column answer, not the per-column one
+			ss.str("");
+			ss << "WARNING: ies_localizer_combine_common with ies_use_approx = false: the combined local solves give the "
+			   << "result the same columns would give as one parameter group, which differs from solving the columns one "
+			   << "at a time because the prior term is factored over the parameters in each solve";
+			frec << ss.str() << endl << endl;
+			cout << ss.str() << endl;
+			performance_log->log_event(ss.str());
+		}
+	}
     vector<string> missing_from_loc;
 	if ((filename.size() > 0) && (how == How::PARAMETERS))
     {
@@ -509,6 +532,99 @@ unordered_map<string, pair<vector<string>, vector<string>>> Localizer::process_m
  *
  * @param f_rec Description.
  */
+Localizer::CombineStats Localizer::combine_common(unordered_map<string, pair<vector<string>, vector<string>>>& lmap, How how,
+	ostream& frec, const string& when, int max_sets)
+{
+	CombineStats st;
+	st.n_in = (int)lmap.size();
+	//the side that defines the solve, sorted, is the key; the members of each key are sorted
+	//too so the merged entry and its parameter order do not depend on hash order
+	map<string, vector<string>> members;
+	for (auto& kv : lmap)
+	{
+		vector<string> side = (how == How::PARAMETERS) ? kv.second.first : kv.second.second;
+		sort(side.begin(), side.end());
+		string key;
+		for (auto& n : side)
+		{
+			key += n;
+			key += '\n';
+		}
+		members[key].push_back(kv.first);
+	}
+	unordered_map<string, pair<vector<string>, vector<string>>> merged;
+	map<string, vector<string>> merged_members;
+	map<int, int> size_counts;
+	for (auto& m : members)
+	{
+		vector<string>& names = m.second;
+		sort(names.begin(), names.end());
+		if (names.size() == 1)
+		{
+			merged[names[0]] = lmap[names[0]];
+			continue;
+		}
+		pair<vector<string>, vector<string>> p = lmap[names[0]];
+		for (size_t i = 1; i < names.size(); i++)
+		{
+			pair<vector<string>, vector<string>>& other = lmap[names[i]];
+			if (how == How::PARAMETERS)
+				p.second.insert(p.second.end(), other.second.begin(), other.second.end());
+			else
+				p.first.insert(p.first.end(), other.first.begin(), other.first.end());
+		}
+		string mname = names[0] + "+" + to_string(names.size() - 1);
+		merged[mname] = p;
+		merged_members[mname] = names;
+		size_counts[(int)names.size()] += 1;
+		st.largest = max(st.largest, (int)names.size());
+	}
+	lmap = merged;
+	st.n_out = (int)lmap.size();
+
+	//the rec block
+	frec << endl << "  ---  ies_localizer_combine_common summary" << (when.size() ? " (" + when + ")" : "") << "  ---  " << endl;
+	frec << "    local solves before combining: " << st.n_in << endl;
+	frec << "    local solves after combining:  " << st.n_out << endl;
+	if (merged_members.empty())
+	{
+		frec << "    no two localizer columns share a nonzero pattern, nothing was combined" << endl << endl;
+		return st;
+	}
+	frec << "    columns left on their own:     " << (st.n_out - (int)merged_members.size()) << endl;
+	frec << "    combined sets by size (columns per solve: number of solves):";
+	for (auto& sc : size_counts)
+		frec << " " << sc.first << ":" << sc.second;
+	frec << endl;
+	frec << "    largest combined set:          " << st.largest << " columns" << endl;
+	int listed = 0;
+	for (auto& m : merged_members)
+	{
+		if (listed >= max_sets)
+		{
+			frec << "    ... " << ((int)merged_members.size() - listed) << " more combined sets not listed" << endl;
+			break;
+		}
+		frec << "    " << m.first << " (" << m.second.size() << " columns):";
+		int shown = 0;
+		for (auto& c : m.second)
+		{
+			if (shown >= 20)
+			{
+				frec << " ... +" << ((int)m.second.size() - shown);
+				break;
+			}
+			frec << " " << c;
+			shown++;
+		}
+		frec << endl;
+		listed++;
+	}
+	frec << endl;
+	return st;
+}
+
+
 void Localizer::report(ofstream &f_rec)
 {
 	vector<string> zeros;
@@ -854,6 +970,16 @@ unordered_map<string, pair<vector<string>, vector<string>>> Localizer::get_local
 	ss << "autoadaloc matrix constructed with " << cur_mat.e_ptr()->nonZeros() << " non-zero elements";
 	performance_log->log_event(ss.str());
 	lmap = process_mat(performance_log, cur_mat);
+	if (pest_scenario_ptr->get_pestpp_options().get_ies_localizer_combine_common())
+	{
+		//the screen above rebuilt the map one parameter per entry, so the merge is redone here
+		CombineStats st = combine_common(lmap, how, frec, "after autoadaloc, iteration " + to_string(iter));
+		ss.str("");
+		ss << "...ies_localizer_combine_common after autoadaloc: " << st.n_in << " local solves combined into "
+		   << st.n_out << " (largest combined set " << st.largest << ")";
+		frec << ss.str() << endl;
+		performance_log->log_event(ss.str());
+	}
 	cout << "automatic adaptive localization calculations done" << endl;
 	return lmap;
 }

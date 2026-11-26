@@ -2287,13 +2287,15 @@ def capi_host_quarantine_test():
         "no non-loopback address found ({0}) - the two-host arrangement needs one".format(lan_addr)
     print("second host will dial", lan_addr)
 
-    good_wd = _setup("capi_quar", noptmax=1, num_reals=12)
+    # 30, not 12: when one host fails everything and the other nothing, the screen's z comes out
+    # as sqrt(total attempts) however the runs are split, so 12 runs top out at 3.46 - under the
+    # 3.5 it needs. it only passed when a retry happened to add a 13th attempt
+    good_wd = _setup("capi_quar", noptmax=1, num_reals=30)
 
-    # the allowance has to come down for this arrangement to trip at all. a host is screened out
-    # when its failures pass its fair share plus the allowance, and with 2 of the 4 agents on the
-    # bad machine its fair share is half of every failure. at the default of 3 the bad machine
-    # would need 7 failures out of 6 runs, which cannot happen - the test would sit there looking
-    # like the feature was broken. at 1 it trips once the bad machine is 2 clear of its share.
+    # the screen is off by default (0), so it has to be switched on. a host is screened out when
+    # its failures pass what the other host's failure rate predicts by more than the allowance
+    # and the difference is significant (z above 3.5). the good machine never fails, so the bad
+    # one trips it once both have done a handful of runs; 1 keeps the allowance out of the way.
     _pst = pyemu.Pst(os.path.join(good_wd, "pest.pst"))
     _pst.pestpp_options["panther_agent_max_failed_run_delta"] = 1
     _pst.write(os.path.join(good_wd, "pest.pst"), version=2)

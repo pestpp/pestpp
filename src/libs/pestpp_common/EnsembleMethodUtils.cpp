@@ -2,6 +2,7 @@
  * @file EnsembleMethodUtils.cpp
  * @brief Implementation of EnsembleMethodUtils.
  */
+#include <chrono>
 #include <random>
 #include <map>
 #include <iomanip>
@@ -46,8 +47,6 @@ static void drive_run_batch(RunManagerAbstract* run_mgr_ptr, double slice_sec = 
 #include "RunStorage.h"
 #include "RunManagerAbstract.h"
 #include "utilities.h"
-
-
 
 
 EnsembleSolver::EnsembleSolver(PerformanceLog* _performance_log, FileManager& _file_manager, Pest& _pest_scenario, ParameterEnsemble& _pe,
@@ -508,7 +507,6 @@ void EnsembleSolver::update_multimodal_components(const double mm_alpha) {
     }
 
 
-
     //util functions
     typedef std::function<bool(std::pair<std::string, double>, std::pair<std::string, double>)> Comparator;
     // Defining a lambda function to compare two pairs. It will compare two pairs using second field
@@ -959,7 +957,6 @@ void EnsembleSolver::solve_multimodal(int num_threads, double cur_lam, bool use_
                                      Am, std::ref(*ut_ptr), std::ref(exception_ptrs[i])));
 
 
-
         }
         message(2, "waiting to join threads");
         //for (auto &t : threads)
@@ -1036,7 +1033,7 @@ void EnsembleSolver::solve_multimodal(int num_threads, double cur_lam, bool use_
             upgrade_real_names.push_back(real_names[idx]);
 
         ParameterEnsemble pe_real(&pest_scenario, pe.get_rand_gen_ptr());
-        pe_real.reserve(upgrade_real_names, pe.get_var_names());
+        pe_real.reserve(upgrade_real_names, pe.get_shared_var_names());
 
         if (!localizer.get_use()) {
             performance_log->log_event("calculating nonlocalized multimodal upgrade for " + real_name);
@@ -1174,17 +1171,9 @@ void EnsembleSolver::nonlocalized_solve(double cur_lam,bool use_glm_form, Parame
         }
         mm_weight_sum = mm_real_weight_map.at(center_on).sum();
     }
-    if (prior_prec != nullptr)
-    {
-        //ies_use_prior_prec: same inputs, but the prior enters as an explicit precision
-        //instead of the Am pseudo-inverse.  raw anomalies on purpose - see the note in
-        //ensemble_solution_prec on why ies_use_prior_scaling has nothing to do here
-        UpgradeThread::ensemble_solution_prec(iter,verbose_level,maxsing,use_approx,cur_lam,eigthresh,par_resid,
-                      par_diff,*prior_prec,obs_resid,obs_diff,upgrade_1,local_weights,reg_factor);
-    }
-    else
-        UpgradeThread::ensemble_solution(iter,verbose_level,maxsing,0,0,use_prior_scaling,use_approx,use_glm_form,cur_lam,eigthresh,par_resid,
-                      par_diff,Am,obs_resid,obs_diff,upgrade_1,obs_err,local_weights,parcov_inv, act_obs_names,act_par_names,reg_factor,mm_weight_sum);
+    UpgradeThread::ensemble_solution(iter,verbose_level,maxsing,0,0,use_prior_scaling,use_approx,use_glm_form,cur_lam,eigthresh,par_resid,
+                      par_diff,Am,obs_resid,obs_diff,upgrade_1,obs_err,local_weights,parcov_inv, act_obs_names,act_par_names,reg_factor,mm_weight_sum,
+                      pest_scenario.get_pestpp_options().get_svd_pack());
     pe_upgrade.add_2_cols_ip(act_par_names, upgrade_1);
 
 
@@ -1201,25 +1190,10 @@ void EnsembleSolver::init_enif_graph(const vector<string>& pe_real_names, const 
         return;
     ofstream& frec = file_manager.rec_ofstream();
     performance_log->log_event("enif: reading conditional-independence graph");
-    enif_graph.from_file(gname, act_par_names, frec,
-        pest_scenario.get_pestpp_options().get_ies_enif_order());
+    enif_graph.from_file(gname, act_par_names, frec);
 
     Eigen::MatrixXd X = pe.get_eigen(pe_real_names, act_par_names);
     X.transposeInPlace();
-    bool hybrid = pest_scenario.get_pestpp_options().get_ies_enif_hybrid_damp();
-    if ((hybrid) && (!pest_scenario.get_pestpp_options().get_ies_use_approx()))
-        throw runtime_error("EnsembleSolver::init_enif_graph(): 'ies_enif_hybrid_damp' needs 'ies_use_approx' = true");
-    enif_graph.set_hybrid_damp(hybrid);
-    if (hybrid)
-    {
-        //the damping metric: the current ensemble on the graph, every iteration
-        Eigen::MatrixXd A = (X.colwise() - X.rowwise().mean()) * scale;
-        performance_log->log_event("enif: estimating current-ensemble precision for the hybrid damping");
-        frec << "...enif: hybrid damping, lambda multiplies the current-ensemble precision (ies_enif_hybrid_damp)" << endl;
-        enif_graph.estimate_precision(
-            A, pest_scenario.get_pestpp_options().get_ies_enif_shrink(), frec,
-            pest_scenario.get_pestpp_options().get_ies_enif_direct_nbrs(), true);
-    }
     if (pname.size() > 0)
     {
         performance_log->log_event("enif: reading the prior precision");
@@ -1233,16 +1207,13 @@ void EnsembleSolver::init_enif_graph(const vector<string>& pe_real_names, const 
     //and the step shrinks in the directions already learned - the trust region ies gets from
     //its ensemble covariance.  without it the step size is set by the prior spread for the
     //whole run and lambda has to supply all the damping.  x0 = x - e is still the prior
-    if ((pest_scenario.get_pestpp_options().get_ies_enif_current_prec()) && (!hybrid))
+    if (pest_scenario.get_pestpp_options().get_ies_enif_current_prec())
     {
-        //with the hybrid damping the current ensemble is already in the step, so the
-        //curvature keeps the prior
         Eigen::MatrixXd A = (X.colwise() - X.rowwise().mean()) * scale;
         performance_log->log_event("enif: estimating sparse precision on the graph from the CURRENT ensemble");
         frec << "...enif: precision estimated from the current ensemble (ies_enif_current_prec)" << endl;
         enif_graph.estimate_precision(
-            A, pest_scenario.get_pestpp_options().get_ies_enif_shrink(), frec,
-            pest_scenario.get_pestpp_options().get_ies_enif_direct_nbrs());
+            A, pest_scenario.get_pestpp_options().get_ies_enif_shrink(), frec);
     }
     else
     {
@@ -1250,13 +1221,12 @@ void EnsembleSolver::init_enif_graph(const vector<string>& pe_real_names, const 
         Eigen::MatrixXd A0 = (X0.colwise() - X0.rowwise().mean()) * scale;
         performance_log->log_event("enif: estimating sparse prior precision on the graph");
         enif_graph.estimate_precision(
-            A0, pest_scenario.get_pestpp_options().get_ies_enif_shrink(), frec,
-            pest_scenario.get_pestpp_options().get_ies_enif_direct_nbrs());
+            A0, pest_scenario.get_pestpp_options().get_ies_enif_shrink(), frec);
     }
 }
 
 
-void EnsembleSolver::solve_enif(double cur_lam, ParameterEnsemble& pe_upgrade)
+void EnsembleSolver::solve_enif(double cur_lam, ParameterEnsemble& pe_upgrade, unordered_map<string, pair<vector<string>, vector<string>>>& loc_map)
 {
     //ensemble information filter.  the standard ies upgrade builds the kalman gain from
     //sample cross-covariances; enif instead builds it from the prior covariance the user
@@ -1337,6 +1307,38 @@ void EnsembleSolver::solve_enif(double cur_lam, ParameterEnsemble& pe_upgrade)
     //H = B M A^T is never formed, not even as a p x n product: every path below
     //applies it through A, B and the N x N factor
 
+    //a localizer limits which parameters each observation's lasso H row may use: an
+    //obs-par pair that shares a local solve is in, anything zero or not listed stays
+    //zero in H.  only the lasso H fits below use it, and only once per iteration
+    Eigen::SparseMatrix<double> h_loc;
+    const Eigen::SparseMatrix<double>* h_loc_ptr = nullptr;
+    if ((use_localizer) && (!enif_h_ready))
+    {
+        unordered_map<string, int> oidx, pidx;
+        for (int i = 0; i < n_obs; i++)
+            oidx[act_obs_names[i]] = i;
+        for (int j = 0; j < (int)act_par_names.size(); j++)
+            pidx[act_par_names[j]] = j;
+        vector<Eigen::Triplet<double>> loc_trips;
+        for (auto& lm : loc_map)
+            for (auto& pname : lm.second.second)
+            {
+                auto pit = pidx.find(pname);
+                if (pit == pidx.end())
+                    continue;
+                for (auto& oname : lm.second.first)
+                {
+                    auto oit = oidx.find(oname);
+                    if (oit != oidx.end())
+                        loc_trips.push_back(Eigen::Triplet<double>(oit->second, pit->second, 1.0));
+                }
+            }
+        h_loc.resize(n_obs, (int)act_par_names.size());
+        h_loc.setFromTriplets(loc_trips.begin(), loc_trips.end());
+        h_loc.makeCompressed();
+        h_loc_ptr = &h_loc;
+    }
+
     //--- graph path: sparse H and the information form -----------------------
     //when a conditional-independence graph is supplied, estimate a SPARSE H by
     //lasso and solve in the information form.  H^T Rinv H then stays sparse, so
@@ -1352,9 +1354,12 @@ void EnsembleSolver::solve_enif(double cur_lam, ParameterEnsemble& pe_upgrade)
         if (!enif_h_ready)
         {
             performance_log->log_event("enif: estimating sparse H");
+            auto h_t0 = chrono::steady_clock::now();
             enif_H = estimate_sparse_H(
                 A, B, lasso, pest_scenario.get_pestpp_options().get_ies_num_threads(),
-                enif_unexp, frec, pest_scenario.get_pestpp_options().get_ies_enif_h_cv_folds());
+                enif_unexp, frec, -1.0, h_loc_ptr);
+            frec << "...sparse H took " << setprecision(4) << chrono::duration<double>(
+                chrono::steady_clock::now() - h_t0).count() << " s" << endl;
             enif_h_ready = true;
         }
         const Eigen::SparseMatrix<double>& Hs = enif_H;
@@ -1415,10 +1420,13 @@ void EnsembleSolver::solve_enif(double cur_lam, ParameterEnsemble& pe_upgrade)
         if (!enif_h_ready)
         {
             performance_log->log_event("enif: estimating sparse H for the covariance path");
+            auto h_t0 = chrono::steady_clock::now();
             frec << "...enif: lasso H on the covariance path (ies_enif_h_lasso given, no graph)" << endl;
             enif_H = estimate_sparse_H(
                 A, B, lasso_opt, pest_scenario.get_pestpp_options().get_ies_num_threads(),
-                enif_unexp, frec, pest_scenario.get_pestpp_options().get_ies_enif_h_cv_folds());
+                enif_unexp, frec, -1.0, h_loc_ptr);
+            frec << "...sparse H took " << setprecision(4) << chrono::duration<double>(
+                chrono::steady_clock::now() - h_t0).count() << " s" << endl;
             enif_h_ready = true;
         }
         if (pest_scenario.get_pestpp_options().get_ies_enif_save_h())
@@ -1563,11 +1571,11 @@ EnifMmThread::EnifMmThread(PerformanceLog* _performance_log, const vector<string
     unordered_map<string, Eigen::SparseMatrix<double>>& _H_map,
     unordered_map<string, Eigen::VectorXd>& _unexp_map, bool _h_ready,
     const EnifGraph* _graph, const Eigen::SparseMatrix<double>* _C, const Eigen::MatrixXd* _Afac,
-    double _lasso, int _cv_folds, bool _inflate, double _cur_lam, Eigen::MatrixXd& _upgrade) :
+    double _lasso, bool _inflate, double _cur_lam, Eigen::MatrixXd& _upgrade) :
     performance_log(_performance_log), real_names(_real_names), X(_X), Y(_Y), e(_e), r(_r),
     real_idx_map(_real_idx_map), real_name_map(_real_name_map), q_vec_map(_q_vec_map),
     real_weight_map(_real_weight_map), H_map(_H_map), unexp_map(_unexp_map), h_ready(_h_ready),
-    graph(_graph), C(_C), Afac(_Afac), lasso(_lasso), cv_folds(_cv_folds), inflate(_inflate), cur_lam(_cur_lam),
+    graph(_graph), C(_C), Afac(_Afac), lasso(_lasso), inflate(_inflate), cur_lam(_cur_lam),
     upgrade(_upgrade)
 {
     noise_var.resize(real_names.size());
@@ -1642,7 +1650,7 @@ void EnifMmThread::work(int thread_id)
                     divisor = wsum;
             }
             stringstream tss;
-            Hk = estimate_sparse_H(Ak, Bk, lasso, 1, uk, tss, cv_folds, divisor);
+            Hk = estimate_sparse_H(Ak, Bk, lasso, 1, uk, tss, divisor);
             lock_guard<mutex> guard(results_lock);
             H_map[rname] = Hk;
             unexp_map[rname] = uk;
@@ -1765,14 +1773,13 @@ void EnsembleSolver::solve_enif_multimodal(int num_threads, double cur_lam, Para
     double lasso = pest_scenario.get_pestpp_options().get_ies_enif_h_lasso();
     if (lasso <= 0.0)
         lasso = 1.0e-2;
-    int cv_folds = pest_scenario.get_pestpp_options().get_ies_enif_h_cv_folds();
     bool apply_inflate = pest_scenario.get_pestpp_options().get_ies_enif_resid_inflate();
     bool h_was_ready = enif_mm_h_ready;
 
     Eigen::MatrixXd upgrade = Eigen::MatrixXd::Zero(n_par, num_reals);
     EnifMmThread worker(performance_log, pe_real_names, X, Y, e, r, mm_real_idx_map, mm_real_name_map,
         mm_q_vec_map, mm_real_weight_map, enif_mm_H, enif_mm_unexp, h_was_ready, graph, C, Afac_ptr,
-        lasso, cv_folds, apply_inflate, cur_lam, upgrade);
+        lasso, apply_inflate, cur_lam, upgrade);
     ss.str("");
     ss << "enif-mm: " << (h_was_ready ? "reusing" : "estimating") << " per-realization H and taking the "
        << (graph != nullptr ? "information" : "woodbury") << " step for " << num_reals << " realizations";
@@ -1853,7 +1860,7 @@ void EnsembleSolver::solve_enif_multimodal(int num_threads, double cur_lam, Para
         sort(ratios.begin(), ratios.end());
         frec << "...enif-mm: per-realization sparse H by lasso on realization-centred deviations, "
              << (graph != nullptr ? "information form on the graph" : "woodbury with parcov")
-             << ", lasso fraction " << lasso << (cv_folds > 0 ? " (cv)" : "") << endl;
+             << ", lasso fraction " << lasso << endl;
         frec << "...enif-mm: H density percent min / median / max over realizations: " << setprecision(3)
              << dens.front() << " / " << dens[dens.size() / 2] << " / " << dens.back() << endl;
         frec << "...enif-mm: mean noise inflation ratio per realization min / median / max: "
@@ -1904,6 +1911,7 @@ void EnsembleSolver::solve(int num_threads, double cur_lam, bool use_glm_form, P
                                             _how, reg_factor);
     //pass the (possibly empty) multimodal realization weights for the localized multimodal path
     ut_ptr->set_real_weights(mm_current_weights);
+    ut_ptr->prepare_writeback();
     performance_log->log_event("using local analysis upgrade thread");
 
 	if ((num_threads < 1) || (loc_map.size() == 1))
@@ -1932,7 +1940,6 @@ void EnsembleSolver::solve(int num_threads, double cur_lam, bool use_glm_form, P
 			//threads.push_back(thread(localanalysis_upgrade_thread_function, i, iter, cur_lam, use_glm_form, act_par_names, act_obs_names, std::ref(worker), std::ref(exception_ptrs[i])));
 			threads.push_back(thread(upgrade_thread_function, i, iter, cur_lam, use_glm_form, act_par_names,
 				act_obs_names, std::ref(*ut_ptr), std::ref(exception_ptrs[i])));
-
 
 
 		}
@@ -2014,6 +2021,75 @@ void EnsembleSolver::message(int level, const string& _message, T extra)
 }
 
 
+//the svd of the ensemble solve, by ++svd_pack: eigen (JacobiSVD), bdcsvd (Eigen's divide and
+//conquer) or redsvd (randomized, the default).  all three truncate the same way, by eigthresh
+//relative to the largest value and by maxsing
+static void ens_svd(PestppOptions::SVD_PACK pack, Eigen::MatrixXd& A, Eigen::MatrixXd& s, Eigen::MatrixXd& U,
+	Eigen::MatrixXd& V, double eigthresh, int maxsing, PerformanceLog* plog = nullptr)
+{
+	if ((pack == PestppOptions::EIGEN) || (pack == PestppOptions::BDCSVD))
+	{
+		SVD_EIGEN svd(1000000, 1.0e-7, pack == PestppOptions::BDCSVD);
+		if (plog)
+			svd.set_performance_log(plog);
+		svd.solve_ip(A, s, U, V, eigthresh, (double)maxsing);
+	}
+	else
+	{
+		SVD_REDSVD svd;
+		if (plog)
+			svd.set_performance_log(plog);
+		svd.solve_ip(A, s, U, V, eigthresh, maxsing);
+	}
+}
+
+
+void UpgradeThread::prepare_writeback()
+{
+	col_index.clear();
+	vector<string> vnames = pe_upgrade.get_var_names();
+	col_index.reserve(vnames.size());
+	for (int i = 0; i < (int)vnames.size(); i++)
+		col_index[vnames[i]] = i;
+	//the lock-free write is only safe if no parameter is in two cases: check, once
+	vector<char> seen(vnames.size(), 0);
+	for (auto& c : cases)
+	{
+		for (auto& p : c.second.second)
+		{
+			auto it = col_index.find(p);
+			if (it == col_index.end())
+				throw runtime_error("UpgradeThread::prepare_writeback(): parameter '" + p + "' in local case '" + c.first +
+					"' is not in the upgrade ensemble");
+			if (seen[it->second])
+				throw runtime_error("UpgradeThread::prepare_writeback(): parameter '" + p +
+					"' is in more than one local case, the threaded write-back needs them disjoint");
+			seen[it->second] = 1;
+		}
+	}
+}
+
+
+int UpgradeThread::write_local_upgrade(Eigen::MatrixXd& target, const unordered_map<string, int>& col_index,
+	const vector<string>& names, const Eigen::MatrixXd& upd)
+{
+	if (upd.rows() != target.rows())
+		throw runtime_error("UpgradeThread::write_local_upgrade(): local upgrade has " + to_string(upd.rows()) +
+			" rows, the ensemble has " + to_string(target.rows()));
+	if (upd.cols() != (Eigen::Index)names.size())
+		throw runtime_error("UpgradeThread::write_local_upgrade(): local upgrade columns do not match its names");
+	for (int i = 0; i < (int)names.size(); i++)
+	{
+		//find(), never operator[]: the map is shared read-only across threads
+		auto it = col_index.find(names[i]);
+		if (it == col_index.end())
+			throw runtime_error("UpgradeThread::write_local_upgrade(): '" + names[i] + "' is not in the upgrade ensemble");
+		target.col(it->second) += upd.col(i);
+	}
+	return (int)names.size();
+}
+
+
 UpgradeThread::UpgradeThread(PerformanceLog* _performance_log, unordered_map<string, Eigen::VectorXd>& _par_resid_map, unordered_map<string, Eigen::VectorXd>& _par_diff_map,
                              unordered_map<string, Eigen::VectorXd>& _obs_resid_map, unordered_map<string, Eigen::VectorXd>& _obs_diff_map, unordered_map<string, Eigen::VectorXd>& _obs_err_map,
                              Localizer& _localizer, unordered_map<string, double>& _parcov_inv_map,
@@ -2037,6 +2113,32 @@ UpgradeThread::UpgradeThread(PerformanceLog* _performance_log, unordered_map<str
 	
 }
 
+//a local (or global) solve whose obs_diff is all zeros has no information: none of its
+//observations vary across the ensemble.  the svd of a zero matrix keeps no components,
+//and the next step then hands an empty matrix to eigen, which reads a null pointer.
+//this happens for real - an obs at a fixed-head cell paired alone with a parameter.
+//trap it here: zero upgrade (realizations x parameters, what the solve returns) and a
+//warning.  returns true when trapped
+static bool trap_zero_obs_diff(const Eigen::MatrixXd& obs_diff, const Eigen::MatrixXd& par_diff,
+	Eigen::MatrixXd& upgrade_1, const vector<string>& obs_names, const vector<string>& par_names)
+{
+	if ((obs_diff.size() > 0) && (obs_diff.cwiseAbs().maxCoeff() > 0.0))
+		return false;
+	upgrade_1 = Eigen::MatrixXd::Zero(par_diff.cols(), par_diff.rows());
+	stringstream ss;
+	ss << "warning: observation differences are all zero for " << par_diff.rows()
+		<< " parameter(s)";
+	if (par_names.size() > 0)
+		ss << " (first: " << par_names[0] << ")";
+	ss << " and " << obs_diff.rows() << " observation(s)";
+	if (obs_names.size() > 0)
+		ss << " (first: " << obs_names[0] << ")";
+	ss << " - no observation in this solve varies across the ensemble, skipping the upgrade" << endl;
+	cout << ss.str();
+	return true;
+}
+
+
 void UpgradeThread::ensemble_solution(const int iter, const int verbose_level,const int maxsing,  const int thread_id,
                               const int t_count, const bool use_prior_scaling,const bool use_approx, const bool use_glm,
                               const double cur_lam,const double eigthresh, Eigen::MatrixXd& par_resid, Eigen::MatrixXd& par_diff,
@@ -2044,7 +2146,7 @@ void UpgradeThread::ensemble_solution(const int iter, const int verbose_level,co
                               Eigen::MatrixXd& obs_err, const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& weights,
                               const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& parcov_inv,
                               const vector<string>& act_obs_names,const vector<string>& act_par_names,double _reg_factor,
-                              double mm_weight_sum)
+                              double mm_weight_sum, PestppOptions::SVD_PACK svd_pack)
 {
     class local_utils
     {
@@ -2107,6 +2209,8 @@ void UpgradeThread::ensemble_solution(const int iter, const int verbose_level,co
 
     local_utils::save_names(verbose_level,thread_id, iter, t_count,"act_obs_names", act_obs_names);
     local_utils::save_names(verbose_level,thread_id, iter, t_count,"act_par_names", act_par_names);
+    if (trap_zero_obs_diff(obs_diff, par_diff, upgrade_1, act_obs_names, act_par_names))
+        return;
 
     stringstream ss;
     if (!use_glm)
@@ -2117,13 +2221,12 @@ void UpgradeThread::ensemble_solution(const int iter, const int verbose_level,co
             obs_err = obs_err.colwise() - obs_err.rowwise().mean();
             obs_err = sqrt(cur_lam) * obs_err;
             Eigen::MatrixXd s0, V0, U0, s0_i;
-            SVD_REDSVD rsvd;
-            rsvd.solve_ip(obs_diff, s0, U0, V0, eigthresh, maxsing);
+            ens_svd(svd_pack, obs_diff, s0, U0, V0, eigthresh, maxsing);
             s0_i = s0.asDiagonal().inverse();
             Eigen::MatrixXd X0 = U0.transpose() * obs_err;
             X0 = s0_i * X0;
             Eigen::MatrixXd s1, V1, U1, s1_2, s1_2i;
-            rsvd.solve_ip(X0, s1, U1, V1, 0, maxsing);
+            ens_svd(svd_pack, X0, s1, U1, V1, 0, maxsing);
 
             s1_2 = s1.cwiseProduct(s1);
             s1_2i = (Eigen::VectorXd::Ones(s1_2.size()) + s1_2).asDiagonal().inverse();
@@ -2148,14 +2251,13 @@ void UpgradeThread::ensemble_solution(const int iter, const int verbose_level,co
             obs_err = obs_err.colwise() - obs_err.rowwise().mean();
 
             Eigen::MatrixXd s2_, s, V, U, cum_sum;
-            SVD_REDSVD rsvd;
             Eigen::MatrixXd C;
             C = obs_diff + (sqrt(cur_lam) * obs_err); // curr_lam is the inflation factor
             local_utils::save_mat(verbose_level, thread_id, iter, t_count, "C", C);
             Eigen::VectorXd s2;
 
 
-            rsvd.solve_ip(C, s, U, V, eigthresh, maxsing);
+            ens_svd(svd_pack, C, s, U, V, eigthresh, maxsing);
             local_utils::save_mat(verbose_level, thread_id, iter, t_count, "s", s);
             local_utils::save_mat(verbose_level, thread_id, iter, t_count, "U", U);
             local_utils::save_mat(verbose_level, thread_id, iter, t_count, "V", V);
@@ -2224,9 +2326,7 @@ void UpgradeThread::ensemble_solution(const int iter, const int verbose_level,co
         else
             par_diff = scale * par_diff;
         local_utils::save_mat(verbose_level, thread_id, iter, t_count, "scaled_par_diff", par_diff);
-        SVD_REDSVD rsvd;
-
-        rsvd.solve_ip(obs_diff, s, Ut, V, eigthresh, maxsing);
+        ens_svd(svd_pack, obs_diff, s, Ut, V, eigthresh, maxsing);
 
         Ut.transposeInPlace();
         //obs_diff.resize(0, 0);
@@ -2325,85 +2425,6 @@ void UpgradeThread::ensemble_solution(const int iter, const int verbose_level,co
         }
     }
 
-}
-
-
-void UpgradeThread::ensemble_solution_prec(const int iter, const int verbose_level, const int maxsing,
-                           const bool use_approx, const double cur_lam, const double eigthresh,
-                           Eigen::MatrixXd& par_resid, Eigen::MatrixXd& par_diff,
-                           const Eigen::SparseMatrix<double>& Q, Eigen::MatrixXd& obs_resid,
-                           Eigen::MatrixXd& obs_diff, Eigen::MatrixXd& upgrade_1,
-                           const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& weights, double _reg_factor)
-{
-    //the glm step of ensemble_solution with the prior written out as a precision Q.
-    //in the existing form the prior enters the hessian as (1+lam) I in the anomaly
-    //subspace and the gradient through Am Am^T = (dM0 dM0^T)^+.  here Q replaces both
-    //at once:
-    //    H = (1+lam) dM^T Q dM + V S^2 V^T          (N x N)
-    //    g = V S U^T r + dM^T Q (m - m0)            (N x N, one column per realization)
-    //    upgrade = -dM H^+ g
-    //with dD = W obs_diff / sqrt(N-1) = U S V^T the same tsvd the existing path takes.
-    //putting Q in the gradient alone would mix two different priors, so it goes in both.
-    //when Q is the untruncated Am Am^T of the same ensemble this reduces to the existing
-    //form exactly - the selftest checks that.
-    //
-    //ies_use_prior_scaling is ignored here on purpose: scaling par_diff by C_sc^-1/2
-    //means Q has to be scaled by C_sc^1/2 on both sides to stay the same prior, and
-    //dM_s^T Q_s dM_s == dM^T Q dM exactly, so the scaling cancels before it can change
-    //anything.  raw anomalies in, raw upgrade out.
-    if ((Q.rows() != par_diff.rows()) || (Q.cols() != par_diff.rows()))
-        throw runtime_error("ensemble_solution_prec(): prior precision not aligned with par_diff");
-    int num_reals = par_resid.cols();
-    double scale = (1.0 / (sqrt(double(num_reals - 1))));
-    obs_resid = weights * obs_resid;
-    obs_diff = scale * (weights * obs_diff);
-    par_diff = scale * par_diff;
-
-    Eigen::MatrixXd s, Ut, V;
-    SVD_REDSVD rsvd;
-    rsvd.solve_ip(obs_diff, s, Ut, V, eigthresh, maxsing);
-    Ut.transposeInPlace();
-    Eigen::MatrixXd s2 = s.cwiseProduct(s);
-
-    //Q dM once, its the big product (p x p sparse times p x N)
-    Eigen::MatrixXd QdM = Q * par_diff;
-    Eigen::MatrixXd H = (1.0 + cur_lam) * (par_diff.transpose() * QdM);
-    H += V * s2.asDiagonal() * V.transpose();
-    Eigen::MatrixXd g = V * (s.asDiagonal() * (Ut * obs_resid));
-    if ((!use_approx) && (iter > 1))
-    {
-        //the prior pull, weighted the same way ensemble_solution weights upgrade_2:
-        //_reg_factor is |ies_reg_factor|, the default 0 means weight 1
-        Eigen::MatrixXd gp = QdM.transpose() * par_resid;
-        if (_reg_factor > 0)
-            g += _reg_factor * gp;
-        else
-            g += gp;
-    }
-
-    //H is singular along the ones vector whenever the anomalies are mean centred
-    //(dM 1 = 0) and can be elsewhere, so pseudo-invert it: keep the eigenvalues that
-    //are above eigthresh times the largest.  N x N, so this is cheap
-    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> esolve(H);
-    if (esolve.info() != Eigen::Success)
-        throw runtime_error("ensemble_solution_prec(): eigen decomposition of the hessian failed");
-    Eigen::VectorXd ev = esolve.eigenvalues();
-    double emax = ev.maxCoeff();
-    Eigen::VectorXd evinv = Eigen::VectorXd::Zero(ev.size());
-    int nkeep = 0;
-    for (int i = 0; i < ev.size(); i++)
-    {
-        if (ev[i] > eigthresh * emax)
-        {
-            evinv[i] = 1.0 / ev[i];
-            nkeep++;
-        }
-    }
-    if (verbose_level > 1)
-        cout << "ensemble_solution_prec: kept " << nkeep << " of " << ev.size() << " hessian eigenvalues, largest " << emax << endl;
-    Eigen::MatrixXd x = -1.0 * (esolve.eigenvectors() * (evinv.asDiagonal() * (esolve.eigenvectors().transpose() * g)));
-    upgrade_1 = par_diff * x;
-    upgrade_1.transposeInPlace();
 }
 
 
@@ -2507,13 +2528,6 @@ void MmUpgradeThread::work(int thread_id, int iter, double cur_lam, bool use_glm
 
     //these locks are used to control (thread-safe) access to the fast look up containers
     unique_lock<mutex> next_guard(next_lock, defer_lock);
-    unique_lock<mutex> obs_diff_guard(obs_diff_lock, defer_lock);
-    unique_lock<mutex> obs_resid_guard(obs_resid_lock, defer_lock);
-    unique_lock<mutex> obs_err_guard(obs_err_lock, defer_lock);
-    unique_lock<mutex> par_diff_guard(par_diff_lock, defer_lock);
-    unique_lock<mutex> par_resid_guard(par_resid_lock, defer_lock);
-    unique_lock<mutex> weight_guard(weight_lock, defer_lock);
-    unique_lock<mutex> parcov_guard(parcov_lock, defer_lock);
     unique_lock<mutex> put_guard(put_lock, defer_lock);
 
     vector<string> pe_real_names,oe_real_names;
@@ -2628,7 +2642,8 @@ void MmUpgradeThread::work(int thread_id, int iter, double cur_lam, bool use_glm
         //Eigen::MatrixXd upgrade_1;
         vector<string> empty_obs_names,empty_par_names;
         UpgradeThread::ensemble_solution(iter,verbose_level,maxsing,thread_id,t_count, use_prior_scaling,use_approx,use_glm_form,cur_lam,eigthresh,par_resid,par_diff,Am,obs_resid,
-                          obs_diff,upgrade_1,obs_err,weights,parcov_inv,empty_obs_names,empty_par_names,reg_factor,mm_weight_sum);
+                          obs_diff,upgrade_1,obs_err,weights,parcov_inv,empty_obs_names,empty_par_names,reg_factor,mm_weight_sum,
+                          pe_upgrade.get_pest_scenario_ptr()->get_pestpp_options().get_svd_pack());
 
 
         //assuming that the fist row is the realization we are after...
@@ -2675,8 +2690,6 @@ MmUpgradeThread::MmUpgradeThread(PerformanceLog* _performance_log, unordered_map
     //random_shuffle(keys.begin(), keys.end());
 
 }
-
-
 
 
 void LocalAnalysisUpgradeThread::work(int thread_id, int iter, double cur_lam, bool use_glm_form,
@@ -2810,18 +2823,7 @@ void LocalAnalysisUpgradeThread::work(int thread_id, int iter, double cur_lam, b
 	string key;
 
 
-	//these locks are used to control (thread-safe) access to the fast look up containers
-	unique_lock<mutex> next_guard(next_lock, defer_lock);
-	unique_lock<mutex> obs_diff_guard(obs_diff_lock, defer_lock);
-	unique_lock<mutex> obs_resid_guard(obs_resid_lock, defer_lock);
-	unique_lock<mutex> obs_err_guard(obs_err_lock, defer_lock);
-	unique_lock<mutex> par_diff_guard(par_diff_lock, defer_lock);
-	unique_lock<mutex> par_resid_guard(par_resid_lock, defer_lock);
-	unique_lock<mutex> loc_guard(loc_lock, defer_lock);
-	unique_lock<mutex> weight_guard(weight_lock, defer_lock);
-	unique_lock<mutex> parcov_guard(parcov_lock, defer_lock);
-	unique_lock<mutex> am_guard(am_lock, defer_lock);
-	unique_lock<mutex> put_guard(put_lock, defer_lock);
+	//the lookup maps are only read during the solve, so their reads take no lock; next_lock hands out the cases
 
 	set<string> sorg_par_names(par_names.begin(),par_names.end());
 	set<string> sorg_obs_names(obs_names.begin(),obs_names.end());
@@ -2834,42 +2836,36 @@ void LocalAnalysisUpgradeThread::work(int thread_id, int iter, double cur_lam, b
 		par_names.clear();
 		obs_names.clear();
 
-		while (true)
+		//take the next case: one atomic increment, no lock.  the case map and the key list are
+		//only read during the solve, so the copies below need no lock either
+		int idx = next_case.fetch_add(1);
+		if (idx >= (int)keys.size())
 		{
-			if (next_guard.try_lock())
+			if (verbose_level > 3)
 			{
-				//if all the pieces have been completed, return
-				if (count == keys.size())
-				{
-					if (verbose_level > 3)
-					{
-						cout << "upgrade thread: " << thread_id << " processed " << pcount << " upgrade parts" << endl;
-					}
-					if (f_thread.good())
-						f_thread.close();
-					return;
-				}
-				key = keys[count];
-				pair<vector<string>, vector<string>> p = cases.at(key);
-				par_names = p.second;
-				obs_names = p.first;
-				// the `if (localizer.get_use()) use_localizer = true;` that was here went with
-				// the variable - nothing read it. get_use() is a plain getter, so dropping the
-				// test changes nothing.
-				if ((count % 1000 == 0) && (count > 0))
-				{
-					ss.str("");
-					ss << "upgrade thread progress: " << count << " of " << total << " parts done";
-					if (verbose_level > 3)
-						cout << ss.str() << endl;
-					performance_log->log_event(ss.str());
-				}
-				count++;
-				t_count = count;
-				pcount++;
-				next_guard.unlock();
-				break;
+				cout << "upgrade thread: " << thread_id << " processed " << pcount << " upgrade parts" << endl;
 			}
+			if (f_thread.good())
+				f_thread.close();
+			return;
+		}
+		key = keys[idx];
+		{
+			const pair<vector<string>, vector<string>>& p = cases.at(key);
+			par_names = p.second;
+			obs_names = p.first;
+		}
+		t_count = idx + 1;
+		pcount++;
+		if ((idx % 1000 == 0) && (idx > 0))
+		{
+			//the performance log is not thread safe, and this is rare: keep a lock just for it
+			lock_guard<mutex> log_guard(next_lock);
+			ss.str("");
+			ss << "upgrade thread progress: " << idx << " of " << total << " parts done";
+			if (verbose_level > 3)
+				cout << ss.str() << endl;
+			performance_log->log_event(ss.str());
 		}
 
 
@@ -2923,13 +2919,13 @@ void LocalAnalysisUpgradeThread::work(int thread_id, int iter, double cur_lam, b
         if ((!use_approx) && (Am.rows() == 0))
         {
             //Am = local_utils::get_matrix_from_map(num_reals, par_names, Am_map).transpose();
-            int am_cols = Am_map[par_names[0]].size();
+            int am_cols = Am_map.at(par_names[0]).size();
             Am.resize(par_names.size(), am_cols);
             Am.setZero();
 
             for (int j = 0; j < par_names.size(); j++)
             {
-                Am.row(j) = Am_map[par_names[j]];
+                Am.row(j) = Am_map.at(par_names[j]);
             }
         }
 
@@ -2960,18 +2956,12 @@ void LocalAnalysisUpgradeThread::work(int thread_id, int iter, double cur_lam, b
                                       Am, obs_resid,obs_diff, upgrade_1,
                                       obs_err, weights,
                                       parcov_inv,
-                                      obs_names,par_names,reg_factor,mm_weight_sum);
+                                      obs_names,par_names,reg_factor,mm_weight_sum,
+                                      pe_upgrade.get_pest_scenario_ptr()->get_pestpp_options().get_svd_pack());
 
 		
-		while (true)
-		{
-			if (put_guard.try_lock())
-			{
-				pe_upgrade.add_2_cols_ip(par_names, upgrade_1);				
-				put_guard.unlock();
-				break;
-			}
-		}
+		//no lock: this thread's case owns these columns (see prepare_writeback)
+		write_local_upgrade(*pe_upgrade.get_eigen_ptr_4_mod(), col_index, par_names, upgrade_1);
 	}
 
 }
@@ -3071,7 +3061,7 @@ vector<string> ViolationDetector::read_nominated(Pest& scenario)
 	return out;
 }
 
-void ViolationDetector::apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals,vector<string> &names)
+void ViolationDetector::apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, const vector<string> &names)
 {
 	if ((lt_obs_names.empty()) && (gt_obs_names.empty()) &&
             (lt_obs_bounds.empty()) && (gt_obs_bounds.empty()) &&
@@ -3090,9 +3080,18 @@ void ViolationDetector::apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::Ma
        (lt_obs_bounds.empty()) && (gt_obs_bounds.empty()) &&
             (double_obs_bounds.empty()))
 		return;
+	//only the obs that have an inequality or a bound need a column - with millions of obs a
+	//lookup of every name here cost about as much as the whole name list, on every call
+	set<string> wanted;
+	for (const auto& iv : lt_vals) wanted.insert(iv.first);
+	for (const auto& iv : gt_vals) wanted.insert(iv.first);
+	for (const auto& iv : lt_obs_bounds) wanted.insert(iv.first);
+	for (const auto& iv : gt_obs_bounds) wanted.insert(iv.first);
+	for (const auto& iv : double_obs_bounds) wanted.insert(iv.first);
 	map<string, int> idxs;
 	for (int i = 0; i < names.size(); i++)
-		idxs[names[i]] = i;
+		if (wanted.find(names[i]) != wanted.end())
+			idxs[names[i]] = i;
 	int idx;
 	double val,val2;
 	Eigen::VectorXd col, scol;
@@ -3359,7 +3358,7 @@ Eigen::MatrixXd L2PhiHandler::get_obs_resid_subset(ObservationEnsemble &oe, bool
     {
         real_names = oe.get_real_names();
     }
-	vector<string> names = oe.get_var_names();
+	const vector<string>& names = oe.get_var_names();
     Eigen::MatrixXd oe_vals = oe.get_eigen(real_names,vector<string>());
 	Eigen::MatrixXd resid = oe_vals - oe_base->get_eigen(real_names, names);
 	if (apply_ineq)
@@ -3611,7 +3610,7 @@ void L2PhiHandler::save_residual_cov(ObservationEnsemble& oe, int iter)
 {
 	Eigen::MatrixXd rmat = get_obs_resid(oe, false); //dont apply ineq constraints
 	ObservationEnsemble res(pest_scenario, oe.get_rand_gen_ptr());
-	res.reserve(oe.get_real_names(), oe_base->get_var_names());
+	res.reserve(oe.get_real_names(), oe_base->get_shared_var_names());
 	res.set_eigen(rmat);
 	pair<Covariance,Covariance> rcovs = res.get_empirical_cov_matrices(file_manager);
 	stringstream ss;
@@ -3868,8 +3867,7 @@ vector<string> L2PhiHandler::detect_simulation_data_conflict(ObservationEnsemble
 
     double smin, smax, omin, omax, smin_stat, smax_stat, omin_stat, omax_stat;
     map<string, int> smap, omap;
-    vector<string> snames = _oe.get_var_names();
-    vector<string> onames = oe_base->get_var_names();
+    const vector<string>& onames = oe_base->get_var_names();
     vector<string> temp = get_lt_obs_names();
     set<string> ineq_lt(temp.begin(), temp.end());
     //set<string>::iterator end = ineq.end();
@@ -3877,8 +3875,11 @@ vector<string> L2PhiHandler::detect_simulation_data_conflict(ObservationEnsemble
     set<string> ineq_gt(temp.begin(), temp.end());
     temp.resize(0);
 
-    for (int i = 0; i < snames.size(); i++) {
-        smap[snames[i]] = i;
+    //smap only needs the weighted obs, not every obs in _oe
+    for (auto& oname : pest_scenario->get_ctl_ordered_nz_obs_names()) {
+        int i = _oe.get_var_index(oname);
+        if (i >= 0)
+            smap[oname] = i;
     }
     for (int i = 0; i < onames.size(); i++) {
         omap[onames[i]] = i;
@@ -4223,8 +4224,6 @@ void L2PhiHandler::report(bool echo, bool group_report)
 }
 
 
-
-
 void L2PhiHandler::write(int iter_num, int total_runs, bool write_group)
 {
 	write_csv(iter_num, total_runs, file_manager->get_ofstream(tag+"phi.actual.csv"), phiType::ACTUAL,oreal_names);
@@ -4334,7 +4333,6 @@ void L2PhiHandler::prepare_lambda_csv(ofstream &csv)
 {
     csv << "iteration,num_reals,current_lambda,current_comp_mean_phi,current_comp_std_phi,lambda_scale_fac,lambda,comp_mean_phi,comp_std_phi" << endl;
 }
-
 
 
 vector<int> L2PhiHandler::get_idxs_greater_than(double bad_phi, double bad_phi_sigma, ObservationEnsemble &oe, ObservationEnsemble& weights)
@@ -4547,8 +4545,6 @@ map<string,map<string,double>> L2PhiHandler::get_meas_phi_weight_ensemble(Observ
 }
 
 
-
-
 map<string, Eigen::VectorXd> L2PhiHandler::calc_meas(ObservationEnsemble & oe, Eigen::VectorXd &q_vec)
 {
 	map<string, Eigen::VectorXd> phi_map;
@@ -4694,12 +4690,11 @@ vector<string> L2PhiHandler::get_violating_realizations(ObservationEnsemble& oe,
 }
 
 
-void L2PhiHandler::apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, vector<string> &names)
+void L2PhiHandler::apply_ineq_constraints(Eigen::MatrixXd &resid, Eigen::MatrixXd &sim_vals, const vector<string> &names)
 {
 	// forwards: phi's inequality treatment and the violation test are the same code
 	ineq.apply_ineq_constraints(resid, sim_vals, names);
 }
-
 
 
 map<string, Eigen::VectorXd> L2PhiHandler::calc_actual(ObservationEnsemble & oe, Eigen::VectorXd &q_vec)
@@ -5542,10 +5537,63 @@ void EnsembleMethod::sanity_checks()
     {
         errors.push_back("multimodal alpha > 1.0");
     }
+    if (!ppo->get_ies_reinflate_multimodal_alpha().empty())
+    {
+        for (auto a : ppo->get_ies_reinflate_multimodal_alpha())
+        {
+            if ((a < 0.0) || (a > 1.0))
+                errors.push_back("ies_reinflate_multimodal_alpha entry " + to_string(a) + " must be in [0,1]");
+        }
+        if (ppo->get_ies_multimodal_alpha() > 0.0)
+            warnings.push_back("ies_reinflate_multimodal_alpha is set, so ies_multimodal_alpha is ignored");
+        if (ppo->get_ies_reinflate_multimodal_alpha().size() > 1)
+        {
+            bool reinflating = false;
+            for (auto n : ppo->get_ies_n_iter_reinflate())
+                if (n != 0) reinflating = true;
+            if (!reinflating)
+                warnings.push_back("ies_reinflate_multimodal_alpha has more than one entry but reinflation is off (ies_n_iter_reinflate = 0), only the first entry will be used");
+        }
+    }
     // if (ppo->get_ies_multimodal_alpha() < 0.001)
     // {
     //     errors.push_back("multimodal alpha < 0.001");
     // }
+
+    {
+        bool any_sn = false;
+        for (auto f : ppo->get_ies_reinflate_structnoise_frac())
+        {
+            // a negative entry means recapture the residuals at that reinflation, with abs(f)
+            // as the fraction
+            if (abs(f) > 1.0)
+                warnings.push_back("ies_reinflate_structnoise_frac entry " + to_string(f) + " magnitude > 1.0, more structural noise than the residuals carry...user beware!");
+            if (f != 0.0)
+                any_sn = true;
+        }
+        bool reinflating = false;
+        for (auto n : ppo->get_ies_n_iter_reinflate())
+            if (n != 0) reinflating = true;
+        if ((any_sn) && (!reinflating))
+            warnings.push_back("ies_reinflate_structnoise_frac nonzero but reinflation is off (ies_n_iter_reinflate = 0), no structural noise will be added");
+        if ((ppo->get_ies_structnoise_em()) && (!any_sn))
+            warnings.push_back("ies_structnoise_em is true but every ies_reinflate_structnoise_frac entry is 0.0, nothing will be done");
+        if ((ppo->get_ies_structnoise_em()) && (any_sn) && (ppo->get_ies_no_noise()))
+            warnings.push_back("ies_structnoise_em with ies_no_noise: the user's noise is zero, so the em excess is the whole residual variance (the same as without em)");
+        if ((ppo->get_ies_structnoise_deweight()) && (!any_sn))
+            warnings.push_back("ies_structnoise_deweight is true but every ies_reinflate_structnoise_frac entry is 0.0, weights will not be changed");
+        if ((any_sn) && (ppo->get_ies_phi_fractions_file().size() > 0))
+            warnings.push_back("ies_phi_factor_file with ies_reinflate_structnoise_frac: the phi factors are applied to the prior weights only, "
+                               "never again at a reinflation (that would count the structure twice). the structural de-weighting starts from the phi-factor weights");
+        if ((any_sn) && (ppo->get_ies_structnoise_deweight()))
+        {
+            bool esmda = ppo->get_ies_use_mda();
+            for (auto& sv : ppo->get_ies_reinflate_solver())
+                if (sv == "esmda") esmda = true;
+            if (esmda)
+                warnings.push_back("ies_structnoise_deweight has no effect on the esmda solve, which doesnt use the weights - only the structural noise draws reach it");
+        }
+    }
 
     for (auto& fac : ppo->get_ies_reinflate_factor())
     {
@@ -5611,7 +5659,6 @@ bool EnsembleMethod::should_terminate(int current_n_iter_mean)
 	int count = 0;
 	int nphired = 0;
 	//best_mean_phis = vector<double>{ 1.0,0.8,0.81,0.755,1.1,0.75,0.75,1.2 };
-
 
 
 	/*if ((!consec_sat )&& (best_mean_phis.size() == 0))
@@ -6069,7 +6116,7 @@ int EnsembleMethod::initialize_prepare(int cycle, bool run, bool use_existing)
 				message(1, "calculating mean parameter values");
 				Parameters pars = pest_scenario.get_ctl_parameters();
 				pars.update(pe.get_var_names(), pe.get_mean_stl_var_vector());
-				_pe.reserve(vector<string>(), pe.get_var_names());
+				_pe.reserve(vector<string>(), pe.get_shared_var_names());
 				_pe.set_trans_status(pe.get_trans_status());
 				_pe.append("mean", pars);
 			}
@@ -6210,7 +6257,6 @@ int EnsembleMethod::initialize_prepare(int cycle, bool run, bool use_existing)
 		}
 
 
-
 		return 0;
 	}
 
@@ -6279,27 +6325,6 @@ int EnsembleMethod::initialize_prepare(int cycle, bool run, bool use_existing)
 		ofstream& frec = file_manager.rec_ofstream();
 		use_localizer = localizer.initialize(performance_log, frec, forgive_missing);
 	}
-	if (ppo->get_ies_use_prior_prec())
-	{
-		//the precision form only exists for the plain, global glm solve so far
-		if (use_localizer)
-			throw_em_error("ies_use_prior_prec is not supported with localization");
-		if (ppo->get_ies_multimodal_alpha() > 0.0)
-			throw_em_error("ies_use_prior_prec is not supported with the multimodal solve (ies_multimodal_alpha)");
-		if (any_mda_solve())
-			throw_em_error("ies_use_prior_prec needs the glm form, not esmda (ies_use_mda / ies_reinflate_solver)");
-		bool enif = ppo->get_ies_use_enif();
-		for (auto& sol : ppo->get_ies_reinflate_solver())
-			if (sol == "enif") enif = true;
-		if (enif)
-			throw_em_error("ies_use_prior_prec is an ies option, it doesnt apply to the enif solve (ies_use_enif / ies_reinflate_solver)");
-		if ((ppo->get_ies_use_empirical_prior()) && (ppo->get_ies_enif_graph().empty()))
-			throw_em_error("ies_use_prior_prec with no ies_enif_graph needs parcov, which ies_use_empirical_prior turns off");
-		if (ppo->get_ies_enif_graph().empty())
-			message(1, "ies_use_prior_prec: prior precision will be the inverse of parcov");
-		else
-			message(1, "ies_use_prior_prec: prior precision will be estimated on graph " + ppo->get_ies_enif_graph() + " from the prior ensemble");
-	}
 	if (!use_localizer)
 		message(1, "not using localization");
 	else
@@ -6314,6 +6339,13 @@ int EnsembleMethod::initialize_prepare(int cycle, bool run, bool use_existing)
 			message(1, "using localization matrix " + localizer.get_filename());
 			localizer.report(file_manager.rec_ofstream());
 		}
+	}
+	{
+		PestppOptions::SVD_PACK pk = pest_scenario.get_pestpp_options().get_svd_pack();
+		ss.str("");
+		ss << "using svd package '" << ((pk == PestppOptions::BDCSVD) ? "bdcsvd" : ((pk == PestppOptions::EIGEN) ? "eigen" : "redsvd"))
+		   << "' for the ensemble solve (++svd_pack)";
+		message(1, ss.str());
 	}
 	if ((use_localizer) && (!localizer.get_autoadaloc()))
 	{
@@ -6833,7 +6865,7 @@ int EnsembleMethod::initialize_prepare(int cycle, bool run, bool use_existing)
         ParamTransformSeq pts = pe.get_par_transform();
 
         ParameterEnsemble _pe(&pest_scenario, &rand_gen);
-        _pe.reserve(vector<string>(), pe.get_var_names());
+        _pe.reserve(vector<string>(), pe.get_shared_var_names());
         _pe.set_trans_status(pe.get_trans_status());
 
         if (rname != "mean") {
@@ -6851,7 +6883,7 @@ int EnsembleMethod::initialize_prepare(int cycle, bool run, bool use_existing)
         pe_base = _pe;
         pe_base.reorder(vector<string>(), act_par_names);
         ObservationEnsemble _oe(&pest_scenario, &rand_gen);
-        _oe.reserve(vector<string>(), oe_base.get_var_names());
+        _oe.reserve(vector<string>(), oe_base.get_shared_var_names());
         _oe.reserve(vector<string>(), pest_scenario.get_ctl_ordered_obs_names());
         _oe.append(org_rname, pest_scenario.get_ctl_observations());
         oe_base = _oe;
@@ -7031,8 +7063,6 @@ int EnsembleMethod::initialize_prepare(int cycle, bool run, bool use_existing)
 		}
 		message(1, "saved initial truncated parameter ensemble to ", ss.str());
 	}
-
-
 
 
     //ok, now run the prior ensemble - after checking for center_on
@@ -7682,8 +7712,6 @@ void EnsembleMethod::check_and_fill_phi_factors(map<string,vector<string>>& grou
             }
 
 
-
-
         }
         //now we need to somehow align the rows of the phi factor table with the realization names
         //first check if they are full coincident
@@ -7819,29 +7847,39 @@ void EnsembleMethod::adjust_weights(bool save) {
     }
 
     if (save) {
-        ss.str("");
-        ss << file_manager.get_base_filename() << "." << iter;
-        if (pest_scenario.get_pestpp_options().get_save_dense()) {
-            ss << ".adjusted.weights" << dense_file_ext;
-            weights.to_dense(ss.str());
-        } else if (pest_scenario.get_pestpp_options().get_save_binary()) {
-            ss << ".adjusted.weights.jcb";
-            weights.to_binary(ss.str());
-        } else {
-            ss << ".adjusted.weights.csv";
-            weights.to_csv(ss.str());
-        }
-        message(1, "saved adjusted weight ensemble to ", ss.str());
-
-        map<string, double> base_weights = weights.get_real_map(BASE_REAL_NAME, true);
-        ss.str("");
-        ss << file_manager.get_base_filename()  << "." << iter << ".adjusted.obs_data.csv";
-        ofstream f_obs(ss.str());
-        if (f_obs.bad())
-            throw_em_error("error opening: " + ss.str());
-        output_file_writer.scenario_obs_csv(f_obs, base_weights);
-        f_obs.close();
+        save_adjusted_weights();
     }
+}
+
+/**
+ * @brief Save the current weight ensemble and obs data as case.N.adjusted.weights / .obs_data.csv.
+ *
+ * used by the phi factor adjustment and by the structural noise de-weighting
+ */
+void EnsembleMethod::save_adjusted_weights()
+{
+    stringstream ss;
+    ss << file_manager.get_base_filename() << "." << iter;
+    if (pest_scenario.get_pestpp_options().get_save_dense()) {
+        ss << ".adjusted.weights" << dense_file_ext;
+        weights.to_dense(ss.str());
+    } else if (pest_scenario.get_pestpp_options().get_save_binary()) {
+        ss << ".adjusted.weights.jcb";
+        weights.to_binary(ss.str());
+    } else {
+        ss << ".adjusted.weights.csv";
+        weights.to_csv(ss.str());
+    }
+    message(1, "saved adjusted weight ensemble to ", ss.str());
+
+    map<string, double> base_weights = weights.get_real_map(BASE_REAL_NAME, true);
+    ss.str("");
+    ss << file_manager.get_base_filename()  << "." << iter << ".adjusted.obs_data.csv";
+    ofstream f_obs(ss.str());
+    if (f_obs.bad())
+        throw_em_error("error opening: " + ss.str());
+    output_file_writer.scenario_obs_csv(f_obs, base_weights);
+    f_obs.close();
 }
 
 
@@ -8716,8 +8754,6 @@ UpgradeStatus EnsembleMethod::prepare_upgrades(UpgradeContext& ctx, bool use_mda
 	{
 		ctx.Am = get_Am(pe.get_real_names(), pe.get_var_names());
 	}
-	if ((pest_scenario.get_pestpp_options().get_ies_use_prior_prec()) && (!prior_prec_ready))
-		initialize_prior_prec();
 
 	// choose the subset by position as before, then remember it by name
 	vector<int> _subset_idxs = get_subset_idxs(pe.shape().first, ctx.local_subset_size);
@@ -8748,9 +8784,7 @@ void EnsembleMethod::generate_upgrades(UpgradeContext& ctx, bool use_mda,
 	ObservationEnsemble oe_upgrade(oe.get_pest_scenario_ptr(), &rand_gen, oe.get_eigen(vector<string>(), act_obs_names, false), oe.get_real_names(), act_obs_names);
     EnsembleSolver es(performance_log, file_manager, pest_scenario, pe, oe_upgrade, oe_base, weights, localizer, parcov, ctx.Am, ph,
 		use_localizer, iter, act_par_names, act_obs_names, get_reg_factor());
-    if (pest_scenario.get_pestpp_options().get_ies_use_prior_prec())
-        es.set_prior_prec(&prior_prec);
-    double mm_alpha = pest_scenario.get_pestpp_options().get_ies_multimodal_alpha();
+    double mm_alpha = get_multimodal_alpha();
     if (mm_alpha > 0.0)
     {
         es.update_multimodal_components(mm_alpha);
@@ -8784,7 +8818,7 @@ void EnsembleMethod::generate_upgrades(UpgradeContext& ctx, bool use_mda,
 		else if (use_enif_solve())
         {
             message(1,"ensemble information filter solve for inflation factor ",cur_lam);
-            es.solve_enif(cur_lam, pe_upgrade);
+            es.solve_enif(cur_lam, pe_upgrade, ctx.loc_map);
         }
 		else{
             es.solve(get_num_threads(), cur_lam, !use_mda, pe_upgrade, ctx.loc_map);
@@ -9496,7 +9530,6 @@ UpgradeStatus EnsembleMethod::accept_or_reject(UpgradeContext& ctx, bool use_mda
 		last_best_lam = new_lam;
 
 
-
 	}
 
 	return UpgradeStatus::ACCEPTED;
@@ -9583,6 +9616,15 @@ ReinflationSchedule::ReinflationSchedule(Pest& pest_scenario)
 	reinflate_solver = pest_scenario.get_pestpp_options().get_ies_reinflate_solver();
 	if (reinflate_solver.size() > 0)
 		current_solver = reinflate_solver[0];
+	// multimodal alpha is walked the same way
+	reinflate_mm_alpha = pest_scenario.get_pestpp_options().get_ies_reinflate_multimodal_alpha();
+	if (reinflate_mm_alpha.size() > 0)
+		current_mm_alpha = reinflate_mm_alpha[0];
+	// structural noise fraction is walked like factor: entry 0 is used at the first
+	// reinflation, entry 1 at the second, last entry held
+	reinflate_sn_frac = pest_scenario.get_pestpp_options().get_ies_reinflate_structnoise_frac();
+	if (reinflate_sn_frac.size() > 0)
+		current_sn_frac = reinflate_sn_frac[0];
 }
 
 /**
@@ -9603,6 +9645,10 @@ void ReinflationSchedule::advance()
 		current_num_reals = reinflate_num_reals[idx + 1];
 	if ((int)reinflate_solver.size() > idx)
 		current_solver = reinflate_solver[idx];
+	if ((int)reinflate_mm_alpha.size() > idx)
+		current_mm_alpha = reinflate_mm_alpha[idx];
+	if ((int)reinflate_sn_frac.size() > idx)
+		current_sn_frac = reinflate_sn_frac[idx];
 }
 
 /**
@@ -9644,7 +9690,7 @@ void EnsembleMethod::end_iteration(int cycle)
 }
 
 void EnsembleMethod::reinflate_par_ensemble(double reinflate_factor,int reinflate_num_reals,
-                                            int center_on_min_phi){
+                                            int center_on_min_phi, double structnoise_frac){
 
     // negative == defer to ies_n_iter_reinflate, which is what the shipped loop passes
     bool use_min_phi_real = (center_on_min_phi < 0) ? get_reinflate_to_minphi_real()
@@ -9776,12 +9822,25 @@ void EnsembleMethod::reinflate_par_ensemble(double reinflate_factor,int reinflat
     ss << "iteration:" << iter;
     vector<int> temp;
     ofstream& frec = file_manager.rec_ofstream();
-    oe.reserve(oebase_real_names,oe.get_var_names());
+    // with structural noise in play, report the ensemble as it stands - the noise and weights
+    // it was fitted with - before they are reset, so it can be set against the reinflation
+    // phi report after
+    if ((structnoise_frac != 0.0) || (sn_captured))
+    {
+        ph.update(oe, pe, weights);
+        message(0, "phi report before the reinflation noise and weight reset:");
+        ph.report(true);
+    }
+    // the residuals come from oe, so this has to happen before oe is reset below
+    apply_structural_noise(structnoise_frac);
+    oe.reserve(oebase_real_names,oe.get_shared_var_names());
     weights = weights_base;
     for (auto& oname : oe.get_var_names())
     {
         pest_scenario.get_observation_info_ptr()->get_observation_rec_ptr_4_mod(oname)->weight = org_obs_info.get_weight(oname);
     }
+    // after the restore just above, so it always starts from the user's weights
+    apply_structural_deweight(structnoise_frac);
     run_ensemble_util(performance_log,frec,new_pe,oe,run_mgr_ptr,false,temp,NetPackage::NULL_DA_CYCLE, ss.str());
     pe = new_pe;
     new_pe = ParameterEnsemble();
@@ -9806,6 +9865,339 @@ void EnsembleMethod::reinflate_par_ensemble(double reinflate_factor,int reinflat
     message(1,"iter = ies_n_iter_reinflate, resetting lambda to ",last_best_lam);
     consec_bad_lambda_cycles = 0;
 
+}
+
+/**
+ * @brief Add structural noise from the irreducible residuals to the noise realizations.
+ *
+ * at the first call with frac != 0, the actual residuals of the current ensemble are captured
+ * (observed minus simulated, active nz obs, not centred - the shared part is the bias that
+ * should become variance), along with a copy of the user's noise and one column of standard
+ * normals per noise realization.  a positive frac after that reuses what was captured; a
+ * negative frac recaptures the residuals (and draws new coefficients) from the ensemble as it
+ * stands, with abs(frac) as the fraction.  the copy of the user's noise is only ever taken at
+ * the first capture, so the user's noise stays the floor whatever the schedule.
+ *
+ * every call then rebuilds oe_base from the user's noise:
+ *   S       = coef^T R / sqrt(Ne)              (one row per realization, plain combinations)
+ *   oe_base = user noise + sqrt(frac) * S       (base realization skipped)
+ * and clamps to the obs bounds.  the draws' covariance is R^T R / Ne.  since the coefficients
+ * are zero mean the targets spread symmetrically around the observed values, and since each
+ * obs only combines its own residuals the units drop out - no sigma or weight scaling.
+ *
+ * frac == 0 before anything was captured does nothing at all (no random numbers are used),
+ * so a run with every entry 0 is unchanged.  frac == 0 after the capture puts the user's
+ * noise back for that cycle.
+ */
+void EnsembleMethod::apply_structural_noise(double frac)
+{
+    // a negative frac means recapture the residuals here and use abs(frac) as the fraction
+    bool recapture = (frac < 0.0) && (sn_captured);
+    frac = abs(frac);
+    if ((frac == 0.0) && (!sn_captured))
+        return;
+    ofstream& frec = file_manager.rec_ofstream();
+    vector<string> rnames = oe_base.get_real_names();
+    vector<string> vnames = oe_base.get_var_names();
+    Eigen::MatrixXd* reals = oe_base.get_eigen_ptr_4_mod();
+    int ne;
+    if ((!sn_captured) || (recapture))
+    {
+        message(0, recapture ? "recapturing irreducible residuals for structural noise" :
+                               "capturing irreducible residuals for structural noise");
+        performance_log->log_event("capturing irreducible residuals for structural noise");
+        // get_actual_obs_resid() is simulated minus observed over oe_base's obs (the active
+        // nz obs), with satisfied inequality obs at zero.  flip it to observed minus simulated
+        sn_resid = -1.0 * ph.get_actual_obs_resid(oe);
+        sn_obs_names = vnames;
+        ne = sn_resid.rows();
+        if (ne < 2)
+            throw_em_error("structural noise: need at least 2 realizations to capture residuals");
+        sn_s2 = sn_resid.array().square().colwise().sum().transpose() / static_cast<double>(ne);
+        // the user's noise only at the first capture: at a recapture oe_base already carries
+        // the last structural draws, and the user's noise has to stay the floor
+        if (!sn_captured)
+        {
+            sn_meas.clear();
+            for (int i = 0; i < rnames.size(); i++)
+                sn_meas[rnames[i]] = reals->row(i).transpose();
+            sn_meas_names = vnames;
+        }
+        // new coefficients every capture, since the number of realizations in R can change
+        sn_coef.clear();
+        for (auto& rname : rnames)
+        {
+            if (rname == BASE_REAL_NAME)
+                continue;
+            Eigen::VectorXd c(ne);
+            for (int j = 0; j < ne; j++)
+                c[j] = draw_standard_normal(rand_gen);
+            sn_coef[rname] = c;
+        }
+        sn_captured = true;
+        frec << "...structural noise: " << (recapture ? "recaptured" : "captured") << " residuals of " << ne << " realizations and "
+             << sn_obs_names.size() << " observations" << endl;
+        frec << "...structural noise: mean irreducible residual variance over observations: "
+             << sn_s2.mean() << ", max: " << sn_s2.maxCoeff() << endl;
+        frec << "...structural noise: note the measured phi will jump from here on, since the" << endl;
+        frec << "   noisy targets now carry the structural draws as well as the measurement noise" << endl;
+
+        // the variance the correction is built on.  by default the captured residual variance
+        // as is.  with ies_structnoise_em, the em excess over the user's noise:
+        //   var = max(0, s2 - sig2)
+        // where sig2 is the mean square of the user's noise draws for that obs (taken from the
+        // noise realizations, never the weights, so weights and noise stay separate).  the
+        // draws are then scaled per obs so their variance is var instead of s2
+        sn_var = sn_s2;
+        sn_scale.resize(0);
+        if (pest_scenario.get_pestpp_options().get_ies_structnoise_em())
+            set_structural_em_variance();
+    }
+    ne = sn_resid.rows();
+    double sfac = sqrt(max(frac, 0.0) / static_cast<double>(ne));
+    message(1, "structural noise fraction for this reinflation:", frac);
+    frec << "...structural noise: fraction " << frac << " applied to " << rnames.size()
+         << " noise realizations (residuals " << ne << " x " << sn_obs_names.size() << ")" << endl;
+
+    // line up the columns by name, since oe_base can lose obs after the capture
+    map<string, int> rcol, mcol;
+    for (int k = 0; k < sn_obs_names.size(); k++)
+        rcol[sn_obs_names[k]] = k;
+    for (int k = 0; k < sn_meas_names.size(); k++)
+        mcol[sn_meas_names[k]] = k;
+    vector<int> meas_idx(vnames.size(), -1), r_idx(vnames.size(), -1);
+    for (int j = 0; j < vnames.size(); j++)
+    {
+        if (auto it = mcol.find(vnames[j]); it != mcol.end())
+            meas_idx[j] = it->second;
+        if (auto it = rcol.find(vnames[j]); it != rcol.end())
+            r_idx[j] = it->second;
+    }
+
+    int nnew = 0;
+    for (int i = 0; i < rnames.size(); i++)
+    {
+        const string& rname = rnames[i];
+        // start from the user's noise every time, so nothing piles up
+        auto mit = sn_meas.find(rname);
+        if (mit == sn_meas.end())
+            mit = sn_meas.emplace(rname, reals->row(i).transpose()).first;
+        for (int j = 0; j < vnames.size(); j++)
+            if (meas_idx[j] >= 0)
+                (*reals)(i, j) = mit->second[meas_idx[j]];
+        if ((rname == BASE_REAL_NAME) || (frac <= 0.0))
+            continue;
+        // realizations that turn up after the capture get their own new coefficients
+        auto cit = sn_coef.find(rname);
+        if (cit == sn_coef.end())
+        {
+            Eigen::VectorXd c(ne);
+            for (int j = 0; j < ne; j++)
+                c[j] = draw_standard_normal(rand_gen);
+            cit = sn_coef.emplace(rname, c).first;
+            nnew++;
+        }
+        Eigen::RowVectorXd srow = sfac * (cit->second.transpose() * sn_resid);
+        if (sn_scale.size() > 0)
+            srow.array() *= sn_scale.transpose().array();
+        for (int j = 0; j < vnames.size(); j++)
+            if (r_idx[j] >= 0)
+                (*reals)(i, j) += srow[r_idx[j]];
+    }
+    if (nnew > 0)
+        frec << "...structural noise: drew coefficients for " << nnew << " new realizations" << endl;
+    // rebuilt from scratch above, so the clamp never stacks
+    int nclamp = oe_base.enforce_obs_bounds(frec, false, sn_obs_names);
+    if (nclamp > 0)
+        message(1, "structural noise: values clamped to obs bounds:", nclamp);
+
+    // save the rebuilt noise realizations so they can be checked against case.obs+noise
+    stringstream ss;
+    ss << file_manager.get_base_filename() << "." << iter;
+    if (pest_scenario.get_pestpp_options().get_save_dense())
+    {
+        ss << ".obs+noise" << dense_file_ext;
+        oe_base.to_dense(ss.str());
+    }
+    else if (pest_scenario.get_pestpp_options().get_save_binary())
+    {
+        ss << ".obs+noise.jcb";
+        oe_base.to_binary(ss.str());
+    }
+    else
+    {
+        ss << ".obs+noise.csv";
+        oe_base.to_csv(ss.str());
+    }
+    message(1, "saved obs+noise ensemble with structural noise to ", ss.str());
+}
+
+/**
+ * @brief The em base variance for the structural noise (ies_structnoise_em).
+ *
+ * called at each capture.  for each captured obs, sig2 is the mean square of the user's noise
+ * draws (the copy in sn_meas, minus obsval, base realization left out) and the em m-step for a
+ * level per obs, with the obs's own residual variance as the shape, is
+ *   var = max(0, s2 - sig2)
+ * the excess of the misfit over the user's noise.  sig2 comes from the noise realizations and
+ * not from the weights, so a user whose weights and noise differ on purpose keeps that.  one
+ * capture gives about (1 - p_eff/n) of the true structure; recapturing at each reinflation
+ * (negative entries) is what iterates it toward the em fixed point.
+ */
+void EnsembleMethod::set_structural_em_variance()
+{
+    ofstream& frec = file_manager.rec_ofstream();
+    Observations ctl_obs = pest_scenario.get_ctl_observations();
+    map<string, int> mcol;
+    for (int k = 0; k < sn_meas_names.size(); k++)
+        mcol[sn_meas_names[k]] = k;
+    int nobs = sn_obs_names.size();
+    sn_sig2 = Eigen::VectorXd::Zero(nobs);
+    int nnoise = 0;
+    double d;
+    for (auto& m : sn_meas)
+    {
+        if (m.first == BASE_REAL_NAME)
+            continue;
+        nnoise++;
+        for (int k = 0; k < nobs; k++)
+        {
+            auto it = mcol.find(sn_obs_names[k]);
+            if (it == mcol.end())
+                continue;
+            d = m.second[it->second] - ctl_obs.get_rec(sn_obs_names[k]);
+            sn_sig2[k] += d * d;
+        }
+    }
+    if (nnoise > 0)
+        sn_sig2 /= static_cast<double>(nnoise);
+    sn_var = (sn_s2 - sn_sig2).cwiseMax(0.0);
+    sn_scale.resize(nobs);
+    for (int k = 0; k < nobs; k++)
+        sn_scale[k] = (sn_s2[k] > 0.0) ? sqrt(sn_var[k] / sn_s2[k]) : 0.0;
+
+    // per group: mean s2, mean sig2, mean excess, and how many obs have no excess at all
+    map<string, double> g_s2, g_sig2, g_var;
+    map<string, int> g_n, g_zero;
+    for (int k = 0; k < nobs; k++)
+    {
+        string g = org_obs_info.get_group(sn_obs_names[k]);
+        g_s2[g] += sn_s2[k];
+        g_sig2[g] += sn_sig2[k];
+        g_var[g] += sn_var[k];
+        g_n[g]++;
+        if (sn_var[k] <= 0.0)
+            g_zero[g]++;
+    }
+    message(1, "structural noise: em excess over the user's noise computed from realizations: ", nnoise);
+    frec << "...structural noise em: base variance is max(0, s2 - sig2), sig2 from the user's noise draws" << endl;
+    frec << "      " << setw(20) << left << "group" << right << setw(8) << "nobs" << setw(14) << "mean s2"
+         << setw(14) << "mean sig2" << setw(14) << "mean excess" << setw(10) << "no excess" << endl;
+    for (auto& gn : g_n)
+    {
+        const string& g = gn.first;
+        frec << "      " << setw(20) << left << g << right << setw(8) << gn.second
+             << setw(14) << g_s2[g] / gn.second << setw(14) << g_sig2[g] / gn.second
+             << setw(14) << g_var[g] / gn.second << setw(10) << g_zero[g] << endl;
+    }
+}
+
+/**
+ * @brief Lower each obs weight by its irreducible residual variance (ies_structnoise_deweight).
+ *
+ * called right after reinflation has put the weight ensemble back to weights_base and the
+ * control file weights back to org_obs_info, so it always starts from the user's weights and
+ * nothing accumulates.  row by row, each realization from its own original weight:
+ *   w' = 1 / sqrt( w^-2 + frac * s2 )
+ * where s2 is the mean over realizations of the captured R^2 for that obs (or, with
+ * ies_structnoise_em, its excess over the user's noise, sn_var).  w' <= w always,
+ * w' == w where s2 or frac is 0, and zero weights stay zero.  nothing goes to the solver - it
+ * just sees an ordinary weight ensemble.  this is the diagonal version: each obs is discounted
+ * by its own variance, not along the shapes of the residuals across obs.
+ */
+void EnsembleMethod::apply_structural_deweight(double frac)
+{
+    if (!pest_scenario.get_pestpp_options().get_ies_structnoise_deweight())
+        return;
+    // the sign only says whether the residuals were recaptured
+    frac = abs(frac);
+    if ((!sn_captured) || (frac == 0.0))
+    {
+        if (sn_captured)
+            message(1, "structural noise fraction is 0, using the user's weights for this cycle");
+        return;
+    }
+    ofstream& frec = file_manager.rec_ofstream();
+    message(1, "lowering weights by the irreducible residual variance, fraction:", frac);
+    map<string, double> s2_map;
+    for (int k = 0; k < sn_obs_names.size(); k++)
+        s2_map[sn_obs_names[k]] = sn_var[k];
+
+    // the weight ensemble, row by row from its own originals
+    vector<string> wnames = weights.get_var_names();
+    Eigen::MatrixXd* w = weights.get_eigen_ptr_4_mod();
+    // per group: sum, count, min and max of w'/w over the weight ensemble, and how many obs
+    // had their control file weight cut by more than half
+    map<string, double> g_sum, g_min, g_max;
+    map<string, int> g_count, g_nobs, g_halved;
+    double wv, wn, ratio;
+    for (int j = 0; j < wnames.size(); j++)
+    {
+        auto it = s2_map.find(wnames[j]);
+        if (it == s2_map.end())
+            continue;
+        string g = org_obs_info.get_group(wnames[j]);
+        if (g_count.find(g) == g_count.end())
+        {
+            g_sum[g] = 0.0; g_count[g] = 0; g_nobs[g] = 0; g_halved[g] = 0;
+            g_min[g] = numeric_limits<double>::max();
+            g_max[g] = numeric_limits<double>::lowest();
+        }
+        g_nobs[g]++;
+        for (int i = 0; i < w->rows(); i++)
+        {
+            wv = (*w)(i, j);
+            if (wv <= 0.0)
+                continue;
+            // s2 = 0 leaves the weight exactly as it was (1/sqrt(w^-2) is not bit-exact)
+            wn = (it->second > 0.0) ? 1.0 / sqrt((1.0 / (wv * wv)) + (frac * it->second)) : wv;
+            (*w)(i, j) = wn;
+            ratio = wn / wv;
+            g_sum[g] += ratio;
+            g_count[g]++;
+            g_min[g] = min(g_min[g], ratio);
+            g_max[g] = max(g_max[g], ratio);
+        }
+    }
+
+    // the control file weights, the same way, from org_obs_info
+    ObservationInfo* oi = pest_scenario.get_observation_info_ptr();
+    for (auto& s2 : s2_map)
+    {
+        wv = org_obs_info.get_weight(s2.first);
+        if ((wv <= 0.0) || (s2.second <= 0.0))
+            continue;
+        wn = 1.0 / sqrt((1.0 / (wv * wv)) + (frac * s2.second));
+        oi->get_observation_rec_ptr_4_mod(s2.first)->weight = wn;
+        if (wn / wv < 0.5)
+            g_halved[org_obs_info.get_group(s2.first)]++;
+    }
+
+    frec << "...structural noise de-weighting: fraction " << frac << ", weight ratio w'/w by group" << endl;
+    frec << "      (mean/min/max over the weight ensemble, obs cut by more than half in the control file weights)" << endl;
+    frec << "      " << setw(20) << left << "group" << right << setw(8) << "nobs" << setw(12) << "mean"
+         << setw(12) << "min" << setw(12) << "max" << setw(10) << "halved" << endl;
+    for (auto& gc : g_count)
+    {
+        const string& g = gc.first;
+        frec << "      " << setw(20) << left << g << right << setw(8) << g_nobs[g];
+        if (gc.second > 0)
+            frec << setw(12) << g_sum[g] / gc.second << setw(12) << g_min[g] << setw(12) << g_max[g];
+        else
+            frec << setw(12) << "-" << setw(12) << "-" << setw(12) << "-";
+        frec << setw(10) << g_halved[g] << endl;
+    }
+    save_adjusted_weights();
 }
 
 void EnsembleMethod::remove_external_pe_filenames(vector<string>& pe_filenames)
@@ -10278,7 +10670,7 @@ bool EnsembleMethod::initialize_weights()
             wvec[i] = 0.0;
         }
         message(1, "setting weights ensemble to zeros - no non-zero weighted obs found");
-        weights.reserve(oe_base.get_real_names(), oe_base.get_var_names());
+        weights.reserve(oe_base.get_real_names(), oe_base.get_shared_var_names());
         weights.get_eigen_ptr_4_mod()->setZero();
         for (int i = 0; i < weights.shape().first; i++) {
             weights.get_eigen_ptr_4_mod()->row(i) = wvec;
@@ -10351,6 +10743,16 @@ bool EnsembleMethod::initialize_weights()
 		{
 			ss << "unrecognized weights ensemble extension " << obs_ext << ", looking for csv, jcb, jco, or bin";
 			throw_em_error(ss.str());
+		}
+		// same check as the par and noise ensembles get in initialize(): two rows with one
+		// name (e.g. two 'base' realizations) would otherwise go through quietly
+		try
+		{
+			weights.check_for_dups();
+		}
+		catch (const exception& e)
+		{
+			throw_em_error("error in weight ensemble: " + string(e.what()));
 		}
 		//make sure all oe realizations are in weights
 		vector<string> missing, keep, real_names = oe_base.get_real_names();
@@ -10535,6 +10937,16 @@ void EnsembleMethod::initialize_restart()
 		ss << "unrecognized restart obs ensemble extension " << obs_ext << ", looking for csv, jcb, jco, bin";
 		throw_em_error(ss.str());
 	}
+	// same check as the par and noise ensembles get in initialize(): two rows with one
+	// name (e.g. two 'base' realizations) would otherwise go through quietly
+	try
+	{
+		oe.check_for_dups();
+	}
+	catch (const exception& e)
+	{
+		throw_em_error("error in restart obs ensemble: " + string(e.what()));
+	}
 	if (par_restart_csv.size() > 0)
 	{
 		string par_ext = pest_utils::lower_cp(par_restart_csv).substr(par_restart_csv.size() - 3, par_restart_csv.size());
@@ -10576,6 +10988,16 @@ void EnsembleMethod::initialize_restart()
 		{
 			ss << "unrecognized restart par ensemble extension " << par_ext << ", looking for csv, jcb, jco, or bin";
 			throw_em_error(ss.str());
+		}
+		// same check as the par and noise ensembles get in initialize(): two rows with one
+		// name (e.g. two 'base' realizations) would otherwise go through quietly
+		try
+		{
+			pe.check_for_dups();
+		}
+		catch (const exception& e)
+		{
+			throw_em_error("error in restart par ensemble: " + string(e.what()));
 		}
 		if (pe.shape().first != oe.shape().first)
 		{
@@ -10902,6 +11324,9 @@ void EnsembleMethod::initialize_obscov()
 		{
 			oi->set_weight(cov_names[i], min(1.0 / sqrt(diag[i]), oi->get_weight(cov_names[i])));
 		}
+		// reinflation puts the control file weights back from org_obs_info, so it has to
+		// see this reset - otherwise the first reinflation undoes it
+		org_obs_info = pest_scenario.get_ctl_observation_info_copy();
 	}
 	else 
 		obscov = obscov.get(act_obs_names);
@@ -10944,6 +11369,21 @@ void EnsembleMethod::zero_weight_obs(vector<string>& obs_to_zero_weight, bool up
 			weights.get_eigen_ptr_4_mod()->col(weight_var_map.at(n)).setZero();
 		}
 	}
+	// reinflation puts the weights back from weights_base and org_obs_info, so zero these
+	// there too - otherwise the first reinflation gives them their weight back
+	if (weights_base.shape().first > 0)
+	{
+		// the var map is a cache and weights_base's is not kept current, so rebuild it first
+		weights_base.update_var_map();
+		map<string, int> base_var_map = weights_base.get_var_map();
+		for (auto n : obs_to_zero_weight)
+		{
+			if (base_var_map.find(n) != base_var_map.end())
+				weights_base.get_eigen_ptr_4_mod()->col(base_var_map.at(n)).setZero();
+		}
+	}
+	for (auto n : obs_to_zero_weight)
+		org_obs_info.set_weight(n, 0.0);
     act_obs_names = pest_scenario.get_ctl_ordered_nz_obs_names();
 	stringstream ss;
 	ss << "number of non-zero weighted observations reduced from " << org_nnz_obs;
@@ -11188,86 +11628,14 @@ Eigen::MatrixXd EnsembleMethod::get_Am(const vector<string>& real_names, const v
 	}
 
 	Eigen::MatrixXd ivec, upgrade_1, s, V, U, st;
-	SVD_REDSVD rsvd;
-	//SVD_EIGEN rsvd;
-	rsvd.set_performance_log(performance_log);
-
-	rsvd.solve_ip(par_diff, s, U, V, pest_scenario.get_svd_info().eigthresh, pest_scenario.get_svd_info().maxsing);
+	ens_svd(pest_scenario.get_pestpp_options().get_svd_pack(), par_diff, s, U, V, pest_scenario.get_svd_info().eigthresh,
+		pest_scenario.get_svd_info().maxsing, performance_log);
 	par_diff.resize(0, 0);
 	Eigen::MatrixXd temp = s.asDiagonal().inverse();
 	Eigen::MatrixXd Am = U * temp;
 	return Am;
 }
 
-
-void EnsembleMethod::initialize_prior_prec()
-{
-	//ies_use_prior_prec: build Q once.  two sources: a conditional-independence graph
-	//(ies_enif_graph), in which case Q is the sparse precision estimated on it from the
-	//PRIOR ensemble the same way solve_enif does it, or the supplied parcov, inverted.
-	//either way Q is anchored on the prior and never re-estimated - a partly collapsed
-	//ensemble would shrink the prior term as the run goes on
-	stringstream ss;
-	ofstream& frec = file_manager.rec_ofstream();
-	string gname = pest_scenario.get_pestpp_options().get_ies_enif_graph();
-	int p = (int)act_par_names.size();
-	if (gname.size() > 0)
-	{
-		performance_log->log_event("ies_use_prior_prec: estimating the prior precision on the graph");
-		EnifGraph graph;
-		graph.from_file(gname, act_par_names, frec, pest_scenario.get_pestpp_options().get_ies_enif_order());
-		//solve_enif recovers the prior as x - e; pe_base is that same prior, so use it directly.
-		//mean centred, not center_on, to match solve_enif
-		vector<string> real_names = pe.get_real_names();
-		double scale = (1.0 / (sqrt(double(real_names.size() - 1))));
-		Eigen::MatrixXd A0 = pe_base.get_eigen_anomalies(real_names, act_par_names, string());
-		A0.transposeInPlace();
-		A0 *= scale;
-		graph.estimate_precision(A0, pest_scenario.get_pestpp_options().get_ies_enif_shrink(), frec);
-		prior_prec = graph.precision();
-		ss << "ies_use_prior_prec: prior precision estimated on graph '" << gname << "' from the prior ensemble ("
-		   << real_names.size() << " realizations), " << prior_prec.nonZeros() << " non-zeros";
-	}
-	else
-	{
-		performance_log->log_event("ies_use_prior_prec: inverting parcov");
-		if (parcov.get_row_names() != act_par_names)
-			throw_em_error("ies_use_prior_prec: parcov not aligned with the adjustable parameter names");
-		if (parcov.isdiagonal())
-		{
-			Eigen::VectorXd d = parcov.e_ptr()->diagonal();
-			vector<Eigen::Triplet<double>> trips;
-			trips.reserve(p);
-			for (int i = 0; i < p; i++)
-			{
-				if (d[i] <= 0.0)
-					throw_em_error("ies_use_prior_prec: parcov has a non-positive variance for " + act_par_names[i]);
-				trips.push_back(Eigen::Triplet<double>(i, i, 1.0 / d[i]));
-			}
-			prior_prec.resize(p, p);
-			prior_prec.setFromTriplets(trips.begin(), trips.end());
-			ss << "ies_use_prior_prec: prior precision is the inverse of the diagonal parcov";
-			if (pest_scenario.get_pestpp_options().get_parcov_filename().empty())
-				ss << " built from parameter bounds (no parcov_filename) - Q carries no correlation, "
-				   << "so this is the same as the ensemble pseudo-inverse only in the diagonal directions";
-		}
-		else
-		{
-			Eigen::MatrixXd C = parcov.e_ptr()->toDense();
-			Eigen::LDLT<Eigen::MatrixXd> ldlt(C);
-			if ((ldlt.info() != Eigen::Success) || (!ldlt.isPositive()))
-				throw_em_error("ies_use_prior_prec: parcov is not positive definite, cant invert it");
-			Eigen::MatrixXd Qd = ldlt.solve(Eigen::MatrixXd::Identity(p, p));
-			//the solve is only symmetric to roundoff and the eigen solver downstream wants it exact
-			Qd = 0.5 * (Qd + Qd.transpose());
-			prior_prec = Qd.sparseView();
-			ss << "ies_use_prior_prec: prior precision is the dense inverse of parcov (" << p << " x " << p << ")";
-		}
-	}
-	prior_prec.makeCompressed();
-	message(1, ss.str());
-	prior_prec_ready = true;
-}
 
 void EnsembleMethod::drop_bad_reals(ParameterEnsemble& _pe, ObservationEnsemble& _oe, vector<int> subset_idxs)
 {

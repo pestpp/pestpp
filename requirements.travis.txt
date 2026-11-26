@@ -1,5 +1,0 @@
-matplotlib
-pyproj
-pyshp
-pandas
-numpy

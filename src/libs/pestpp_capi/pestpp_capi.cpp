@@ -23,6 +23,7 @@
 #include <iostream>
 #include <cstdio>
 #include <cstddef>
+#include <cmath>
 #if defined(_WIN32)
 // Deliberately no descriptor macros here. The windows redirect swaps cout's streambuf and must
 // never call _dup2/_close on fd 1: under the static CRT this library has a private descriptor
@@ -1057,6 +1058,52 @@ struct OptAdapter : public ToolAdapter
     const char* name() const override { return "opt"; }
 };
 
+/** the tool-free handle: PESTPP_MODEL. there is no tool here, only the control file's model
+ * interface, which pestpp_run_model() drives directly. every tool call refuses, and says so -
+ * the base queue_runs/process_runs dereference par_ensemble(), so those two have to be
+ * overridden or a stray call is a segfault in the host process.
+ */
+struct ModelAdapter : public ToolAdapter
+{
+    Pest& scen;
+    explicit ModelAdapter(Pest& p) : scen(p) {}
+
+    [[noreturn]] static void no_tool(const string& what)
+    {
+        unsupported("this is a model handle (PESTPP_MODEL): there is no tool to " + what +
+                    " - pestpp_run_model() is what it is for");
+    }
+
+    Pest& scenario() override { return scen; }
+
+    void initialize() override { no_tool("initialize"); }
+    int  initialize_prepare() override { no_tool("initialize"); }
+    void initialize_finish() override { no_tool("initialize"); }
+
+    map<string, int> queue_runs(PerformanceLog*, ofstream&, RunManagerAbstract*) override
+    { no_tool("queue runs for"); }
+    vector<int> process_runs(PerformanceLog*, ofstream&, RunManagerAbstract*,
+                             map<string, int>&) override
+    { no_tool("process runs for"); }
+
+    pestpp_status advance() override { no_tool("iterate"); }
+    void finalize() override { no_tool("finalize"); }
+    int  iteration() override { no_tool("report an iteration for"); }
+    bool should_terminate() override { no_tool("terminate"); }
+
+    Ensemble* ensemble(int) override { return nullptr; }
+    ParameterEnsemble* par_ensemble() override { return nullptr; }
+    ObservationEnsemble* obs_ensemble() override { return nullptr; }
+
+    void phi_summary(int, double&, double&, double&, double&) override { no_tool("compute phi for"); }
+    void phi_vector(int, vector<string>&, vector<double>&) override { no_tool("compute phi for"); }
+    void phi_residuals(int, vector<string>&, vector<string>&, vector<double>&) override
+    { no_tool("compute phi for"); }
+    void update_phi() override { no_tool("compute phi for"); }
+
+    const char* name() const override { return "model"; }
+};
+
 /** glm: initialize -> solve_iteration -> finalize, carrying ONE parameter set, not an ensemble.
  *
  * The other four tools all propagate a population. glm does not: it holds a single ModelRun,
@@ -1424,7 +1471,7 @@ pestpp_status pestpp_create(const pestpp_create_options* opts, pestpp_handle* ou
         s->working_dir = (working_dir == nullptr) ? string() : string(working_dir);
         ScopedWorkingDir swd(s->working_dir);
 
-        PestppOptions::ToolType tool_type;
+        PestppOptions::ToolType tool_type = PestppOptions::ToolType::IES;
         switch (s->tool)
         {
         case PESTPP_IES: tool_type = PestppOptions::ToolType::IES; break;
@@ -1433,6 +1480,13 @@ pestpp_status pestpp_create(const pestpp_create_options* opts, pestpp_handle* ou
         case PESTPP_SQP: tool_type = PestppOptions::ToolType::SQP; break;
         case PESTPP_GLM: tool_type = PestppOptions::ToolType::GLM; break;
         case PESTPP_OPT: tool_type = PestppOptions::ToolType::OPT; break;
+        case PESTPP_MODEL:
+            // the model runs here, in this process - there is nothing for a panther master
+            // or an external driver to do
+            if (rm_type != PESTPP_RM_SERIAL)
+                bad_arg("a PESTPP_MODEL handle runs the model locally; it takes the serial "
+                        "run manager only");
+            break;
         default: bad_arg("unknown tool id");
         }
 
@@ -1482,7 +1536,9 @@ pestpp_status pestpp_create(const pestpp_create_options* opts, pestpp_handle* ou
         s->output_file_writer.reset(new OutputFileWriter(*s->file_manager, *s->pest_scenario, false));
         s->output_file_writer->scenario_report(fout_rec, false);
 
-        s->pest_scenario->get_pestpp_options_ptr()->apply_tool_defaults(tool_type, fout_rec);
+        // no tool, no tool defaults
+        if (s->tool != PESTPP_MODEL)
+            s->pest_scenario->get_pestpp_options_ptr()->apply_tool_defaults(tool_type, fout_rec);
 
         const ModelExecInfo& exi = s->pest_scenario->get_model_exec_info();
         const PestppOptions& opt = s->pest_scenario->get_pestpp_options();
@@ -1575,6 +1631,10 @@ pestpp_status pestpp_create(const pestpp_create_options* opts, pestpp_handle* ou
         case PESTPP_SQP: s->adapter.reset(new SqpAdapter(scen, fm, ofw, pl, rm)); break;
         case PESTPP_GLM: s->adapter.reset(new GlmAdapter(scen, fm, ofw, pl, rm)); break;
         case PESTPP_OPT: s->adapter.reset(new OptAdapter(scen, fm, ofw, pl, rm)); break;
+        // the serial run manager above is kept even though pestpp_run_model() never uses it:
+        // the run-management calls reach for s->run_manager directly, and an empty one answers
+        // them harmlessly where a null one would crash
+        case PESTPP_MODEL: s->adapter.reset(new ModelAdapter(scen)); break;
         default: bad_arg("unknown tool id");
         }
     }
@@ -3307,7 +3367,7 @@ pestpp_status pestpp_set_obs_weights(pestpp_handle h, const char* names,
 }
 
 pestpp_status pestpp_reinflate_ensemble(pestpp_handle h, double factor, int num_reals,
-                                        int center_on_min_phi)
+                                        int center_on_min_phi, double structnoise_frac)
 {
     CAPI_BEGIN(h)
         EnsembleMethod* em = s->adapter->ensemble_method();
@@ -3341,7 +3401,9 @@ pestpp_status pestpp_reinflate_ensemble(pestpp_handle h, double factor, int num_
         if ((center_on_min_phi < -1) || (center_on_min_phi > 1))
             bad_arg("center_on_min_phi must be -1 (follow 'ies_n_iter_reinflate'), 0 (the "
                     "ensemble mean) or 1 (the minimum-phi realization)");
-        em->reinflate_par_ensemble(factor, num_reals, center_on_min_phi);
+        if (!std::isfinite(structnoise_frac))
+            bad_arg("structnoise_frac must be a finite number");
+        em->reinflate_par_ensemble(factor, num_reals, center_on_min_phi, structnoise_frac);
         return PESTPP_OK;
     CAPI_END()
 }
@@ -3633,6 +3695,119 @@ pestpp_status pestpp_set_run_failed(pestpp_handle h, int run_id)
             bad_state("a batch is open; service runs yourself OR drive the run manager over "
                       "them, not both");
         s->run_manager->update_run_failed(run_id);
+        return PESTPP_OK;
+    CAPI_END()
+}
+
+pestpp_status pestpp_run_model(pestpp_handle h, const double* pars, int npars,
+                               const char* par_names, double* obs, int max_nobs,
+                               char* obs_names, int obs_names_len, int* nobs)
+{
+    CAPI_BEGIN(h)
+        if (s->tool != PESTPP_MODEL)
+            unsupported(string("pestpp_run_model needs a PESTPP_MODEL handle; this one is '") +
+                        s->adapter->name() + "', which runs the model through its run manager");
+        if (npars < 0)
+            bad_arg("npars must be zero or more");
+        if ((npars > 0) && ((pars == nullptr) || (par_names == nullptr)))
+            bad_arg("pestpp_run_model needs values and names when npars > 0");
+
+        Pest& scen = *s->pest_scenario;
+        const vector<string>& onames = scen.get_ctl_ordered_obs_names();
+        if (nobs != nullptr)
+            *nobs = (int)onames.size();
+        if (obs_names != nullptr)
+        {
+            int n = (int)onames.size();
+            pestpp_status st = pack_names(onames, obs_names, obs_names_len, &n);
+            if (st != PESTPP_OK)
+                return st;
+        }
+        // the sizing call: nothing to put results in, so nothing is run
+        if (obs == nullptr)
+            return PESTPP_OK;
+        if (max_nobs < (int)onames.size())
+            too_small("observation buffer too small; call with obs=NULL to size it first");
+
+        // start from the control file and overwrite by name, so a partial vector is fine
+        Parameters ctl_pars = scen.get_ctl_parameters();
+        const ParameterInfo& pinfo = scen.get_ctl_parameter_info();
+        vector<string> in_names = unpack_names(par_names, npars);
+        vector<string> bad;
+        for (int i = 0; i < npars; i++)
+        {
+            string nm = in_names[i];
+            pest_utils::upper_ip(nm);
+            in_names[i] = nm;
+            if (ctl_pars.find(nm) == ctl_pars.end())
+                bad_arg("pestpp_run_model: '" + nm + "' is not a parameter in the control file");
+            const ParameterRec* rec = pinfo.get_parameter_rec_ptr(nm);
+            if ((rec->tranform_type == ParameterRec::TRAN_TYPE::LOG) && (pars[i] <= 0.0))
+                bad.push_back(nm + "=" + to_string(pars[i]));
+            ctl_pars.update_rec(nm, pars[i]);
+        }
+        if (!bad.empty())
+        {
+            stringstream ss;
+            ss << "pestpp_run_model: log-transformed parameters need values above zero, "
+               << "otherwise they reach the model as nan:";
+            for (auto& b : bad)
+                ss << " " << b;
+            bad_arg(ss.str());
+        }
+
+        // the same road a run manager's parameters take: drop to the active set and back, which
+        // is where tied parameters follow their parents and fixed ones get their control-file
+        // values back, then scale and offset on the way to the model
+        const ParamTransformSeq& pts = scen.get_base_par_tran_seq();
+        Parameters final_ctl = ctl_pars;
+        pts.ctl2active_ctl_ip(final_ctl);
+        pts.active_ctl2ctl_ip(final_ctl);
+        // a fixed or tied value that would be replaced is refused rather than quietly dropped.
+        // the same value back is fine, so a full vector out of the control file still works
+        for (int i = 0; i < npars; i++)
+        {
+            const ParameterRec* rec = pinfo.get_parameter_rec_ptr(in_names[i]);
+            if ((rec->tranform_type != ParameterRec::TRAN_TYPE::FIXED) &&
+                (rec->tranform_type != ParameterRec::TRAN_TYPE::TIED))
+                continue;
+            double used = final_ctl.get_rec(in_names[i]);
+            if (abs(used - pars[i]) > 1.0e-10 * max(1.0, abs(used)))
+                bad.push_back(in_names[i] + " (" +
+                    ((rec->tranform_type == ParameterRec::TRAN_TYPE::FIXED) ? "fixed" : "tied") +
+                    ", passed " + to_string(pars[i]) + ", would run " + to_string(used) + ")");
+        }
+        if (!bad.empty())
+        {
+            stringstream ss;
+            ss << "pestpp_run_model: fixed and tied parameters cannot be set - fixed ones always "
+               << "run their control-file value and tied ones follow their parent:";
+            for (auto& b : bad)
+                ss << " " << b;
+            bad_arg(ss.str());
+        }
+        Parameters model_pars = pts.ctl2model_cp(final_ctl);
+
+        // built fresh each call, so an option changed with pestpp_set_option() since the last
+        // one is picked up. the settings are the ones the serial run manager uses
+        const ModelExecInfo& exi = scen.get_model_exec_info();
+        const PestppOptions& opt = scen.get_pestpp_options();
+        ModelInterface mi(exi.tplfile_vec, exi.inpfile_vec, exi.insfile_vec, exi.outfile_vec,
+                          exi.comline_vec);
+        mi.set_additional_ins_delimiters(opt.get_additional_ins_delimiters());
+        mi.set_fill_tpl_zeros(opt.get_fill_tpl_zeros());
+        mi.set_num_threads(opt.get_num_tpl_ins_threads());
+        mi.set_tpl_force_decimal(opt.get_tpl_force_decimal());
+        mi.set_sleep_ms(5);
+        mi.set_should_echo(opt.get_panther_echo());
+
+        // starts out holding the control file's observations because read_output_files()
+        // checks what the instruction files read against the names already in here
+        Observations sim_obs = scen.get_ctl_observations();
+        mi.run(&model_pars, &sim_obs);
+
+        for (size_t i = 0; i < onames.size(); i++)
+            obs[i] = sim_obs.get_rec(onames[i]);
         return PESTPP_OK;
     CAPI_END()
 }

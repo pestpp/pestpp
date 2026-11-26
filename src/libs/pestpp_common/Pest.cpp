@@ -165,7 +165,7 @@ void Pest::check_inputs(ostream &f_rec, bool forgive, bool forgive_parchglim, in
         prec = ctl_parameter_info.get_parameter_rec_ptr(pname);
         tran = prec->tranform_type;
         adj_par = true;
-        if ((tran == tranfixed) || (tran == tranfixed))
+        if ((tran == tranfixed) || (tran == trantied))
             adj_par = false;
         if (tran == trantied) {
             string partied = tied_map.at(pname).first;
@@ -864,7 +864,7 @@ int Pest::process_ctl_file(ifstream& fin, string _pst_filename, ofstream& f_rec)
 				efile.keep_cols(efile_keep_cols);
 				// [] default-constructs the vector for a new section, so the find-and-seed
 				// was doing nothing but a second lookup
-				efiles_map[section].push_back(efile);
+				efiles_map[section].push_back(std::move(efile));
  
 			}
 			else if (section == "PARAMETER GROUPS")
@@ -979,7 +979,7 @@ int Pest::process_ctl_file(ifstream& fin, string _pst_filename, ofstream& f_rec)
 				efile.keep_cols(efile_keep_cols);
 				// [] default-constructs the vector for a new section, so the find-and-seed
 				// was doing nothing but a second lookup
-				efiles_map[section].push_back(efile);
+				efiles_map[section].push_back(std::move(efile));
 	
 			}
 			else if (section == "OBSERVATION GROUPS")
@@ -1012,7 +1012,7 @@ int Pest::process_ctl_file(ifstream& fin, string _pst_filename, ofstream& f_rec)
 				efile.keep_cols(efile_keep_cols);
 				// [] default-constructs the vector for a new section, so the find-and-seed
 				// was doing nothing but a second lookup
-				efiles_map[section].push_back(efile);
+				efiles_map[section].push_back(std::move(efile));
 			}
 
 			else if (section == "OBSERVATION DATA")
@@ -1023,7 +1023,14 @@ int Pest::process_ctl_file(ifstream& fin, string _pst_filename, ofstream& f_rec)
 			else if (section == "OBSERVATION DATA EXTERNAL")
 			{
 				
-				pest_utils::ExternalCtlFile efile(line);		
+				pest_utils::ExternalCtlFile efile(line);
+				//only keep the columns pest++ uses - the standard ones (either naming) and the
+				//efile_keep_cols ones. holding every column of a millions-of-obs file costs a
+				//lot of memory for nothing
+				set<string> read_cols(efile_keep_cols.begin(), efile_keep_cols.end());
+				read_cols.insert(obs_formal_names.begin(), obs_formal_names.end());
+				read_cols.insert(obs_easy_names.begin(), obs_easy_names.end());
+				efile.set_read_cols(read_cols);
 				efile.read_file(f_rec);
 					
 				vector<string> get_names;
@@ -1067,7 +1074,7 @@ int Pest::process_ctl_file(ifstream& fin, string _pst_filename, ofstream& f_rec)
 				efile.keep_cols(efile_keep_cols);
 				// [] default-constructs the vector for a new section, so the find-and-seed
 				// was doing nothing but a second lookup
-				efiles_map[section].push_back(efile);
+				efiles_map[section].push_back(std::move(efile));
 			}
 
 			else if (section == "PRIOR INFORMATION")
@@ -1101,7 +1108,7 @@ int Pest::process_ctl_file(ifstream& fin, string _pst_filename, ofstream& f_rec)
 				efile.keep_cols(efile_keep_cols);
 				// [] default-constructs the vector for a new section, so the find-and-seed
 				// was doing nothing but a second lookup
-				efiles_map[section].push_back(efile);	
+				efiles_map[section].push_back(std::move(efile));	
 			}
 
 		
@@ -1157,7 +1164,7 @@ int Pest::process_ctl_file(ifstream& fin, string _pst_filename, ofstream& f_rec)
 				efile.keep_cols(efile_keep_cols);
 				// [] default-constructs the vector for a new section, so the find-and-seed
 				// was doing nothing but a second lookup
-				efiles_map[section].push_back(efile);	
+				efiles_map[section].push_back(std::move(efile));	
 			
 			}
 
@@ -1209,7 +1216,7 @@ int Pest::process_ctl_file(ifstream& fin, string _pst_filename, ofstream& f_rec)
 				efile.keep_cols(efile_keep_cols);
 				// [] default-constructs the vector for a new section, so the find-and-seed
 				// was doing nothing but a second lookup
-				efiles_map[section].push_back(efile);
+				efiles_map[section].push_back(std::move(efile));
 			
 			}
 			else if (section == "MODEL INPUT/OUTPUT")

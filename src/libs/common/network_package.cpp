@@ -363,7 +363,7 @@ pair<int,string>  NetPackage::recv(int sockfd)
 			for (int i = 0; i < sizeof(security_code); i++)
 			{
 				temp = int(rcv_security_code[i]);
-				ss << rcv_security_code[i] << "," << temp << "; ";
+				ss << temp << "; ";
 			}
 			//cerr << endl;
 			n = -2;
@@ -400,7 +400,7 @@ pair<int,string>  NetPackage::recv(int sockfd)
 					corrupt_desc = true;
 					n = -2;
 					ss.str("");
-					ss << "non - ascii char in header buffer at position " << i << ": " << header_buf[i_start + i];
+					ss << "non - ascii char in header buffer at position " << i << ", character code: " << int(header_buf[i_start + i]);
 					return pair<int,string> (n,ss.str());
 				}
 				else

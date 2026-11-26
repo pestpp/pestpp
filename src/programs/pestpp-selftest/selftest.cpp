@@ -17,10 +17,16 @@
 #include <iostream>
 #include <csignal>
 #include <random>
+#include <atomic>
+#include <thread>
 #include <sstream>
 #include <fstream>
 #include <limits>
 #include <filesystem>
+#include <functional>
+#include "../../libs/pestpp_common/Localizer.h"
+#include "../../libs/pestpp_common/SVDPackage.h"
+#include "../../libs/run_managers/yamr/RunManagerPanther.h"
 #include "config_os.h"
 #include "pest_data_structs.h"
 #include "Pest.h"
@@ -30,6 +36,7 @@
 #include "constraints.h"
 #include "EnsembleView.h"
 #include "EnsembleMethodUtils.h"
+#include "EnsembleSmoother.h"
 #include "MOEA.h"
 #include "SQP.h"
 #include "model_interface.h"
@@ -39,6 +46,9 @@
 #include "SVDSolver.h"
 #include "SVDPackage.h"
 #include "Regularization.h"
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 using namespace std;
 using PO = PestppOptions;
@@ -55,6 +65,75 @@ struct IesProbe : public EnsembleMethod
     bool p_reinflate_minphi() const { return get_reinflate_to_minphi_real(); }
     vector<int> p_resolve(const vector<string>& n, const vector<string>& cur) const
     { return resolve_subset_idxs(n, cur); }
+};
+
+// the weight ensemble an ies run is actually using, read straight out of the object
+struct IesWeightProbe : public IterEnsembleSmoother
+{
+    using IterEnsembleSmoother::IterEnsembleSmoother;
+    // smallest and largest value in one observation's column of the weight ensemble
+    pair<double, double> ens_weight(const string& oname)
+    {
+        map<string, int> vmap = weights.get_var_map();
+        auto col = weights.get_eigen_ptr()->col(vmap.at(oname));
+        return make_pair(col.minCoeff(), col.maxCoeff());
+    }
+    // the same for the copy reinflation restores the weight ensemble from
+    pair<double, double> base_weight(const string& oname)
+    {
+        weights_base.update_var_map();
+        map<string, int> vmap = weights_base.get_var_map();
+        auto col = weights_base.get_eigen_ptr()->col(vmap.at(oname));
+        return make_pair(col.minCoeff(), col.maxCoeff());
+    }
+};
+
+// the structural noise state an ies run holds, read straight out of the object
+struct StructNoiseProbe : public IterEnsembleSmoother
+{
+    using IterEnsembleSmoother::IterEnsembleSmoother;
+    ObservationEnsemble& noise() { return oe_base; }
+    ObservationEnsemble& sim() { return oe; }
+    bool captured() const { return sn_captured; }
+    const Eigen::MatrixXd& resid() const { return sn_resid; }
+    const vector<string>& resid_obs() const { return sn_obs_names; }
+    const map<string, Eigen::VectorXd>& coef() const { return sn_coef; }
+    const Eigen::VectorXd& s2() const { return sn_s2; }
+    const Eigen::VectorXd& var() const { return sn_var; }
+    const Eigen::VectorXd& sig2() const { return sn_sig2; }
+    ObservationEnsemble& wts() { return weights; }
+    ObservationEnsemble& wts_base() { return weights_base; }
+    ObservationInfo& org_info() { return org_obs_info; }
+    int cur_iter() const { return iter; }
+    // the ies loop bumps the iteration count before each reinflation; a test calling
+    // reinflate_par_ensemble() directly has to do the same or every save lands on one name
+    void bump_iter() { iter++; }
+};
+
+// a run manager that runs the "model" in the test itself, so a whole ies startup can be
+// driven without an executable, template or instruction file
+struct InProcessRunManager : public RunManagerAbstract
+{
+    std::function<void(Parameters&, Observations&)> model;
+    InProcessRunManager(const string& rns_name, std::function<void(Parameters&, Observations&)> _model)
+        : RunManagerAbstract(vector<string>(), vector<string>(), vector<string>(), vector<string>(),
+                             vector<string>(), rns_name, 1), model(_model) {}
+    void run() override
+    {
+        const vector<string>& obs_names = file_stor.get_obs_name_vec();
+        int n = 0;
+        for (int id : get_outstanding_run_ids())
+        {
+            Parameters pars;
+            file_stor.get_parameters(id, pars);
+            Observations obs;
+            obs.insert(obs_names, vector<double>(obs_names.size(), 0.0));
+            model(pars, obs);
+            file_stor.update_run(id, pars, obs);
+            n++;
+        }
+        total_runs += n;
+    }
 };
 
 struct MouProbe : public MOEA
@@ -266,6 +345,1183 @@ static void test_ies_reinflate_reset()
     o.set_option("IES_REINFLATE_FACTOR", "0.7");
     CHK((o.get_ies_reinflate_factor() == vector<double>{0.7}), "reinflate_factor reset post-init took effect");
     CHK(o.get_init_only_change_warnings().empty(), "live reinflation reset post-init: no warning");
+}
+
+static void test_reinflate_multimodal_alpha_schedule()
+{
+    cout << "[ies_reinflate_multimodal_alpha: one alpha per reinflation cycle, last one held]" << endl;
+    Pest p; p.set_defaults();
+    PestppOptions* o = p.get_pestpp_options_ptr();
+    CHK(o->get_ies_reinflate_multimodal_alpha().empty(), "default is empty (ies_multimodal_alpha decides)");
+    CHK(!o->is_init_only("IES_REINFLATE_MULTIMODAL_ALPHA"), "the schedule is live, like the other reinflation lists");
+
+    // not given: the schedule hands back a negative alpha, which the solve reads as "use
+    // ies_multimodal_alpha"
+    {
+        ReinflationSchedule rs(p);
+        CHK(rs.get_multimodal_alpha() < 0.0, "no schedule: alpha is negative before any reinflation");
+        rs.advance();
+        CHK(rs.get_multimodal_alpha() < 0.0, "no schedule: still negative after a reinflation");
+    }
+
+    // walked like ies_reinflate_solver: entry 0 until the first reinflation, then entry 1,
+    // and the last entry held once the list runs out.  0 turns the multimodal solve off
+    o->set_option("IES_N_ITER_REINFLATE", "2");
+    o->set_option("IES_REINFLATE_MULTIMODAL_ALPHA", "0.0,0.25,1.0");
+    CHK((o->get_ies_reinflate_multimodal_alpha() == vector<double>{0.0, 0.25, 1.0}), "list parsed in order");
+    {
+        ReinflationSchedule rs(p);
+        CHK(rs.get_multimodal_alpha() == 0.0, "cycle 0 uses entry 0 (multimodal off)");
+        rs.advance();
+        CHK(rs.get_multimodal_alpha() == 0.25, "cycle 1 uses entry 1");
+        rs.advance();
+        CHK(rs.get_multimodal_alpha() == 1.0, "cycle 2 uses entry 2");
+        rs.advance();
+        CHK(rs.get_multimodal_alpha() == 1.0, "the last entry is held once the list runs out");
+        CHK(rs.get_n_iter() == 2, "the other lists still walk as before");
+    }
+}
+
+static void test_reinflate_structnoise_frac_schedule()
+{
+    cout << "[ies_reinflate_structnoise_frac: one fraction per reinflation, last one held]" << endl;
+    Pest p; p.set_defaults();
+    PestppOptions* o = p.get_pestpp_options_ptr();
+    CHK((o->get_ies_reinflate_structnoise_frac() == vector<double>{0.0}), "default is {0.0} (off)");
+    CHK(!o->get_ies_structnoise_deweight(), "deweight defaults to false");
+    CHK(!o->is_init_only("IES_REINFLATE_STRUCTNOISE_FRAC"), "the schedule is live, like the other reinflation lists");
+    {
+        ReinflationSchedule rs(p);
+        CHK(rs.get_structnoise_frac() == 0.0, "default: frac 0 at the first reinflation");
+        rs.advance();
+        CHK(rs.get_structnoise_frac() == 0.0, "default: still 0 after a reinflation");
+    }
+
+    // walked like ies_reinflate_factor: entry 0 is used at the first reinflation, entry 1 at
+    // the second, last entry held
+    o->set_option("IES_N_ITER_REINFLATE", "2");
+    o->set_option("IES_REINFLATE_STRUCTNOISE_FRAC", "0.1,1.0");
+    CHK((o->get_ies_reinflate_structnoise_frac() == vector<double>{0.1, 1.0}), "list parsed in order");
+    o->set_option("IES_STRUCTNOISE_DEWEIGHT", "true");
+    CHK(o->get_ies_structnoise_deweight(), "deweight set");
+    {
+        ReinflationSchedule rs(p);
+        CHK(rs.get_structnoise_frac() == 0.1, "first reinflation uses entry 0");
+        rs.advance();
+        CHK(rs.get_structnoise_frac() == 1.0, "second reinflation uses entry 1");
+        rs.advance();
+        CHK(rs.get_structnoise_frac() == 1.0, "the last entry is held once the list runs out");
+        CHK(rs.get_n_iter() == 2, "the other lists still walk as before");
+    }
+}
+
+static void test_structnoise_draws()
+{
+    cout << "[structural noise: capture, draws, rebuild and bound clamp at reinflation]" << endl;
+    // two pars, and obs the model cannot fit: o1 = p1 observed at 0, o2 = p1 observed at 2,
+    // so whatever p1 is, the pair carries an irreducible residual.  o3 = p2 at 0.5 is
+    // fittable.  o4 = p1 observed at 0.05 with a lower_bound of 0, so the structural draws
+    // around it go negative and get clamped
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p1);
+        obs.update_rec("O3", p2);
+        obs.update_rec("O4", p1);
+    };
+    string name = "selftest_structnoise";
+    {
+        ofstream f(name + ".obs_data.csv");
+        f << "obsnme,obsval,weight,obgnme,lower_bound" << endl
+          << "o1,0.0,10.0,g1," << endl
+          << "o2,2.0,10.0,g1," << endl
+          << "o3,0.5,10.0,g2," << endl
+          << "o4,0.05,10.0,g2,0.0" << endl;
+    }
+    {
+        ofstream f(name + ".pst");
+        f << "pcf" << endl
+          << "* control data" << endl
+          << "restart estimation" << endl
+          << "2 4 1 0 2" << endl
+          << "1 1 single point 1 0 0" << endl
+          << "5.0 2.0 0.3 0.03 10" << endl
+          << "5.0 5.0 0.001" << endl
+          << "0.1" << endl
+          << "1 0.01 3 3 0.01 3" << endl
+          << "0 0 0" << endl
+          << "* parameter groups" << endl
+          << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+          << "* parameter data" << endl
+          << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "* observation groups" << endl
+          << "g1" << endl
+          << "g2" << endl
+          << "* observation data external" << endl
+          << name << ".obs_data.csv" << endl
+          << "* model command line" << endl
+          << "echo" << endl
+          << "* model input/output" << endl
+          << "x.tpl x.dat" << endl
+          << "y.ins y.dat" << endl
+          << "++ies_num_reals(200)" << endl
+          << "++ies_n_iter_reinflate(1)" << endl;
+    }
+    stringstream cap;
+    streambuf* old = cout.rdbuf(cap.rdbuf());
+    string where = "startup";
+    try
+    {
+        ofstream flog(name + "_perf.log");
+        PerformanceLog pfm(flog);
+        FileManager fm(name);
+        ofstream& frec = fm.open_ofile_ext("rec");
+        Pest p;
+        {
+            ifstream fin(name + ".pst");
+            p.process_ctl_file(fin, name + ".pst", frec);
+        }
+        p.check_inputs(frec);
+        OutputFileWriter ofw(fm, p);
+        p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+        InProcessRunManager rm(name + ".rns", model);
+        rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+        StructNoiseProbe ies(p, fm, ofw, &pfm, &rm);
+        ies.initialize();
+
+        const vector<string> rnames = ies.noise().get_real_names();
+        const vector<string> vnames = ies.noise().get_var_names();
+        const Eigen::MatrixXd n0 = *ies.noise().get_eigen_ptr();
+        map<string, int> vmap;
+        for (int j = 0; j < vnames.size(); j++)
+            vmap[vnames[j]] = j;
+
+        // frac = 0 before any capture: nothing touched
+        where = "reinflation with frac 0";
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+        bool same0 = (*ies.noise().get_eigen_ptr() - n0).cwiseAbs().maxCoeff() == 0.0;
+        bool cap0 = ies.captured();
+
+        // the residuals the capture should see: observed minus simulated, from the sims
+        // as they stand going into the first frac > 0 reinflation
+        ObservationEnsemble sim_before = ies.sim();
+        Observations ctl_obs = p.get_ctl_observations();
+
+        where = "reinflation with frac 1";
+        ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
+        const Eigen::MatrixXd n1 = *ies.noise().get_eigen_ptr();
+        bool cap1 = ies.captured();
+        Eigen::MatrixXd R = ies.resid();
+        vector<string> robs = ies.resid_obs();
+        auto coef = ies.coef();
+
+        where = "second reinflation with frac 1";
+        ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
+        const Eigen::MatrixXd n2 = *ies.noise().get_eigen_ptr();
+
+        where = "reinflation with frac 0.25";
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.25);
+        const Eigen::MatrixXd n3 = *ies.noise().get_eigen_ptr();
+
+        where = "reinflation with frac 0 after the capture";
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+        const Eigen::MatrixXd n4 = *ies.noise().get_eigen_ptr();
+        cout.rdbuf(old);
+
+        CHK(same0, "frac 0 before any capture: the noise realizations are untouched");
+        CHK(!cap0, "frac 0 before any capture: nothing captured");
+        CHK(cap1, "frac 1: residuals captured at the first reinflation with frac > 0");
+        CHK(R.rows() == sim_before.shape().first && R.cols() == vnames.size(),
+            "R is (realizations of oe) x (active nz obs)");
+
+        // R is observed minus simulated, not centred
+        double rerr = 0.0;
+        {
+            Eigen::MatrixXd sv = sim_before.get_eigen(vector<string>(), robs);
+            for (int i = 0; i < R.rows(); i++)
+                for (int k = 0; k < robs.size(); k++)
+                    rerr = max(rerr, abs(R(i, k) - (ctl_obs.get_rec(robs[k]) - sv(i, k))));
+        }
+        CHK(rerr < 1.0e-10, "R is observed minus simulated, uncentred (max err " + to_string(rerr) + ")");
+
+        // the draws: oe_base - user noise == sqrt(frac) * coef^T R / sqrt(Ne), base untouched
+        int ne = R.rows();
+        int o4 = vmap.at("O4");
+        double ferr1 = 0.0, ferr3 = 0.0, base_change = 0.0;
+        int n_rows_checked = 0, n_coef_missing = 0;
+        vector<double> s_mean(robs.size(), 0.0), s_var(robs.size(), 0.0);
+        for (int i = 0; i < rnames.size(); i++)
+        {
+            if (rnames[i] == BASE_REAL_NAME)
+            {
+                base_change = max(base_change, (n1.row(i) - n0.row(i)).cwiseAbs().maxCoeff());
+                continue;
+            }
+            auto cit = coef.find(rnames[i]);
+            if (cit == coef.end()) { n_coef_missing++; continue; }
+            Eigen::RowVectorXd srow = (cit->second.transpose() * R) / sqrt(double(ne));
+            for (int k = 0; k < robs.size(); k++)
+            {
+                int j = vmap.at(robs[k]);
+                s_mean[k] += srow[k];
+                s_var[k] += srow[k] * srow[k];
+                if (j == o4)
+                    continue;   // clamped, checked below
+                ferr1 = max(ferr1, abs(n1(i, j) - (n0(i, j) + srow[k])));
+                ferr3 = max(ferr3, abs(n3(i, j) - (n0(i, j) + 0.5 * srow[k])));
+            }
+            n_rows_checked++;
+        }
+        CHK(n_coef_missing == 0, "every non-base noise realization has a coefficient column");
+        CHK(base_change == 0.0, "the base realization is left noise-free");
+        CHK(ferr1 < 1.0e-10, "frac 1: oe_base = user noise + coef^T R / sqrt(Ne) (max err " + to_string(ferr1) + ")");
+        CHK(ferr3 < 1.0e-10, "frac 0.25: oe_base = user noise + 0.5 * the same draws (max err " + to_string(ferr3) + ")");
+        CHK((n2 - n1).cwiseAbs().maxCoeff() == 0.0, "a second reinflation at the same frac leaves oe_base unchanged");
+        CHK((n4 - n0).cwiseAbs().maxCoeff() == 0.0, "frac 0 after the capture puts the user's noise back exactly");
+
+        // symmetric and the right size: mean near 0, variance near diag(R^T R) / Ne
+        bool sym_ok = true, size_ok = true;
+        stringstream ss;
+        for (int k = 0; k < robs.size(); k++)
+        {
+            double m = s_mean[k] / n_rows_checked;
+            double v = s_var[k] / n_rows_checked - m * m;
+            double target = R.col(k).squaredNorm() / ne;
+            if (abs(m) > 0.3 * sqrt(target)) sym_ok = false;
+            if ((v < 0.6 * target) || (v > 1.5 * target)) size_ok = false;
+            ss << robs[k] << " mean " << m << " var " << v << " target " << target << "; ";
+        }
+        CHK(sym_ok, "draws are centred on zero: " + ss.str());
+        CHK(size_ok, "draw variance matches diag(R^T R)/Ne: " + ss.str());
+
+        // the bound clamp: o4 never below 0, and it actually bit
+        int nclamped = 0;
+        double o4_min = 1.0e30;
+        for (int i = 0; i < rnames.size(); i++)
+        {
+            o4_min = min(o4_min, n1(i, o4));
+            if (n1(i, o4) == 0.0 && n0(i, o4) != 0.0)
+                nclamped++;
+        }
+        CHK(o4_min >= 0.0, "o4 (lower_bound 0) is never below 0 after the draws (min " + to_string(o4_min) + ")");
+        CHK(nclamped > 0, "the clamp actually bit on o4 (" + to_string(nclamped) + " values)");
+    }
+    catch (const exception& e)
+    {
+        cout.rdbuf(old);
+        CHK(false, name + ": threw during " + where + ": " + e.what());
+    }
+}
+
+static void test_structnoise_recapture()
+{
+    cout << "[structural noise: a negative frac recaptures the residuals, a positive one reuses them]" << endl;
+    // the same irreducible pair as the draws test: o1 = p1 observed at 0, o2 = p1 observed
+    // at 2.  o3 = p2 at 0.5 is fittable.  the sims are shifted by hand before each
+    // reinflation so a recapture is bound to see different residuals
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p1);
+        obs.update_rec("O3", p2);
+    };
+    string name = "selftest_structnoise_rc";
+    {
+        ofstream f(name + ".obs_data.csv");
+        f << "obsnme,obsval,weight,obgnme" << endl
+          << "o1,0.0,10.0,g1" << endl
+          << "o2,2.0,10.0,g1" << endl
+          << "o3,0.5,10.0,g2" << endl;
+    }
+    {
+        ofstream f(name + ".pst");
+        f << "pcf" << endl
+          << "* control data" << endl
+          << "restart estimation" << endl
+          << "2 3 1 0 2" << endl
+          << "1 1 single point 1 0 0" << endl
+          << "5.0 2.0 0.3 0.03 10" << endl
+          << "5.0 5.0 0.001" << endl
+          << "0.1" << endl
+          << "1 0.01 3 3 0.01 3" << endl
+          << "0 0 0" << endl
+          << "* parameter groups" << endl
+          << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+          << "* parameter data" << endl
+          << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "* observation groups" << endl
+          << "g1" << endl
+          << "g2" << endl
+          << "* observation data external" << endl
+          << name << ".obs_data.csv" << endl
+          << "* model command line" << endl
+          << "echo" << endl
+          << "* model input/output" << endl
+          << "x.tpl x.dat" << endl
+          << "y.ins y.dat" << endl
+          << "++ies_num_reals(100)" << endl
+          << "++ies_n_iter_reinflate(1)" << endl
+          // negative entries have to get through the input checks
+          << "++ies_reinflate_structnoise_frac(0,-1,1,-0.5,0)" << endl
+          << "++ies_structnoise_deweight(true)" << endl;
+    }
+    stringstream cap;
+    streambuf* old = cout.rdbuf(cap.rdbuf());
+    string where = "startup";
+    try
+    {
+        ofstream flog(name + "_perf.log");
+        PerformanceLog pfm(flog);
+        FileManager fm(name);
+        ofstream& frec = fm.open_ofile_ext("rec");
+        Pest p;
+        {
+            ifstream fin(name + ".pst");
+            p.process_ctl_file(fin, name + ".pst", frec);
+        }
+        p.check_inputs(frec);
+        OutputFileWriter ofw(fm, p);
+        p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+        InProcessRunManager rm(name + ".rns", model);
+        rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+        StructNoiseProbe ies(p, fm, ofw, &pfm, &rm);
+        ies.initialize();
+        Observations ctl_obs = p.get_ctl_observations();
+
+        const vector<string> rnames = ies.noise().get_real_names();
+        const vector<string> vnames = ies.noise().get_var_names();
+        const Eigen::MatrixXd n0 = *ies.noise().get_eigen_ptr();
+        map<string, int> vmap;
+        for (int j = 0; j < vnames.size(); j++)
+            vmap[vnames[j]] = j;
+
+        // shift every sim by a different amount per realization, and keep what the capture
+        // will see
+        auto shift_sims = [&](double d)
+        {
+            Eigen::MatrixXd* sv = ies.sim().get_eigen_ptr_4_mod();
+            for (int i = 0; i < sv->rows(); i++)
+                sv->row(i).array() += d * (1.0 + 0.01 * i);
+            return ies.sim();
+        };
+        // observed minus simulated, as the capture should compute it
+        auto expected_R = [&](ObservationEnsemble& sim, const vector<string>& robs)
+        {
+            Eigen::MatrixXd sv = sim.get_eigen(vector<string>(), robs);
+            Eigen::MatrixXd r(sv.rows(), sv.cols());
+            for (int i = 0; i < sv.rows(); i++)
+                for (int k = 0; k < robs.size(); k++)
+                    r(i, k) = ctl_obs.get_rec(robs[k]) - sv(i, k);
+            return r;
+        };
+        // the noise each realization should carry: user noise + sqrt(frac) * coef^T R / sqrt(Ne)
+        auto noise_err = [&](const Eigen::MatrixXd& n, double frac)
+        {
+            const Eigen::MatrixXd& R = ies.resid();
+            const vector<string>& robs = ies.resid_obs();
+            double ne = R.rows(), err = 0.0;
+            for (int i = 0; i < rnames.size(); i++)
+            {
+                if (rnames[i] == BASE_REAL_NAME)
+                    continue;
+                Eigen::RowVectorXd srow = sqrt(frac) * (ies.coef().at(rnames[i]).transpose() * R) / sqrt(ne);
+                for (int k = 0; k < robs.size(); k++)
+                {
+                    int j = vmap.at(robs[k]);
+                    err = max(err, abs(n(i, j) - (n0(i, j) + srow[k])));
+                }
+            }
+            return err;
+        };
+        // the control file weight each obs should have after de-weighting at |frac|
+        auto weight_err = [&](double frac)
+        {
+            const vector<string>& robs = ies.resid_obs();
+            double err = 0.0;
+            for (int k = 0; k < robs.size(); k++)
+            {
+                double w = ies.org_info().get_weight(robs[k]);
+                double s2 = ies.resid().col(k).squaredNorm() / ies.resid().rows();
+                double want = (s2 > 0.0) ? 1.0 / sqrt(1.0 / (w * w) + frac * s2) : w;
+                err = max(err, abs(p.get_ctl_observation_info().get_weight(robs[k]) - want));
+            }
+            return err;
+        };
+
+        where = "reinflation with frac 0";
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+        bool cap0 = ies.captured();
+
+        // the first non-zero entry is negative: it captures, same as a positive one would
+        where = "first capture with frac -1";
+        ObservationEnsemble sim1 = shift_sims(0.3);
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, -1.0);
+        bool cap1 = ies.captured();
+        Eigen::MatrixXd R1 = ies.resid();
+        vector<string> robs = ies.resid_obs();
+        auto coef1 = ies.coef();
+        double rerr1 = (R1 - expected_R(sim1, robs)).cwiseAbs().maxCoeff();
+        double nerr1 = noise_err(*ies.noise().get_eigen_ptr(), 1.0);
+        double werr1 = weight_err(1.0);
+
+        // positive: reuse what was captured, even though the sims have moved
+        where = "reuse with frac 1";
+        shift_sims(0.7);
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
+        bool same_R = (ies.resid() - R1).cwiseAbs().maxCoeff() == 0.0;
+        bool same_coef = true;
+        for (auto& c : coef1)
+            if ((ies.coef().at(c.first) - c.second).cwiseAbs().maxCoeff() != 0.0)
+                same_coef = false;
+        double nerr2 = noise_err(*ies.noise().get_eigen_ptr(), 1.0);
+
+        // negative: recapture from the shifted sims, at a fraction of 0.5
+        where = "recapture with frac -0.5";
+        ObservationEnsemble sim3 = shift_sims(1.1);
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, -0.5);
+        Eigen::MatrixXd R3 = ies.resid();
+        double rerr3 = (R3 - expected_R(sim3, ies.resid_obs())).cwiseAbs().maxCoeff();
+        double rdiff = (R3.rows() == R1.rows()) ? (R3 - R1).cwiseAbs().maxCoeff() : 1.0;
+        int coef_changed = 0;
+        for (auto& c : coef1)
+            if ((ies.coef().at(c.first) - c.second).cwiseAbs().maxCoeff() != 0.0)
+                coef_changed++;
+        double nerr3 = noise_err(*ies.noise().get_eigen_ptr(), 0.5);
+        double werr3 = weight_err(0.5);
+
+        where = "reinflation with frac 0 after the recapture";
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+        const Eigen::MatrixXd n4 = *ies.noise().get_eigen_ptr();
+        double werr4 = 0.0;
+        for (auto& oname : robs)
+            werr4 = max(werr4, abs(p.get_ctl_observation_info().get_weight(oname) - ies.org_info().get_weight(oname)));
+        cout.rdbuf(old);
+
+        CHK(!cap0, "frac 0 before any capture: nothing captured");
+        CHK(cap1, "a negative first entry captures the residuals");
+        CHK(rerr1 < 1.0e-10, "first capture: R is observed minus the sims going in (max err " + to_string(rerr1) + ")");
+        CHK(nerr1 < 1.0e-10, "first capture at -1: noise = user noise + the full draws (max err " + to_string(nerr1) + ")");
+        CHK(werr1 < 1.0e-10, "first capture at -1: weights lowered with fraction 1 (max err " + to_string(werr1) + ")");
+        CHK(same_R, "positive frac after the capture: R is reused, not recaptured");
+        CHK(same_coef, "positive frac after the capture: the coefficients are reused");
+        CHK(nerr2 < 1.0e-10, "positive frac: noise rebuilt from the user's noise, nothing piled up (max err " + to_string(nerr2) + ")");
+        CHK(rerr3 < 1.0e-10, "negative frac: R recaptured from the sims as they stand (max err " + to_string(rerr3) + ")");
+        CHK(rdiff > 0.1, "negative frac: the recaptured R differs from the first one (max diff " + to_string(rdiff) + ")");
+        CHK(coef_changed > 0, "negative frac: new coefficients drawn (" + to_string(coef_changed) + " changed)");
+        CHK(nerr3 < 1.0e-10, "negative frac -0.5: noise = the user's noise (not the last noise) + sqrt(0.5) * new draws (max err " + to_string(nerr3) + ")");
+        CHK(werr3 < 1.0e-10, "negative frac -0.5: weights lowered from the user's weights with fraction 0.5 and the new s2 (max err " + to_string(werr3) + ")");
+        CHK((n4 - n0).cwiseAbs().maxCoeff() == 0.0, "frac 0 after a recapture puts the user's noise back exactly");
+        CHK(werr4 == 0.0, "frac 0 after a recapture puts the user's weights back exactly");
+    }
+    catch (const exception& e)
+    {
+        cout.rdbuf(old);
+        CHK(false, name + ": threw during " + where + ": " + e.what());
+    }
+}
+
+static void test_ensemble_dup_real_names()
+{
+    cout << "[duplicate realization names: weight and restart ensembles are checked like par and noise]" << endl;
+    // binary files, since the csv reader already trips over a repeated row name (with a
+    // vaguer message) before the duplicate check is reached
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        obs.update_rec("O1", pars.get_rec("P1"));
+        obs.update_rec("O2", pars.get_rec("P2"));
+    };
+    // kind: the option that names the ensemble with two 'BASE' rows
+    for (string kind : {"ies_weight_ensemble", "ies_restart_obs_en", "ies_restart_par_en"})
+    {
+        string name = "selftest_dupreal_" + kind;
+        {
+            ofstream f(name + ".pst");
+            f << "pcf" << endl
+              << "* control data" << endl
+              << "restart estimation" << endl
+              << "2 2 1 0 1" << endl
+              << "1 1 single point 1 0 0" << endl
+              << "5.0 2.0 0.3 0.03 10" << endl
+              << "5.0 5.0 0.001" << endl
+              << "0.1" << endl
+              << "1 0.01 3 3 0.01 3" << endl
+              << "0 0 0" << endl
+              << "* parameter groups" << endl
+              << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+              << "* parameter data" << endl
+              << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+              << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+              << "* observation groups" << endl
+              << "g1" << endl
+              << "* observation data" << endl
+              << "o1 1.0 10.0 g1" << endl
+              << "o2 0.5 10.0 g1" << endl
+              << "* model command line" << endl
+              << "echo" << endl
+              << "* model input/output" << endl
+              << "x.tpl x.dat" << endl
+              << "y.ins y.dat" << endl
+              << "++ies_num_reals(3)" << endl;
+            // the clean ensembles each case needs beside the bad one: a weight ensemble
+            // needs a noise ensemble, a restart needs the par ensemble it started from
+            if (kind == "ies_weight_ensemble")
+                f << "++ies_obs_en(" << name << ".obs.jcb)" << endl;
+            else
+                f << "++ies_par_en(" << name << ".par.jcb)" << endl;
+            if (kind == "ies_restart_par_en")
+                f << "++ies_restart_obs_en(" << name << ".obs.jcb)" << endl;
+            f << "++" << kind << "(" << name << ".dup.jcb)" << endl;
+        }
+        stringstream cap;
+        streambuf* old = cout.rdbuf(cap.rdbuf());
+        string msg;
+        try
+        {
+            ofstream flog(name + "_perf.log");
+            PerformanceLog pfm(flog);
+            FileManager fm(name);
+            ofstream& frec = fm.open_ofile_ext("rec");
+            Pest p;
+            {
+                ifstream fin(name + ".pst");
+                p.process_ctl_file(fin, name + ".pst", frec);
+            }
+            p.check_inputs(frec);
+            {
+                std::mt19937 rgen(1);
+                Eigen::MatrixXd m(3, 2);
+                m << 1.0, 0.5, 1.1, 0.4, 0.9, 0.6;
+                vector<string> clean{BASE_REAL_NAME, "0", "1"}, dup{BASE_REAL_NAME, "0", BASE_REAL_NAME};
+                ObservationEnsemble(&p, &rgen, m, clean, vector<string>{"O1", "O2"}).to_binary(name + ".obs.jcb");
+                ParameterEnsemble(&p, &rgen, m, clean, vector<string>{"P1", "P2"}).to_binary(name + ".par.jcb");
+                if (kind == "ies_restart_par_en")
+                    ParameterEnsemble(&p, &rgen, m, dup, vector<string>{"P1", "P2"}).to_binary(name + ".dup.jcb");
+                else
+                    ObservationEnsemble(&p, &rgen, m, dup, vector<string>{"O1", "O2"}).to_binary(name + ".dup.jcb");
+            }
+            OutputFileWriter ofw(fm, p);
+            p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+            InProcessRunManager rm(name + ".rns", model);
+            rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+            IterEnsembleSmoother ies(p, fm, ofw, &pfm, &rm);
+            ies.initialize();
+        }
+        catch (const exception& e)
+        {
+            msg = e.what();
+        }
+        cout.rdbuf(old);
+        string want = (kind == "ies_weight_ensemble") ? "weight ensemble" :
+                      (kind == "ies_restart_obs_en") ? "restart obs ensemble" : "restart par ensemble";
+        CHK(msg.find("duplicate") != string::npos, kind + ": two 'base' rows stop the run (got: '" + msg.substr(0, 160) + "')");
+        CHK(msg.find(want) != string::npos, kind + ": the error names the " + want);
+    }
+}
+
+static void test_structnoise_em()
+{
+    cout << "[structural noise em: base variance max(0, s2 - sig2), sig2 from the noise not the weights]" << endl;
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p1);
+        obs.update_rec("O3", p2);
+    };
+    string name = "selftest_structnoise_em";
+    // weight 10 says a variance of 0.01, the standard deviation column says 0.25: the em
+    // excess has to be measured against the 0.25
+    {
+        ofstream f(name + ".obs_data.csv");
+        f << "obsnme,obsval,weight,obgnme,standard_deviation" << endl
+          << "o1,0.0,10.0,g1,0.5" << endl
+          << "o2,2.0,10.0,g1,0.5" << endl
+          << "o3,0.5,10.0,g2,0.5" << endl;
+    }
+    {
+        ofstream f(name + ".pst");
+        f << "pcf" << endl
+          << "* control data" << endl
+          << "restart estimation" << endl
+          << "2 3 1 0 2" << endl
+          << "1 1 single point 1 0 0" << endl
+          << "5.0 2.0 0.3 0.03 10" << endl
+          << "5.0 5.0 0.001" << endl
+          << "0.1" << endl
+          << "1 0.01 3 3 0.01 3" << endl
+          << "0 0 0" << endl
+          << "* parameter groups" << endl
+          << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+          << "* parameter data" << endl
+          << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "* observation groups" << endl
+          << "g1" << endl
+          << "g2" << endl
+          << "* observation data external" << endl
+          << name << ".obs_data.csv" << endl
+          << "* model command line" << endl
+          << "echo" << endl
+          << "* model input/output" << endl
+          << "x.tpl x.dat" << endl
+          << "y.ins y.dat" << endl
+          << "++ies_num_reals(300)" << endl
+          << "++ies_n_iter_reinflate(1)" << endl
+          << "++ies_no_noise(false)" << endl
+          << "++ies_reinflate_structnoise_frac(0.5,-1)" << endl
+          << "++ies_structnoise_deweight(true)" << endl
+          << "++ies_structnoise_em(true)" << endl;
+    }
+    stringstream cap;
+    streambuf* old = cout.rdbuf(cap.rdbuf());
+    string where = "startup";
+    try
+    {
+        ofstream flog(name + "_perf.log");
+        PerformanceLog pfm(flog);
+        FileManager fm(name);
+        ofstream& frec = fm.open_ofile_ext("rec");
+        Pest p;
+        {
+            ifstream fin(name + ".pst");
+            p.process_ctl_file(fin, name + ".pst", frec);
+        }
+        p.check_inputs(frec);
+        OutputFileWriter ofw(fm, p);
+        p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+        InProcessRunManager rm(name + ".rns", model);
+        rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+        StructNoiseProbe ies(p, fm, ofw, &pfm, &rm);
+        ies.initialize();
+        Observations ctl_obs = p.get_ctl_observations();
+
+        const vector<string> rnames = ies.noise().get_real_names();
+        const vector<string> vnames = ies.noise().get_var_names();
+        const Eigen::MatrixXd n0 = *ies.noise().get_eigen_ptr();
+        map<string, int> vmap, rmap;
+        for (int j = 0; j < vnames.size(); j++)
+            vmap[vnames[j]] = j;
+        for (int i = 0; i < rnames.size(); i++)
+            rmap[rnames[i]] = i;
+
+        // the user's noise variance per obs, straight from the draws (base left out)
+        map<string, double> sig2_want;
+        for (auto& v : vnames)
+        {
+            double ss = 0.0;
+            int n = 0;
+            for (int i = 0; i < rnames.size(); i++)
+            {
+                if (rnames[i] == BASE_REAL_NAME)
+                    continue;
+                double d = n0(i, vmap[v]) - ctl_obs.get_rec(v);
+                ss += d * d;
+                n++;
+            }
+            sig2_want[v] = ss / n;
+        }
+        // set every sim so its actual residual (obs - sim) is the given value per obs
+        auto set_resid = [&](std::function<double(const string&, const string&)> r)
+        {
+            ObservationEnsemble& sim = ies.sim();
+            Eigen::MatrixXd* sv = sim.get_eigen_ptr_4_mod();
+            vector<string> sr = sim.get_real_names(), sc = sim.get_var_names();
+            for (int i = 0; i < sr.size(); i++)
+                for (int j = 0; j < sc.size(); j++)
+                    (*sv)(i, j) = ctl_obs.get_rec(sc[j]) - r(sr[i], sc[j]);
+        };
+
+        // 1. a shared bias the model cannot remove: o1 1.5, o2 -2.0, o3 none
+        where = "capture with a bias, frac 0.5";
+        map<string, double> bias{{"O1", 1.5}, {"O2", -2.0}, {"O3", 0.0}};
+        set_resid([&](const string&, const string& o) { return bias[o]; });
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.5);
+        const Eigen::MatrixXd n1 = *ies.noise().get_eigen_ptr();
+        vector<string> robs = ies.resid_obs();
+        Eigen::VectorXd s2 = ies.s2(), var = ies.var(), sig2 = ies.sig2();
+        Eigen::MatrixXd R = ies.resid();
+        double sig_err = 0.0, var_err = 0.0, noise_err = 0.0, w_err = 0.0, sig_min = 1e30, sig_max = 0.0;
+        for (int k = 0; k < robs.size(); k++)
+        {
+            sig_err = max(sig_err, abs(sig2[k] - sig2_want[robs[k]]));
+            var_err = max(var_err, abs(var[k] - max(0.0, s2[k] - sig2_want[robs[k]])));
+            sig_min = min(sig_min, sig2[k]);
+            sig_max = max(sig_max, sig2[k]);
+            double w = ies.org_info().get_weight(robs[k]);
+            double want = (var[k] > 0.0) ? 1.0 / sqrt(1.0 / (w * w) + 0.5 * var[k]) : w;
+            w_err = max(w_err, abs(p.get_ctl_observation_info().get_weight(robs[k]) - want));
+        }
+        int ne = R.rows();
+        for (int i = 0; i < rnames.size(); i++)
+        {
+            if (rnames[i] == BASE_REAL_NAME)
+                continue;
+            Eigen::RowVectorXd srow = (ies.coef().at(rnames[i]).transpose() * R) / sqrt(double(ne));
+            for (int k = 0; k < robs.size(); k++)
+            {
+                double scale = (s2[k] > 0.0) ? sqrt(0.5 * var[k] / s2[k]) : 0.0;
+                int j = vmap.at(robs[k]);
+                noise_err = max(noise_err, abs(n1(i, j) - (n0(i, j) + scale * srow[k])));
+            }
+        }
+        int k3 = find(robs.begin(), robs.end(), "O3") - robs.begin();
+        double o3_change = (n1.col(vmap.at("O3")) - n0.col(vmap.at("O3"))).cwiseAbs().maxCoeff();
+
+        // 2. residuals that are just the user's noise: no excess anywhere, so nothing changes
+        where = "recapture with noise-only residuals";
+        set_resid([&](const string& r, const string& o)
+            { return (r == BASE_REAL_NAME) ? 0.0 : n0(rmap.at(r), vmap.at(o)) - ctl_obs.get_rec(o); });
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, -1.0);
+        double var_max2 = ies.var().maxCoeff();
+        double n_change2 = (*ies.noise().get_eigen_ptr() - n0).cwiseAbs().maxCoeff();
+        double w_change2 = 0.0;
+        for (auto& o : robs)
+            w_change2 = max(w_change2, abs(p.get_ctl_observation_info().get_weight(o) - ies.org_info().get_weight(o)));
+        cout.rdbuf(old);
+
+        CHK(sig_err < 1.0e-10, "sig2 is the mean square of the user's noise draws (max err " + to_string(sig_err) + ")");
+        CHK(sig_min > 0.18 && sig_max < 0.33, "sig2 follows the standard deviation (0.25), not the weights (0.01): " +
+            to_string(sig_min) + " to " + to_string(sig_max));
+        CHK(var_err < 1.0e-10, "the base variance is max(0, s2 - sig2) (max err " + to_string(var_err) + ")");
+        CHK(var[k3] == 0.0, "an obs with no misfit beyond the noise gets no excess");
+        CHK(noise_err < 1.0e-10, "noise = user noise + draws scaled to variance frac * excess (max err " + to_string(noise_err) + ")");
+        CHK(o3_change == 0.0, "an obs with no excess keeps the user's noise exactly");
+        CHK(w_err < 1.0e-10, "weights lowered with frac * excess, from the user's weights (max err " + to_string(w_err) + ")");
+        CHK(var_max2 == 0.0, "residuals that are only the user's noise give no excess (max " + to_string(var_max2) + ")");
+        CHK(n_change2 == 0.0, "no excess: the noise stays the user's noise exactly");
+        CHK(w_change2 == 0.0, "no excess: the weights stay the user's weights exactly");
+    }
+    catch (const exception& e)
+    {
+        cout.rdbuf(old);
+        CHK(false, name + ": threw during " + where + ": " + e.what());
+    }
+}
+
+static void test_structnoise_deweight()
+{
+    cout << "[structural noise de-weighting: w' = 1/sqrt(w^-2 + frac s2), row by row from weights_base]" << endl;
+    // o1/o2 can't both be fitted (same p1, observed at 0 and 2).  o3 = p2 is fittable.  o4 =
+    // p2 is a less-than obs at 100 that is always satisfied, so its actual residual - and s2 -
+    // is exactly 0 and its weight must not move
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p1);
+        obs.update_rec("O3", p2);
+        obs.update_rec("O4", p2);
+    };
+    string name = "selftest_structnoise_dw";
+    // clear saves from an earlier run so the file checks below only see this one
+    for (int i = 0; i < 20; i++)
+    {
+        remove((name + "." + to_string(i) + ".adjusted.weights.csv").c_str());
+        remove((name + "." + to_string(i) + ".adjusted.obs_data.csv").c_str());
+    }
+    {
+        ofstream f(name + ".pst");
+        f << "pcf" << endl
+          << "* control data" << endl
+          << "restart estimation" << endl
+          << "2 4 2 0 3" << endl
+          << "1 1 single point 1 0 0" << endl
+          << "5.0 2.0 0.3 0.03 10" << endl
+          << "5.0 5.0 0.001" << endl
+          << "0.1" << endl
+          << "1 0.01 3 3 0.01 3" << endl
+          << "0 0 0" << endl
+          << "* parameter groups" << endl
+          << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+          << "* parameter data" << endl
+          << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+          << "* observation groups" << endl
+          << "g1" << endl
+          << "g2" << endl
+          << "less_g3" << endl
+          << "* observation data" << endl
+          << "o1 0.0 10.0 g1" << endl
+          << "o2 2.0 10.0 g1" << endl
+          << "o3 0.5 2.0 g2" << endl
+          << "o4 100.0 10.0 less_g3" << endl
+          << "* model command line" << endl
+          << "echo" << endl
+          << "* model input/output" << endl
+          << "x.tpl x.dat" << endl
+          << "y.ins y.dat" << endl
+          << "++ies_num_reals(30)" << endl
+          << "++ies_n_iter_reinflate(1)" << endl
+          << "++ies_structnoise_deweight(true)" << endl;
+    }
+    stringstream cap;
+    streambuf* old = cout.rdbuf(cap.rdbuf());
+    string where = "startup";
+    try
+    {
+        ofstream flog(name + "_perf.log");
+        PerformanceLog pfm(flog);
+        FileManager fm(name);
+        ofstream& frec = fm.open_ofile_ext("rec");
+        Pest p;
+        {
+            ifstream fin(name + ".pst");
+            p.process_ctl_file(fin, name + ".pst", frec);
+        }
+        p.check_inputs(frec);
+        OutputFileWriter ofw(fm, p);
+        p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+        InProcessRunManager rm(name + ".rns", model);
+        rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+        StructNoiseProbe ies(p, fm, ofw, &pfm, &rm);
+        ies.initialize();
+
+        // give every realization its own weights, as a weight ensemble or phi factors by
+        // realization would.  the restore at reinflation reads weights_base
+        {
+            Eigen::MatrixXd* wb = ies.wts_base().get_eigen_ptr_4_mod();
+            for (int i = 0; i < wb->rows(); i++)
+                wb->row(i) *= (1.0 + 0.05 * i);
+        }
+        const Eigen::MatrixXd wb = *ies.wts_base().get_eigen_ptr();
+        const vector<string> wvars = ies.wts_base().get_var_names();
+        const vector<string> wreals = ies.wts_base().get_real_names();
+
+        // the adjusted weight ensemble each reinflation leaves, the control file weights, and
+        // the files it saved
+        struct Snap { Eigen::MatrixXd w; vector<string> rnames; map<string, double> ctl; int iter; };
+        auto snap = [&]()
+        {
+            Snap sn;
+            sn.w = *ies.wts().get_eigen_ptr();
+            sn.rnames = ies.wts().get_real_names();
+            for (auto& o : wvars)
+                sn.ctl[o] = p.get_observation_info_ptr()->get_weight(o);
+            sn.iter = ies.cur_iter();
+            return sn;
+        };
+        where = "reinflation with frac 1";
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
+        Snap s1 = snap();
+        Eigen::VectorXd s2 = ies.s2();
+        Eigen::MatrixXd R = ies.resid();
+        vector<string> robs = ies.resid_obs();
+        where = "reinflation with frac 0.25";
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.25);
+        Snap s3 = snap();
+        where = "reinflation with frac 0";
+        ies.bump_iter();
+        ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+        Snap s0 = snap();
+        cout.rdbuf(old);
+
+        map<string, double> s2_map;
+        for (int k = 0; k < robs.size(); k++)
+            s2_map[robs[k]] = s2[k];
+        double s2err = 0.0;
+        for (int k = 0; k < robs.size(); k++)
+            s2err = max(s2err, abs(s2[k] - R.col(k).squaredNorm() / R.rows()));
+        CHK(s2err < 1.0e-12, "s2 is the uncentred mean of R^2 over realizations");
+        CHK(s2_map.at("O4") == 0.0, "the satisfied less-than obs has s2 exactly 0");
+        CHK(s2_map.at("O1") > 0.5 && s2_map.at("O2") > 0.5, "the obs the model can't fit have a large s2");
+
+        // check one snapshot against the formula, row by row from weights_base
+        auto check = [&](const Snap& sn, double frac, const string& tag)
+        {
+            double ferr = 0.0, over = 0.0, s2zero = 0.0;
+            map<string, int> wb_rmap;
+            for (int i = 0; i < wreals.size(); i++)
+                wb_rmap[wreals[i]] = i;
+            for (int i = 0; i < sn.rnames.size(); i++)
+            {
+                int ib = wb_rmap.at(sn.rnames[i]);
+                for (int j = 0; j < wvars.size(); j++)
+                {
+                    double w0 = wb(ib, j), w1 = sn.w(i, j);
+                    double expect = (frac > 0.0) ? 1.0 / sqrt(1.0 / (w0 * w0) + frac * s2_map.at(wvars[j])) : w0;
+                    ferr = max(ferr, abs(w1 - expect) / w0);
+                    over = max(over, w1 - w0);
+                    if (s2_map.at(wvars[j]) == 0.0)
+                        s2zero = max(s2zero, abs(w1 - w0));
+                }
+            }
+            CHK(ferr < 1.0e-12, tag + ": weight ensemble matches 1/sqrt(w^-2 + frac s2) (max rel err " + to_string(ferr) + ")");
+            CHK(over <= 0.0, tag + ": no weight above its own original in weights_base");
+            CHK(s2zero == 0.0, tag + ": weight unchanged where s2 = 0");
+            double cerr = 0.0;
+            for (auto& o : wvars)
+            {
+                double w0 = ies.org_info().get_weight(o);
+                double expect = (frac > 0.0) ? 1.0 / sqrt(1.0 / (w0 * w0) + frac * s2_map.at(o)) : w0;
+                cerr = max(cerr, abs(sn.ctl.at(o) - expect) / w0);
+            }
+            CHK(cerr < 1.0e-12, tag + ": control file weights match the formula from org_obs_info");
+        };
+        check(s1, 1.0, "frac 1");
+        check(s3, 0.25, "frac 0.25 after frac 1 (rebuilt from weights_base, not compounded)");
+        check(s0, 0.0, "frac 0 after the capture");
+
+        // the rows stay distinct, each adjusted from its own original
+        bool distinct = true;
+        int jo1 = distance(wvars.begin(), find(wvars.begin(), wvars.end(), string("O1")));
+        for (int i = 1; i < s1.w.rows(); i++)
+            if (s1.w(i, jo1) == s1.w(i - 1, jo1)) distinct = false;
+        CHK(distinct, "frac 1: rows of the weight ensemble stay distinct");
+        CHK(s1.w(s1.w.rows() - 1, jo1) / s1.w(0, jo1) < wb(wb.rows() - 1, jo1) / wb(0, jo1),
+            "frac 1: a large structural variance pulls the realizations' weights toward each other");
+
+        // the saved files match what was used
+        for (auto pr : vector<pair<Snap*, string>>{{&s1, "frac 1"}, {&s3, "frac 0.25"}})
+        {
+            string wcsv = name + "." + to_string(pr.first->iter) + ".adjusted.weights.csv";
+            string ocsv = name + "." + to_string(pr.first->iter) + ".adjusted.obs_data.csv";
+            ObservationEnsemble saved(&p);
+            bool ok = true;
+            double serr = 0.0;
+            try { saved.from_csv(wcsv); }
+            catch (...) { ok = false; }
+            CHK(ok, pr.second + ": saved " + wcsv);
+            if (ok)
+            {
+                Eigen::MatrixXd sv = saved.get_eigen(pr.first->rnames, wvars);
+                serr = ((sv - pr.first->w).array().abs() / pr.first->w.array().abs().max(1.0e-30)).maxCoeff();
+                CHK(serr < 1.0e-5, pr.second + ": saved weight ensemble matches what was used (max rel err " + to_string(serr) + ")");
+            }
+            ifstream fo(ocsv);
+            CHK(fo.good(), pr.second + ": saved " + ocsv);
+        }
+        // nothing saved when frac is 0
+        ifstream f0(name + "." + to_string(s0.iter) + ".adjusted.weights.csv");
+        CHK(!f0.good(), "frac 0: no adjusted weights file written");
+    }
+    catch (const exception& e)
+    {
+        cout.rdbuf(old);
+        CHK(false, name + ": threw during " + where + ": " + e.what());
+    }
+}
+
+static void test_structnoise_phi_factors()
+{
+    cout << "[structural noise with phi factors: phi factors on the prior only, de-weighting on top of them]" << endl;
+    // phi factors change the weights once, on the prior, and startup then takes weights_base
+    // and org_obs_info from those.  with structural noise on, they must not be re-run at a
+    // reinflation (that would count the structure twice), and the de-weighting has to start
+    // from the phi-factor weights, not from the control file ones.  two cases - one set of
+    // factors for everyone, and a table by realization (each row its own weights)
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p1);
+        obs.update_rec("O3", p2);
+        obs.update_rec("O4", p2);
+    };
+    int nreals = 30;
+    for (string kind : {"single", "by_real"})
+    {
+        string name = "selftest_structnoise_pf_" + kind;
+        {
+            ofstream f(name + ".phifac.csv");
+            if (kind == "single")
+                f << "g1,0.3" << endl << "g2,0.7" << endl;
+            else
+            {
+                f << "real,g1,g2" << endl;
+                for (int i = 0; i < nreals + 1; i++)
+                {
+                    double g1 = 0.1 + 0.8 * i / double(nreals);
+                    f << "r" << i << "," << g1 << "," << 1.0 - g1 << endl;
+                }
+            }
+        }
+        {
+            ofstream f(name + ".pst");
+            f << "pcf" << endl
+              << "* control data" << endl
+              << "restart estimation" << endl
+              << "2 4 2 0 2" << endl
+              << "1 1 single point 1 0 0" << endl
+              << "5.0 2.0 0.3 0.03 10" << endl
+              << "5.0 5.0 0.001" << endl
+              << "0.1" << endl
+              << "1 0.01 3 3 0.01 3" << endl
+              << "0 0 0" << endl
+              << "* parameter groups" << endl
+              << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+              << "* parameter data" << endl
+              << "p1 none relative 1.0 -5.0 5.0 pg 1.0 0.0 1" << endl
+              << "p2 none relative 0.5 -5.0 5.0 pg 1.0 0.0 1" << endl
+              << "* observation groups" << endl
+              << "g1" << endl
+              << "g2" << endl
+              << "* observation data" << endl
+              << "o1 0.0 10.0 g1" << endl
+              << "o2 2.0 10.0 g1" << endl
+              << "o3 0.5 2.0 g2" << endl
+              << "o4 1.5 2.0 g2" << endl
+              << "* model command line" << endl
+              << "echo" << endl
+              << "* model input/output" << endl
+              << "x.tpl x.dat" << endl
+              << "y.ins y.dat" << endl
+              << "++ies_num_reals(" << nreals << ")" << endl
+              << "++ies_n_iter_reinflate(1)" << endl
+              << "++ies_reinflate_structnoise_frac(1.0,0.0)" << endl
+              << "++ies_structnoise_deweight(true)" << endl
+              << "++ies_phi_factor_file(" << name << ".phifac.csv)" << endl;
+            if (kind == "by_real")
+                f << "++ies_phi_factors_by_real(true)" << endl;
+        }
+        stringstream cap;
+        streambuf* old = cout.rdbuf(cap.rdbuf());
+        string where = "startup";
+        try
+        {
+            ofstream flog(name + "_perf.log");
+            PerformanceLog pfm(flog);
+            FileManager fm(name);
+            ofstream& frec = fm.open_ofile_ext("rec");
+            Pest p;
+            {
+                ifstream fin(name + ".pst");
+                p.process_ctl_file(fin, name + ".pst", frec);
+            }
+            p.check_inputs(frec);
+            OutputFileWriter ofw(fm, p);
+            p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+            InProcessRunManager rm(name + ".rns", model);
+            rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+            StructNoiseProbe ies(p, fm, ofw, &pfm, &rm);
+            ies.initialize();
+
+            // what startup ended with - the phi factor weights
+            const Eigen::MatrixXd w_init = *ies.wts().get_eigen_ptr();
+            const Eigen::MatrixXd wb = *ies.wts_base().get_eigen_ptr();
+            const vector<string> wvars = ies.wts_base().get_var_names();
+            const vector<string> wreals = ies.wts_base().get_real_names();
+            const vector<string> ireals = ies.wts().get_real_names();
+            map<string, double> ctl_wts0;
+            for (auto& o : wvars)
+                ctl_wts0[o] = p.get_observation_info_ptr()->get_weight(o);
+
+            where = "reinflation with frac 1";
+            ies.bump_iter();
+            ies.reinflate_par_ensemble(1.0, 0, 0, 1.0);
+            const Eigen::MatrixXd w1 = *ies.wts().get_eigen_ptr();
+            const vector<string> r1 = ies.wts().get_real_names();
+            map<string, double> ctl_wts1;
+            for (auto& o : wvars)
+                ctl_wts1[o] = p.get_observation_info_ptr()->get_weight(o);
+            Eigen::VectorXd s2 = ies.s2();
+            vector<string> robs = ies.resid_obs();
+
+            where = "reinflation with frac 0";
+            ies.bump_iter();
+            ies.reinflate_par_ensemble(1.0, 0, 0, 0.0);
+            const Eigen::MatrixXd w0 = *ies.wts().get_eigen_ptr();
+            const vector<string> r0 = ies.wts().get_real_names();
+            map<string, double> ctl_wts2;
+            for (auto& o : wvars)
+                ctl_wts2[o] = p.get_observation_info_ptr()->get_weight(o);
+            cout.rdbuf(old);
+
+            map<string, double> s2_map;
+            for (int k = 0; k < robs.size(); k++)
+                s2_map[robs[k]] = s2[k];
+            map<string, int> wb_rmap, wi_rmap;
+            for (int i = 0; i < wreals.size(); i++)
+                wb_rmap[wreals[i]] = i;
+            for (int i = 0; i < ireals.size(); i++)
+                wi_rmap[ireals[i]] = i;
+
+            // startup: the phi factors changed the weights, and weights_base / org_obs_info hold
+            // the changed ones
+            // (by realization, the phi factors only scale rows of the weight ensemble - the
+            // control file weights are left as they were)
+            double moved = 0.0, ens_moved = 0.0, base_vs_init = 0.0, org_vs_ctl = 0.0;
+            for (int j = 0; j < wvars.size(); j++)
+            {
+                double pst_w = (wvars[j] == "O1" || wvars[j] == "O2") ? 10.0 : 2.0;
+                moved = max(moved, abs(ctl_wts0[wvars[j]] - pst_w));
+                org_vs_ctl = max(org_vs_ctl, abs(ies.org_info().get_weight(wvars[j]) - ctl_wts0[wvars[j]]));
+                for (auto& ri : wi_rmap)
+                {
+                    base_vs_init = max(base_vs_init, abs(wb(wb_rmap.at(ri.first), j) - w_init(ri.second, j)));
+                    ens_moved = max(ens_moved, abs(w_init(ri.second, j) - pst_w));
+                }
+            }
+            CHK(ens_moved > 1.0e-6, kind + ": the phi factors changed the weight ensemble at startup");
+            if (kind == "single")
+                CHK(moved > 1.0e-6, kind + ": the phi factors changed the control file weights at startup");
+            else
+                CHK(moved == 0.0, kind + ": phi factors by realization leave the control file weights alone");
+            CHK(base_vs_init == 0.0, kind + ": weights_base is the phi-factor weight ensemble");
+            CHK(org_vs_ctl == 0.0, kind + ": org_obs_info is the phi-factor control file weights");
+            if (kind == "by_real")
+            {
+                int jo1 = distance(wvars.begin(), find(wvars.begin(), wvars.end(), string("O1")));
+                set<double> uniq;
+                for (int i = 0; i < wb.rows(); i++)
+                    uniq.insert(wb(i, jo1));
+                CHK(uniq.size() > wb.rows() / 2, kind + ": each realization has its own phi-factor weights (" +
+                    to_string(uniq.size()) + " distinct of " + to_string(wb.rows()) + ")");
+            }
+
+            // frac 1: de-weighting from the phi-factor weights, row by row, never above them
+            double ferr = 0.0, over = 0.0, cerr = 0.0, cover = 0.0;
+            for (int i = 0; i < r1.size(); i++)
+            {
+                int ib = wb_rmap.at(r1[i]);
+                for (int j = 0; j < wvars.size(); j++)
+                {
+                    double b = wb(ib, j);
+                    double expect = 1.0 / sqrt(1.0 / (b * b) + s2_map.at(wvars[j]));
+                    ferr = max(ferr, abs(w1(i, j) - expect) / b);
+                    over = max(over, w1(i, j) - b);
+                }
+            }
+            for (auto& o : wvars)
+            {
+                double b = ctl_wts0[o];
+                cerr = max(cerr, abs(ctl_wts1[o] - 1.0 / sqrt(1.0 / (b * b) + s2_map.at(o))) / b);
+                cover = max(cover, ctl_wts1[o] - b);
+            }
+            CHK(ferr < 1.0e-12, kind + ": frac 1 de-weights each row from its own phi-factor weights (max rel err " + to_string(ferr) + ")");
+            CHK(over <= 0.0, kind + ": frac 1 never puts a weight above its phi-factor weight");
+            CHK(cerr < 1.0e-12, kind + ": frac 1 control file weights de-weighted from the phi-factor ones");
+            CHK(cover <= 0.0, kind + ": frac 1 control file weights never above the phi-factor ones");
+
+            // frac 0: back to exactly the phi-factor weights - not re-balanced by the phi
+            // factors, not left de-weighted
+            double back = 0.0, cback = 0.0;
+            for (int i = 0; i < r0.size(); i++)
+                for (int j = 0; j < wvars.size(); j++)
+                    back = max(back, abs(w0(i, j) - wb(wb_rmap.at(r0[i]), j)));
+            for (auto& o : wvars)
+                cback = max(cback, abs(ctl_wts2[o] - ctl_wts0[o]));
+            CHK(back == 0.0, kind + ": frac 0 puts the phi-factor weight ensemble back exactly (phi factors not re-run)");
+            CHK(cback == 0.0, kind + ": frac 0 puts the phi-factor control file weights back exactly");
+        }
+        catch (const exception& e)
+        {
+            cout.rdbuf(old);
+            CHK(false, name + ": threw during " + where + ": " + e.what());
+        }
+    }
 }
 
 static void test_ies_ensemble_reset()
@@ -491,6 +1747,186 @@ static void test_tool_objects_track_live_options()
         "each post-init change of the init-only sqp_num_reals IS flagged");
 }
 
+
+static void test_ensemble_keep_rows_empty()
+{
+    cout << "[ensemble keep_rows with an empty list: rows and names must agree]" << endl;
+    Pest p; p.set_defaults();
+    std::mt19937 rgen(11);
+
+    vector<string> rnames{"R0","R1","R2"};
+    vector<string> vnames{"V0","V1"};
+    Eigen::MatrixXd m(3,2);
+    m << 1.0, 4.0,
+         2.0, 5.0,
+         3.0, 6.0;
+
+    // the mou archive hits this when the nondom list comes back empty: get_eigen() reads
+    // an empty row list as "all rows", so the matrix keeps every row while the names are
+    // cleared, and the next pareto sort sees shape() of 3 but no members
+    {
+        ObservationEnsemble oe(&p, &rgen, m, rnames, vnames);
+        oe.keep_rows(vector<string>());
+        CHK(oe.shape().first == (int)oe.get_real_names().size(), "keep_rows(empty names): row count matches the names");
+        CHK(oe.shape().first == 0, "keep_rows(empty names): no rows left");
+    }
+
+    // same thing through the index overload
+    {
+        ObservationEnsemble oe(&p, &rgen, m, rnames, vnames);
+        oe.keep_rows(vector<int>());
+        CHK(oe.shape().first == (int)oe.get_real_names().size(), "keep_rows(empty idxs): row count matches the names");
+        CHK(oe.shape().first == 0, "keep_rows(empty idxs): no rows left");
+    }
+}
+
+// with millions of obs the name list and the name->column lookup are bigger than the numbers
+// in a lambda-test ensemble, so copies share them instead of each holding their own. these
+// checks fail if a copy of the names creeps back in, without having to measure memory
+static void test_ensemble_shared_names()
+{
+    cout << "[ensemble names: copies share one name list and lookup until their names change]" << endl;
+    Pest p; p.set_defaults();
+    std::mt19937 rgen(11);
+
+    int nvar = 100;
+    vector<string> rnames{"R0","R1","R2"};
+    vector<string> vnames;
+    for (int j = 0; j < nvar; j++)
+        vnames.push_back("V" + to_string(j));
+    Eigen::MatrixXd m(3, nvar);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < nvar; j++)
+            m(i, j) = 1000.0 * i + j;
+
+    ObservationEnsemble oe(&p, &rgen, m, rnames, vnames);
+
+    // get_var_names() hands back the ensemble's own list, not a copy
+    CHK(&oe.get_var_names() == &oe.get_var_names(), "get_var_names(): returns the ensemble's own list, not a copy");
+
+    // asking for a few columns out of many doesn't build the lookup of every name
+    {
+        ObservationEnsemble fresh(&p, &rgen, m, rnames, vnames);
+        Eigen::MatrixXd few = fresh.get_eigen(vector<string>(), vector<string>{"V7","V3","V7"});
+        CHK(!fresh.get_shared_var_names().has_lookup(), "get_eigen(few cols): no lookup of every name built");
+        CHK((few.cols() == 3) && (few(1, 0) == 1007.0) && (few(2, 1) == 2003.0) && (few(0, 2) == 7.0),
+            "get_eigen(few cols): right values, a column asked for twice comes back twice");
+        bool threw = false;
+        try { fresh.get_eigen(vector<string>(), vector<string>{"V7","NOT_THERE"}); }
+        catch (...) { threw = true; }
+        CHK(threw, "get_eigen(few cols): a name that isn't there still throws");
+    }
+
+    // a copy shares the names and the lookup
+    oe.update_var_map();
+    ObservationEnsemble c = oe;
+    CHK(c.get_shared_var_names().same_as(oe.get_shared_var_names()), "copy: shares the name list");
+    CHK(&c.get_var_names() == &oe.get_var_names(), "copy: get_var_names() is the very same list");
+    CHK(c.get_shared_var_names().has_lookup(), "copy: shares the lookup already built on the original");
+    CHK(c.get_var_index("V42") == 42, "copy: lookup gives the right column");
+
+    // assignment shares too
+    ObservationEnsemble a(&p, &rgen);
+    a = oe;
+    CHK(a.get_shared_var_names().same_as(oe.get_shared_var_names()), "assignment: shares the name list");
+
+    // changing the copy's names gives it its own list and leaves the original alone
+    vector<string> rev(vnames.rbegin(), vnames.rend());
+    c.reorder(vector<string>(), rev);
+    CHK(!c.get_shared_var_names().same_as(oe.get_shared_var_names()), "reorder on a copy: the copy gets its own names");
+    CHK((oe.get_var_names()[0] == "V0") && (oe.get_var_index("V0") == 0), "reorder on a copy: the original's names untouched");
+    CHK((c.get_var_names()[0] == "V" + to_string(nvar - 1)) && (c.get_var_index("V0") == nvar - 1),
+        "reorder on a copy: the copy's lookup matches its new order");
+    CHK((*oe.get_eigen_ptr())(1, 0) == 1000.0, "reorder on a copy: the original's values untouched");
+
+    // dropping columns on a copy: the lookup can never go stale (the old var_map could)
+    ObservationEnsemble d = oe;
+    d.drop_cols(vector<string>{"V0","V1"});
+    CHK(d.get_var_map().size() == (size_t)(nvar - 2), "drop_cols on a copy: lookup has just the names left");
+    CHK((d.get_var_index("V0") == -1) && (d.get_var_index("V2") == 0), "drop_cols on a copy: lookup matches the names left");
+    CHK(oe.get_var_index("V0") == 0, "drop_cols on a copy: original keeps all its names");
+
+    // an ensemble handed its own names (the list it's about to replace) still comes out right
+    ObservationEnsemble s(&p, &rgen, m, rnames, vnames);
+    s.reorder(vector<string>(), s.get_var_names());
+    CHK((s.get_var_names().size() == (size_t)nvar) && (s.get_var_names()[5] == "V5") && ((*s.get_eigen_ptr())(2, 5) == 2005.0),
+        "reorder with its own names: names and values unchanged");
+
+    // reserve() given a shared list shares it rather than copying
+    ObservationEnsemble r(&p, &rgen);
+    r.reserve(vector<string>{"A","B"}, oe.get_shared_var_names());
+    CHK(r.get_shared_var_names().same_as(oe.get_shared_var_names()), "reserve(shared names): shares the name list");
+    CHK((r.shape().first == 2) && (r.shape().second == nvar), "reserve(shared names): right shape");
+
+    // parameter ensembles get the same sharing
+    ParameterEnsemble pe(&p, &rgen);
+    pe.reserve(rnames, vnames);
+    ParameterEnsemble pc = pe;
+    CHK(pc.get_shared_var_names().same_as(pe.get_shared_var_names()), "par ensemble copy: shares the name list");
+}
+
+// the external obs data csv used to be held as a column-name -> value lookup for every row,
+// every column - 24 GB for a 7.5M obs file. now the obs file keeps one list per column, and
+// only the columns pest++ uses
+static void test_external_file_read_cols()
+{
+    cout << "[external file: only the asked-for columns are kept, the rest read back empty]" << endl;
+    string fname = "selftest_efile.csv";
+    {
+        ofstream f(fname);
+        f << "obsnme,obsval,weight,obgnme,extra1,standard_deviation,extra2" << endl;
+        f << "o1,1.5,1.0,g1,x,0.1,y" << endl;
+        f << "# a comment line in the middle" << endl;
+        f << "o2,2.5,0.0,g1,x,,y" << endl;
+        f << "o3,3.5,2.0,g2,x,0.3,y" << endl;
+    }
+    ofstream f_rec("selftest_efile.rec");
+    pest_utils::ExternalCtlFile efile(fname);
+    efile.set_read_cols(set<string>{"obsnme","obsval","weight","obgnme","standard_deviation"});
+    efile.read_file(f_rec);
+
+    set<string> cols = efile.get_col_set();
+    CHK((cols.size() == 7) && (cols.count("EXTRA1") == 1), "read_cols: every column still listed");
+    vector<string> e1 = efile.get_col_string_vector("EXTRA1");
+    CHK((e1.size() == 3) && (e1[0].empty()) && (e1[2].empty()), "read_cols: a column not asked for reads back empty");
+    vector<string> on = efile.get_col_string_vector("OBSNME");
+    CHK((on.size() == 3) && (on[0] == "O1") && (on[1] == "O2") && (on[2] == "O3"), "read_cols: asked-for column read right");
+    vector<string> sd = efile.get_col_string_vector("STANDARD_DEVIATION");
+    CHK((sd[0] == "0.1") && (sd[1].empty()) && (sd[2] == "0.3"), "read_cols: empty cells stay empty");
+
+    // rows are looked up by their key, which skips the comment line
+    vector<int> ro = efile.get_row_order();
+    CHK((ro.size() == 3) && (ro[0] == 0) && (ro[1] == 2) && (ro[2] == 3), "row keys skip the comment line");
+    vector<string> row = efile.get_row_vector(ro[2], vector<string>{"OBSNME","OBSVAL","WEIGHT","OBGNME"});
+    CHK((row.size() == 4) && (row[0] == "O3") && (row[1] == "3.5") && (row[3] == "G2"), "get_row_vector by key after a comment line");
+    vector<double> ov;
+    efile.fill_col_vector("OBSVAL", ov);
+    CHK((ov.size() == 3) && (ov[1] == 2.5), "fill_col_vector after a comment line");
+
+    // keep_cols drops what isn't kept, what's kept is untouched
+    set<string> keep{"obsnme","standard_deviation"};
+    efile.keep_cols(keep);
+    vector<string> ovs = efile.get_col_string_vector("OBSVAL");
+    CHK((ovs.size() == 3) && (ovs[0].empty()), "keep_cols: a dropped column reads back empty");
+    CHK(efile.get_col_string_vector("OBSNME")[1] == "O2", "keep_cols: a kept column untouched");
+    map<string, string> rm = efile.get_row_map(ro[0]);
+    CHK((rm.size() == 2) && (rm["STANDARD_DEVIATION"] == "0.1"), "get_row_map: just the kept columns");
+
+    // moved into the control file's list (as Pest does now) it keeps its data
+    vector<pest_utils::ExternalCtlFile> efiles;
+    efiles.push_back(std::move(efile));
+    CHK(efiles[0].get_col_string_vector("OBSNME")[2] == "O3", "moved into a list: data kept");
+
+    // with no read_cols set, every column is kept
+    pest_utils::ExternalCtlFile all(fname);
+    all.read_file(f_rec);
+    CHK(all.get_col_string_vector("EXTRA2")[1] == "Y", "no read_cols: every column kept");
+
+    f_rec.close();
+    std::error_code ec;
+    std::filesystem::remove(fname, ec);
+    std::filesystem::remove("selftest_efile.rec", ec);
+}
 
 static void test_ensemble_zero_copy_view()
 {
@@ -1650,6 +3086,84 @@ static void test_model_interface_partial_across_files()
         remove(f.c_str());
 }
 
+#ifndef _WIN32
+static void test_failed_exec_does_not_clone()
+{
+    cout << "[a command that cannot be started is an error - it does not clone this process]" << endl;
+    // the forked child used to throw when execvp() failed, and that exception unwound up a
+    // COPY of the caller's stack - so the child carried on running whatever called it. here
+    // that would be a second copy of this selftest, which leaves a marker and leaves
+    const string marker = "selftest_exec_clone.marker";
+    remove(marker.c_str());
+    pid_t me = getpid();
+    bool threw = false;
+    try
+    {
+        pest_utils::run_commands(vector<string>{"selftest_no_such_command_xyz"}, nullptr, false, 5);
+    }
+    catch (const std::exception&) { threw = true; }
+    if (getpid() != me)
+    {
+        { ofstream f(marker); f << "clone" << endl; }
+        _exit(0);
+    }
+    CHK(!filesystem::exists(marker), "the child of a failed exec carried on as a copy of the caller");
+    CHK(threw, "a command that cannot be started should be an error");
+    remove(marker.c_str());
+}
+#endif
+
+static void test_model_interface_obs_mismatch_messages()
+{
+    cout << "[ins/control file observation mismatches name the right side]" << endl;
+    const string src = "selftest_lbl.src", out = "selftest_lbl.out", ins = "selftest_lbl.ins";
+    { ofstream f(src); f << " 1.5 2.5" << endl; }
+    { ofstream f(ins); f << "pif ~" << endl << "l1 !la1! !la2!" << endl; }
+    // the run clears the output file first, so the "model" has to put it back
+#ifdef _WIN32
+    // no slashes: model interface turns every / in a command into \, so "cmd /c copy" became
+    // "cmd \c copy" and cmd just sat at a prompt without copying anything
+    const string cmd = "powershell -NoProfile -Command Copy-Item " + src + " " + out;
+#else
+    const string cmd = "cp " + src + " " + out;
+#endif
+    vector<string> none;
+    vector<string> insv{ins}, outv{out}, cmdv{cmd};
+
+    auto run_with = [&](const vector<string>& pst_obs) -> string
+    {
+        ModelInterface mi(none, none, insv, outv, cmdv);
+        mi.set_num_threads(1);
+        mi.set_sleep_ms(5);
+        mi.set_should_echo(false);
+        Parameters pars;
+        Observations obs;
+        for (auto& o : pst_obs)
+            obs.insert(o, 0.0);
+        try { mi.run(&pars, &obs); }
+        catch (const std::exception& e) { return e.what(); }
+        return "";
+    };
+
+    // LX is in the control file but no instruction reads it
+    string msg = run_with(vector<string>{"LA1", "LA2", "LX"});
+    CHK(msg.find("control file observations are not in the instruction files") != string::npos,
+        "a control file observation the ins files do not read is reported as such");
+    CHK(msg.find("LX") != string::npos, "and it is named");
+
+    // LA2 is read by the instructions but the control file does not have it
+    msg = run_with(vector<string>{"LA1"});
+    CHK(msg.find("instruction observations are not in the control file") != string::npos,
+        "an ins observation the control file does not have is reported as such");
+    CHK(msg.find("LA2") != string::npos, "and it is named");
+
+    // and when they agree, the values come through
+    CHK(run_with(vector<string>{"LA1", "LA2"}).empty(), "matching sets run cleanly");
+
+    for (auto& f : {src, out, ins})
+        remove(f.c_str());
+}
+
 /**
  * @brief Byte-by-byte truncation of a REAL instruction set, not a synthetic one.
  *
@@ -2372,6 +3886,119 @@ static void test_violation_single_run_matches_ensemble()
     remove("selftest_viol.rec");
 }
 
+static void test_mou_all_infeasible_nondom()
+{
+    cout << "[mou nsga: when every member is infeasible, the least infeasible one is the nondom one]" << endl;
+    // update() puts each infeasible member in its own front, ordered by violation, and
+    // get_nsga2_pareto_dominance() takes front 1 as the nondominated set - the same numbering
+    // the dominance sort uses. the infeasible fronts used to start at 0, so the least
+    // infeasible member landed in the dominated set and the SECOND least infeasible one was
+    // handed to the archive and to pso as the only nondominated member.
+    //
+    // two objectives and one less-than constraint (con1 <= 0) that every member violates by a
+    // different amount. a real control file, because Constraints::initialize() reads the
+    // constraint senses from the observation groups.
+    string pst_name = "selftest_moea.pst";
+    {
+        ofstream f(pst_name);
+        f << "pcf" << endl
+          << "* control data" << endl
+          << "restart estimation" << endl
+          << "2 3 1 0 2" << endl
+          << "1 1 single point 1 0 0" << endl
+          << "5.0 2.0 0.3 0.03 10" << endl
+          << "5.0 5.0 0.001" << endl
+          << "0.1" << endl
+          << "0 0.01 3 3 0.01 3" << endl
+          << "0 0 0" << endl
+          << "* parameter groups" << endl
+          << "dv relative 0.01 0.0 switch 2.0 parabolic" << endl
+          << "* parameter data" << endl
+          << "x1 none relative 0.5 0.0 1.0 dv 1.0 0.0 1" << endl
+          << "x2 none relative 0.5 0.0 1.0 dv 1.0 0.0 1" << endl
+          << "* observation groups" << endl
+          << "l_obj" << endl
+          << "l_con" << endl
+          << "* observation data" << endl
+          << "obj1 0.0 1.0 l_obj" << endl
+          << "obj2 0.0 1.0 l_obj" << endl
+          << "con1 0.0 1.0 l_con" << endl
+          << "* model command line" << endl
+          << "echo" << endl
+          << "* model input/output" << endl
+          << "x.tpl x.dat" << endl
+          << "y.ins y.dat" << endl;
+    }
+    ofstream flog("selftest_moea_perf.log");
+    PerformanceLog pfm(flog);
+    FileManager fm("selftest_moea");
+    ofstream& frec = fm.open_ofile_ext("rec");
+    Pest p;
+    {
+        ifstream fin(pst_name);
+        p.process_ctl_file(fin, pst_name, frec);
+    }
+    OutputFileWriter ofw(fm, p);
+    Constraints c(p, &fm, ofw, pfm);
+    vector<string> dv_names{"X1", "X2"};
+    c.initialize(dv_names, numeric_limits<double>::max());
+    CHK(c.get_obs_constraint_names().size() == 3, "both objectives and con1 are read as constraint observations");
+
+    vector<string> obj_names{"OBJ1", "OBJ2"}, obs_obj_names{"OBJ1", "OBJ2"}, empty;
+    map<string, double> obj_dir_mult;
+    map<string, string> ppd_obj_to_sd;
+    ParetoObjectives po(p, fm, &pfm);
+    po.set_prob_pareto(false);
+    po.set_pointers(obj_names, obs_obj_names, empty, empty, empty, obj_dir_mult, ppd_obj_to_sd);
+
+    std::mt19937 rgen(11);
+    vector<string> onames{"OBJ1", "OBJ2", "CON1"};
+    // con1 violations 3, 1, 2, 4: M1 is the least infeasible, M2 is next
+    vector<string> rnames{"M0", "M1", "M2", "M3"};
+    Eigen::MatrixXd om(4, 3);
+    om << 1.0, 4.0, 3.0,
+          2.0, 3.0, 1.0,
+          3.0, 2.0, 2.0,
+          4.0, 1.0, 4.0;
+    ObservationEnsemble op(&p, &rgen, om, rnames, onames);
+    Eigen::MatrixXd dm(4, 2);
+    dm << 0.1, 0.2,
+          0.3, 0.4,
+          0.5, 0.6,
+          0.7, 0.8;
+    ParameterEnsemble dp(&p, &rgen, dm, rnames, dv_names);
+
+    pair<vector<string>, vector<string>> dom = po.get_nsga2_pareto_dominance(0, op, dp, &c, false, false);
+    CHK(po.get_num_feasible() == 0, "every member is infeasible");
+    CHK(dom.first.size() == 1, "one nondominated member when all are infeasible, got " + to_string(dom.first.size()));
+    CHK(dom.first.size() > 0 && dom.first[0] == "M1",
+        "the nondominated member is the least infeasible one (M1), got " +
+        (dom.first.size() > 0 ? dom.first[0] : string("none")));
+    CHK(dom.first.size() + dom.second.size() == 4, "every member is in one set or the other");
+    CHK(find(dom.second.begin(), dom.second.end(), "M1") == dom.second.end(),
+        "the least infeasible member is not in the dominated set");
+
+    // a single infeasible member: with fronts starting at 0 it had no front 1 to be in, so the
+    // nondominated set came back empty
+    vector<string> one{"M3"};
+    Eigen::MatrixXd om1 = om.row(3);
+    Eigen::MatrixXd dm1 = dm.row(3);
+    ObservationEnsemble op1(&p, &rgen, om1, one, onames);
+    ParameterEnsemble dp1(&p, &rgen, dm1, one, dv_names);
+    dom = po.get_nsga2_pareto_dominance(0, op1, dp1, &c, false, false);
+    CHK(dom.first.size() == 1 && dom.first[0] == "M3", "a lone infeasible member is nondominated");
+    CHK(dom.second.empty(), "and nothing is dominated");
+
+    for (const string& tag : {string("rec"), POP_SUM_TAG, ARC_SUM_TAG, ARC_TRIM_SUM_TAG})
+    {
+        fm.close_file(tag);
+        remove(fm.build_filename(tag).c_str());
+    }
+    flog.close();
+    remove("selftest_moea_perf.log");
+    remove(pst_name.c_str());
+}
+
 
 // ---------------------------------------------------------------------------------------
 // The regularization weight search, isolated.
@@ -2718,138 +4345,411 @@ static void test_prior_inv_sqrt_diag()
         "agrees with scale_prior_anomalies() on the same prior");
 }
 
-/* ies_use_prior_prec: the glm step with an explicit prior precision Q in both the
- * hessian and the gradient.  when Q is the (untruncated) Am Am^T of the same
- * ensemble - the pseudo-inverse of the prior anomaly covariance that the existing
- * path uses - the two forms are the same thing written differently, so the
- * upgrades have to agree to roundoff, at iteration 1 (data term only) and at
- * iteration 2 with the prior pull switched on.  the obs anomalies are kept full
- * rank (nobs >= N-1) so the existing path's V-subspace projection is the whole
- * centred subspace; with fewer obs the two forms legitimately differ.
- */
-static void test_ies_prior_prec_reduces_to_am()
-{
-    cout << "[ies prior precision: Q = Am Am^T reproduces the existing glm step]" << endl;
 
-    const int npar = 30, nobs = 40, nreal = 12;
-    // seeded pseudo-random so the anomalies are full rank (N-1): a smooth formula
-    // like sin(a i + b j) is rank 2 and then the obs svd spans only part of the
-    // centred subspace, which is exactly the case where the two forms differ
-    std::mt19937 gen(20260919);
-    std::uniform_real_distribution<double> unif(-1.0, 1.0);
-    Eigen::MatrixXd par_diff0(npar, nreal), obs_diff0(nobs, nreal), obs_resid0(nobs, nreal),
-        par_resid0(npar, nreal);
+static void test_local_writeback()
+{
+    cout << "[localized solve: lock-free write-back into disjoint columns matches add_2_cols_ip]" << endl;
+    // 40 reals x 3000 vars, 300 cases of 10 vars each, written by 8 threads at once
+    int nr = 40, nv = 3000, nc = 300;
+    std::mt19937 gen(17);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    vector<string> vnames;
+    for (int j = 0; j < nv; j++) vnames.push_back("p" + to_string(j));
+    unordered_map<string, int> idx;
+    for (int j = 0; j < nv; j++) idx[vnames[j]] = j;
+    // cases take a shuffled permutation of the columns, so writes interleave across the matrix
+    vector<int> perm(nv);
+    for (int j = 0; j < nv; j++) perm[j] = j;
+    for (int j = nv - 1; j > 0; j--) { int k = (int)(gen() % (j + 1)); std::swap(perm[j], perm[k]); }
+    vector<vector<string>> case_names(nc);
+    vector<Eigen::MatrixXd> case_upd(nc);
+    for (int c = 0; c < nc; c++)
+    {
+        for (int k = 0; k < nv / nc; k++) case_names[c].push_back(vnames[perm[c * (nv / nc) + k]]);
+        case_upd[c].resize(nr, nv / nc);
+        for (int i = 0; i < nr; i++) for (int k = 0; k < nv / nc; k++) case_upd[c](i, k) = nd(gen);
+    }
+    Eigen::MatrixXd base(nr, nv);
+    for (int i = 0; i < nr; i++) for (int j = 0; j < nv; j++) base(i, j) = nd(gen);
+    // reference: the old serial path
+    vector<string> rnames;
+    for (int i = 0; i < nr; i++) rnames.push_back("r" + to_string(i));
+    Pest pest_scenario;
+    ParameterEnsemble ref(&pest_scenario);
+    ref.reserve(rnames, vnames);
+    ref.set_eigen(base);
+    for (int c = 0; c < nc; c++) ref.add_2_cols_ip(case_names[c], case_upd[c]);
+    // threaded, no lock
+    Eigen::MatrixXd tgt = base;
+    std::atomic<int> next(0), written(0);
+    vector<thread> ths;
+    for (int t = 0; t < 8; t++)
+        ths.push_back(thread([&]() {
+            while (true)
+            {
+                int c = next.fetch_add(1);
+                if (c >= nc) break;
+                written += UpgradeThread::write_local_upgrade(tgt, idx, case_names[c], case_upd[c]);
+            }
+        }));
+    for (auto& th : ths) th.join();
+    CHK(written == nv, "every column written once (" + to_string(written.load()) + ")");
+    double d = (tgt - *ref.get_eigen_ptr()).cwiseAbs().maxCoeff();
+    CHK(d == 0.0, "threaded write-back is bit-identical to add_2_cols_ip (max diff " + to_string(d) + ")");
+    // it adds, it does not assign
+    Eigen::MatrixXd t2 = Eigen::MatrixXd::Ones(nr, nv);
+    UpgradeThread::write_local_upgrade(t2, idx, case_names[0], case_upd[0]);
+    int j0 = idx.at(case_names[0][0]);
+    CHK(std::abs(t2(0, j0) - (1.0 + case_upd[0](0, 0))) < 1e-15, "adds into the column rather than overwriting");
+    // bad input is refused, not written
+    bool threw = false;
+    vector<string> bad = {"nope"};
+    try { UpgradeThread::write_local_upgrade(t2, idx, bad, Eigen::MatrixXd::Zero(nr, 1)); } catch (...) { threw = true; }
+    CHK(threw, "an unknown name throws");
+    threw = false;
+    try { UpgradeThread::write_local_upgrade(t2, idx, case_names[0], Eigen::MatrixXd::Zero(nr + 1, nv / nc)); } catch (...) { threw = true; }
+    CHK(threw, "a row count mismatch throws");
+    threw = false;
+    try { UpgradeThread::write_local_upgrade(t2, idx, case_names[0], Eigen::MatrixXd::Zero(nr, 3)); } catch (...) { threw = true; }
+    CHK(threw, "a column count mismatch throws");
+}
+
+static void test_zero_obs_diff_trap()
+{
+    cout << "[ensemble solve: all-zero obs differences give a zero upgrade, not a crash]" << endl;
+    //the da 10par_xsec case that crashed: an obs at a fixed-head cell has the same value in
+    //every realization, so a local solve pairing it alone with a parameter gets an all-zero
+    //obs_diff.  the svd keeps nothing and eigen then reads a null pointer
+    const int npar = 3, nreal = 10;
+    std::mt19937 gen(4321);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    Eigen::MatrixXd par_diff0(npar, nreal), par_resid0(npar, nreal);
     for (int i = 0; i < npar; i++)
         for (int j = 0; j < nreal; j++)
         {
-            par_diff0(i, j) = unif(gen);
-            par_resid0(i, j) = 0.3 * unif(gen);
+            par_diff0(i, j) = nd(gen);
+            par_resid0(i, j) = nd(gen);
         }
-    for (int i = 0; i < nobs; i++)
-        for (int j = 0; j < nreal; j++)
+    Eigen::MatrixXd Am = par_diff0;
+    Eigen::DiagonalMatrix<double, Eigen::Dynamic> parcov_inv(Eigen::VectorXd::Ones(npar));
+    vector<string> pnames{"p1", "p2", "p3"};
+
+    auto solve = [&](int nobs, bool zero, bool use_glm, bool use_approx, PestppOptions::SVD_PACK pack)
+    {
+        Eigen::MatrixXd par_resid = par_resid0, par_diff = par_diff0;
+        Eigen::MatrixXd obs_diff = Eigen::MatrixXd::Zero(nobs, nreal);
+        Eigen::MatrixXd obs_resid = Eigen::MatrixXd::Ones(nobs, nreal);
+        Eigen::MatrixXd obs_err(nobs, nreal);
+        for (int i = 0; i < nobs; i++)
+            for (int j = 0; j < nreal; j++)
+            {
+                obs_err(i, j) = nd(gen);
+                if (!zero)
+                    obs_diff(i, j) = nd(gen);
+            }
+        Eigen::DiagonalMatrix<double, Eigen::Dynamic> weights(Eigen::VectorXd::Ones(nobs));
+        vector<string> onames;
+        for (int i = 0; i < nobs; i++)
+            onames.push_back("o" + to_string(i));
+        Eigen::MatrixXd upgrade;
+        UpgradeThread::ensemble_solution(2, 0, 1000, 0, 0, false, use_approx, use_glm,
+                                         0.1, 1.0e-7, par_resid, par_diff, Am, obs_resid,
+                                         obs_diff, upgrade, obs_err, weights, parcov_inv,
+                                         onames, pnames, 0.0, -1.0, pack);
+        return upgrade;
+    };
+
+    vector<pair<PestppOptions::SVD_PACK, string>> packs{
+        {PestppOptions::EIGEN, "eigen"}, {PestppOptions::BDCSVD, "bdcsvd"}, {PestppOptions::REDSVD, "redsvd"}};
+    for (auto& pk : packs)
+    {
+        for (int form = 0; form < 3; form++)
         {
-            obs_diff0(i, j) = unif(gen);
-            obs_resid0(i, j) = 0.2 * unif(gen) + 0.1;
+            //mda, glm approx, glm full (iter 2, so the prior term would run)
+            bool use_glm = form > 0, use_approx = form < 2;
+            string tag = pk.second + (form == 0 ? " mda" : (form == 1 ? " glm approx" : " glm full"));
+            Eigen::MatrixXd u = solve(1, true, use_glm, use_approx, pk.first);
+            CHK((u.rows() == nreal) && (u.cols() == npar) && (u.cwiseAbs().maxCoeff() == 0.0),
+                tag + ": one all-zero obs gives a zero realizations x parameters upgrade");
         }
-    par_diff0 = par_diff0.colwise() - par_diff0.rowwise().mean();
-    obs_diff0 = obs_diff0.colwise() - obs_diff0.rowwise().mean();
-    Eigen::MatrixXd obs_err0 = 0.1 * obs_diff0;
-
-    Eigen::VectorXd wvec(nobs);
-    for (int i = 0; i < nobs; i++)
-        wvec[i] = 0.5 + 0.1 * (i % 4);
-    Eigen::DiagonalMatrix<double, Eigen::Dynamic> weights(wvec);
-    Eigen::DiagonalMatrix<double, Eigen::Dynamic> parcov_identity(Eigen::VectorXd::Ones(npar));
-    vector<string> onames, pnames;
-    for (int i = 0; i < nobs; i++) onames.push_back("o" + to_string(i));
-    for (int i = 0; i < npar; i++) pnames.push_back("p" + to_string(i));
-
-    // Am exactly as get_Am builds it: tsvd of the scaled prior anomalies, U S^-1
-    const double eigthresh = 1.0e-10;
-    const int maxsing = 1000;
-    Eigen::MatrixXd Am;
-    {
-        Eigen::MatrixXd pd = par_diff0 / sqrt(double(nreal - 1));
-        Eigen::MatrixXd s, U, V;
-        SVD_REDSVD rsvd;
-        rsvd.solve_ip(pd, s, U, V, eigthresh, maxsing);
-        Eigen::MatrixXd sinv = s.asDiagonal().inverse();
-        Am = U * sinv;
+        Eigen::MatrixXd u = solve(0, true, true, true, pk.first);
+        CHK((u.rows() == nreal) && (u.cols() == npar) && (u.cwiseAbs().maxCoeff() == 0.0),
+            pk.second + ": no obs at all is trapped the same way");
+        u = solve(2, false, true, true, pk.first);
+        CHK((u.rows() == nreal) && (u.cols() == npar) && (u.cwiseAbs().maxCoeff() > 0.0) && u.allFinite(),
+            pk.second + ": varying obs are not trapped and give a finite nonzero upgrade");
     }
-    Eigen::MatrixXd Qd = Am * Am.transpose();
-    Eigen::SparseMatrix<double> Q = Qd.sparseView();
+}
 
-    auto solve_old = [&](int iter, double lam, double reg)
+static void test_svd_pack_bdcsvd()
+{
+    cout << "[svd_pack(bdcsvd): Eigen BDCSVD matches JacobiSVD through both SVD_EIGEN paths]" << endl;
+    PO o; o.set_defaults();
+    CHK(o.assign_value_by_key("SVD_PACK", "bdcsvd") == PO::ARG_STATUS::ARG_ACCEPTED, "svd_pack(bdcsvd) parses");
+    CHK(o.get_svd_pack() == PO::BDCSVD, "and selects BDCSVD");
+    PO o2; o2.set_defaults();   // a fresh object: a second assignment of one key is a duplicate
+    CHK(o2.assign_value_by_key("SVD_PACK", "eigen") == PO::ARG_STATUS::ARG_ACCEPTED && o2.get_svd_pack() == PO::EIGEN,
+        "eigen still selects the Jacobi package");
+    ofstream flog("selftest_svd_bdc.log");
+    PerformanceLog pfm(flog);
+    SVD_EIGEN jac(1000000, 1.0e-7, false), bdc(1000000, 1.0e-7, true);
+    jac.set_performance_log(&pfm);
+    bdc.set_performance_log(&pfm);
+    CHK(!jac.get_use_bdc() && bdc.get_use_bdc(), "the switch is set by the constructor");
+    CHK(bdc.description == "Eigen BDCSVD" && jac.description == "Eigen JacobiSVD", "descriptions name the factorization");
+    SVD_EIGEN copy(bdc);
+    CHK(copy.get_use_bdc(), "a copy keeps the switch");
+    // big enough that Eigen really uses divide and conquer (it falls back to Jacobi below 16 columns),
+    // rank deficient so truncation is exercised: 70 x 60 of rank 40
+    std::mt19937 gen(31);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    Eigen::MatrixXd L(70, 40), R(40, 60);
+    for (int i = 0; i < 70; i++) for (int j = 0; j < 40; j++) L(i, j) = nd(gen);
+    for (int i = 0; i < 40; i++) for (int j = 0; j < 60; j++) R(i, j) = nd(gen);
+    Eigen::MatrixXd A = L * R;
+    // dense path
+    Eigen::MatrixXd Aj = A, Ab = A, Sj, Sb, Uj, Ub, Vj, Vb;
+    jac.solve_ip(Aj, Sj, Uj, Vj, 1.0e-10, 1000000);
+    bdc.solve_ip(Ab, Sb, Ub, Vb, 1.0e-10, 1000000);
+    CHK(Sj.size() == 40 && Sb.size() == 40, "dense path: both truncate to the rank, 40");
+    double ds = (Eigen::VectorXd(Sj) - Eigen::VectorXd(Sb)).cwiseAbs().maxCoeff() / Eigen::VectorXd(Sj)(0);
+    CHK(ds < 1.0e-10, "dense path: singular values agree (" + to_string(ds) + ")");
+    Eigen::MatrixXd Rb = Ub * Eigen::VectorXd(Sb).asDiagonal() * Vb.transpose();
+    double rb = (Rb - A).cwiseAbs().maxCoeff() / A.cwiseAbs().maxCoeff();
+    CHK(rb < 1.0e-10, "dense path: BDCSVD reconstructs A (" + to_string(rb) + ")");
+    // sparse path
+    Eigen::SparseMatrix<double> As = A.sparseView(), Uj2, Ub2, Vtj, Vtb;
+    Eigen::VectorXd sj, sb, tj, tb;
+    jac.solve_ip(As, sj, Uj2, Vtj, tj, 1.0e-10);
+    bdc.solve_ip(As, sb, Ub2, Vtb, tb, 1.0e-10);
+    CHK(sj.size() == sb.size() && sb.size() == 40, "sparse path: both keep 40");
+    CHK(tb.size() == 20, "sparse path: the 20 truncated values are returned");
+    double ds2 = (sj - sb).cwiseAbs().maxCoeff() / sj(0);
+    CHK(ds2 < 1.0e-10, "sparse path: singular values agree");
+    Eigen::MatrixXd Rs = Eigen::MatrixXd(Ub2) * sb.asDiagonal() * Eigen::MatrixXd(Vtb);
+    double rs = (Rs - A).cwiseAbs().maxCoeff() / A.cwiseAbs().maxCoeff();
+    CHK(rs < 1.0e-10, "sparse path: BDCSVD reconstructs A");
+}
+
+static void test_localizer_combine_common()
+{
+    cout << "[localizer: combine_common merges entries with the same nonzero pattern]" << endl;
+    typedef unordered_map<string, pair<vector<string>, vector<string>>> LMap;
+    PO o; o.set_defaults();
+    CHK(!o.get_ies_localizer_combine_common(), "ies_localizer_combine_common defaults to false");
+    CHK(o.assign_value_by_key("IES_LOCALIZER_COMBINE_COMMON", "true") == PO::ARG_STATUS::ARG_ACCEPTED, "parses");
+    CHK(o.get_ies_localizer_combine_common(), "and is true after 'true'");
+    // by parameters: three columns share {o1,o2} (one listed in the other order), one has {o1},
+    // one is a group column already holding two parameters with {o1,o2,o3}
+    LMap m;
+    m["p1"] = {{"o1", "o2"}, {"p1"}};
+    m["p2"] = {{"o2", "o1"}, {"p2"}};
+    m["p3"] = {{"o1", "o2"}, {"p3"}};
+    m["p4"] = {{"o1"}, {"p4"}};
+    m["grp"] = {{"o1", "o2", "o3"}, {"p5", "p6"}};
+    stringstream rec;
+    Localizer::CombineStats st = Localizer::combine_common(m, Localizer::How::PARAMETERS, rec);
+    CHK(st.n_in == 5 && st.n_out == 3, "five entries, three patterns -> three solves");
+    CHK(st.largest == 3, "largest combined set is three");
+    CHK(m.count("p1+2") == 1, "merged entry named after its first (sorted) member with +2");
+    CHK(m.count("p4") == 1 && m.count("grp") == 1, "singletons keep their names");
+    vector<string> want = {"p1", "p2", "p3"};
+    CHK(m["p1+2"].second == want, "merged parameters in sorted-member order");
+    CHK(m["p1+2"].first.size() == 2, "merged entry keeps one copy of the observation list");
+    CHK(rec.str().find("local solves before combining: 5") != string::npos, "summary reports the count before");
+    CHK(rec.str().find("local solves after combining:  3") != string::npos, "summary reports the count after");
+    CHK(rec.str().find("p1+2 (3 columns): p1 p2 p3") != string::npos, "summary lists the merged set and its members");
+    CHK(rec.str().find("3:1") != string::npos, "summary gives the size distribution");
+    // a near miss is not merged
+    LMap m2;
+    m2["p1"] = {{"o1", "o2"}, {"p1"}};
+    m2["p2"] = {{"o1", "o3"}, {"p2"}};
+    stringstream rec2;
+    st = Localizer::combine_common(m2, Localizer::How::PARAMETERS, rec2);
+    CHK(rec2.str().find("nothing was combined") != string::npos, "summary says so when nothing merges");
+    CHK(st.n_in == 2 && st.n_out == 2 && st.largest == 1, "different patterns stay separate");
+    // by observations: rows with the same parameter list merge their observation lists
+    LMap m3;
+    m3["o1"] = {{"o1"}, {"p1", "p2"}};
+    m3["o2"] = {{"o2"}, {"p2", "p1"}};
+    m3["o3"] = {{"o3"}, {"p1"}};
+    stringstream rec3;
+    st = Localizer::combine_common(m3, Localizer::How::OBSERVATIONS, rec3);
+    CHK(st.n_in == 3 && st.n_out == 2, "three rows, two patterns -> two solves");
+    vector<string> wobs = {"o1", "o2"};
+    CHK(m3.count("o1+1") == 1 && m3["o1+1"].first == wobs, "merged rows pool their observations");
+    // an empty map is left alone
+    LMap m4;
+    stringstream rec4;
+    st = Localizer::combine_common(m4, Localizer::How::PARAMETERS, rec4);
+    CHK(st.n_in == 0 && st.n_out == 0, "empty map -> nothing");
+    // hash-order independence: build the same map in another insertion order, same result
+    LMap m5;
+    m5["grp"] = {{"o1", "o2", "o3"}, {"p5", "p6"}};
+    m5["p4"] = {{"o1"}, {"p4"}};
+    m5["p3"] = {{"o1", "o2"}, {"p3"}};
+    m5["p2"] = {{"o2", "o1"}, {"p2"}};
+    m5["p1"] = {{"o1", "o2"}, {"p1"}};
+    stringstream rec5;
+    Localizer::combine_common(m5, Localizer::How::PARAMETERS, rec5);
+    CHK(m5.count("p1+2") == 1 && m5["p1+2"].second == want, "same merge from another insertion order");
+}
+
+static void test_overdue_decision()
+{
+    cout << "[panther: the overdue decision - giveup is per copy and unconditional, duplicates need a free agent]" << endl;
+    using A = RunManagerPanther::OverdueAction;
+    // giveup_minutes 0.25, fac 3, resched 1.15, max_run_fail 3, max concurrent 3, floor 0.01 min
+    auto dec = [](double dur, double avg, int nfail, int nconc, bool free_agent, double gmin = 0.25, double gfac = 3.0,
+                  int maxfail = 3, bool quit = false)
     {
-        Eigen::MatrixXd par_resid = par_resid0, par_diff = par_diff0;
-        Eigen::MatrixXd obs_resid = obs_resid0, obs_diff = obs_diff0, obs_err = obs_err0;
-        Eigen::MatrixXd upgrade;
-        UpgradeThread::ensemble_solution(iter, 0, maxsing, 0, 0, false, false, true, lam, eigthresh,
-                                         par_resid, par_diff, Am, obs_resid, obs_diff, upgrade,
-                                         obs_err, weights, parcov_identity, onames, pnames, reg, -1.0);
-        return upgrade;
+        return RunManagerPanther::decide_overdue(dur, avg, nfail, nconc, free_agent, gmin, gfac, 1.15, maxfail, 3, 0.01, quit);
     };
-    auto solve_new = [&](int iter, double lam, double reg, const Eigen::SparseMatrix<double>& q)
-    {
-        Eigen::MatrixXd par_resid = par_resid0, par_diff = par_diff0;
-        Eigen::MatrixXd obs_resid = obs_resid0, obs_diff = obs_diff0;
-        Eigen::MatrixXd upgrade;
-        UpgradeThread::ensemble_solution_prec(iter, 0, maxsing, false, lam, eigthresh, par_resid,
-                                              par_diff, q, obs_resid, obs_diff, upgrade, weights, reg);
-        return upgrade;
-    };
-    auto rel = [](const Eigen::MatrixXd& a, const Eigen::MatrixXd& b)
-    { return (a - b).norm() / max(1.0e-30, a.norm()); };
+    // past the minutes with agents free and a fast model: killed and requeued (this was the hang)
+    auto d = dec(0.3, 0.005, 0, 1, true);
+    CHK(d.action == A::KILL_COPY, "past giveup_minutes with free agents and a fast model -> kill this copy");
+    CHK(d.why == "giveup_minutes", "and the reason says so");
+    // same with no agents free: same answer, the gate is gone
+    CHK(dec(0.3, 0.005, 0, 1, false).action == A::KILL_COPY, "no free agents -> same kill");
+    // the failure that uses up max_run_fail kills every copy
+    CHK(dec(0.3, 0.005, 2, 1, true).action == A::KILL_ALL, "third failure -> kill all copies, run fails");
+    CHK(dec(0.3, 0.005, 0, 1, true, 0.25, 3.0, 1).action == A::KILL_ALL, "max_run_fail 1 -> first giveup kills all");
+    // the factor needs an average above the floor
+    CHK(dec(0.05, 0.004, 0, 1, true, 1.0e30, 3.0).action == A::NONE, "fac on a sub-floor average is inert");
+    d = dec(0.5, 0.1, 0, 1, true, 1.0e30, 3.0);
+    CHK(d.action == A::KILL_COPY && d.why == "giveup_fac", "3x a usable average -> giveup_fac kill");
+    CHK(dec(0.29, 0.1, 0, 1, false, 1.0e30, 3.0).action == A::NONE, "under 3x and no free agent -> nothing");
+    CHK(dec(0.29, 0.1, 0, 1, true, 1.0e30, 3.0).action == A::RESCHEDULE, "under 3x with a free agent -> only the duplicate");
+    // both bounds disabled: a long run is left alone
+    d = dec(100.0, 0.1, 0, 1, true, 1.0e30, 1.0e30);
+    CHK(d.action != A::KILL_COPY && d.action != A::KILL_ALL, "both giveups disabled -> never killed, however long");
+    // the precautionary duplicate
+    d = dec(0.13, 0.1, 0, 1, true, 1.0e30, 1.0e30);
+    CHK(d.action == A::RESCHEDULE && d.why == "resched_fac", "past 1.15x with a free agent -> duplicate");
+    CHK(dec(0.13, 0.1, 0, 1, false, 1.0e30, 1.0e30).action == A::NONE, "no free agent -> no duplicate");
+    CHK(dec(0.13, 0.1, 0, 3, true, 1.0e30, 1.0e30).action == A::NONE, "at the concurrency limit -> no duplicate");
+    CHK(dec(0.13, 0.005, 0, 1, true, 1.0e30, 1.0e30).action == A::NONE, "sub-floor average -> no duplicate");
+    // a quit file request is a giveup on every copy
+    d = dec(0.01, 0.1, 0, 1, true, 1.0e30, 1.0e30, 3, true);
+    CHK(d.action == A::KILL_COPY && d.why == "quit file", "quit file -> kill, reason quit file");
+    // the minutes bound wins the label when both are over
+    CHK(dec(0.5, 0.1, 0, 1, true, 0.25, 3.0).why == "giveup_minutes", "both over -> labelled giveup_minutes");
+}
 
-    // iteration 1: data term only, at two lambdas
-    for (double lam : {0.0, 3.0})
+static void test_quarantine_screen()
+{
+    cout << "[panther: the host screen judges failure rates, not agent counts, and leaves the model's failures alone]" << endl;
+    using S = AgentInfoRec::State;
+    using V = RunManagerPanther::QuarantineAgentView;
+    auto add_agents = [](vector<V>& agents, const string& host, int n, S state)
     {
-        Eigen::MatrixXd o = solve_old(1, lam, 1.0), n = solve_new(1, lam, 1.0, Q);
-        CHK(o.rows() == n.rows() && o.cols() == n.cols(), "prec form gives an N x p upgrade");
-        double d = rel(o, n);
-        if (d > 1.0e-8)
-            cout << "  iteration 1, lambda " << lam << ": relative diff " << d << endl;
-        CHK(d < 1.0e-8, "iteration 1 upgrade matches the existing glm step (lambda " + to_string(lam) + ")");
-        CHK(o.norm() > 1.0e-8, "the iteration 1 upgrade is non-zero");
-    }
-    // iteration 2 with reg_factor 1: the prior pull is in on both sides
+        for (int i = 0; i < n; i++)
+            agents.push_back({ host, state });
+    };
+    // n failed runs on one host, run ids from first
+    auto add_fails = [](map<int, map<string, int>>& rf, const string& host, int first, int n)
     {
-        Eigen::MatrixXd o = solve_old(2, 2.0, 1.0), n = solve_new(2, 2.0, 1.0, Q);
-        double d = rel(o, n);
-        if (d > 1.0e-8)
-            cout << "  iteration 2, prior pull on: relative diff " << d << endl;
-        CHK(d < 1.0e-8, "iteration 2 upgrade with the prior pull matches the existing full solution");
-        // and the pull did something, or the check above is the iteration 1 check again
-        CHK(rel(solve_old(1, 2.0, 1.0), o) > 1.0e-6, "the prior pull changes the iteration 2 upgrade");
-        // reg_factor 0 (the default) means weight 1 on the pull, on both sides.  this
-        // used to multiply the pull by 0 and quietly turn the full solution into the
-        // approx one - the guard was >= 0 instead of > 0
-        CHK(rel(solve_old(2, 2.0, 0.0), o) < 1.0e-12, "reg_factor 0 (default) is weight 1 on the existing full solution");
-        CHK(rel(solve_new(2, 2.0, 0.0, Q), n) < 1.0e-12, "reg_factor 0 (default) is weight 1 on the prec full solution");
-        // and a fractional weight really scales it, so the > 0 branch is live too
-        Eigen::MatrixXd half_o = solve_old(2, 2.0, 0.5), half_n = solve_new(2, 2.0, 0.5, Q);
-        CHK(rel(half_o, o) > 1.0e-6, "reg_factor 0.5 scales the pull on the existing full solution");
-        CHK(rel(half_o, half_n) < 1.0e-8, "reg_factor 0.5 matches on both sides");
-    }
-    // the two readings of ies_reg_factor: the upgrade takes |r| (negative = full
-    // solution with the magnitude on the pull, no reg phi), the phi handler max(0,r)
+        for (int i = first; i < first + n; i++)
+            rf[i][host]++;
+    };
+    auto quarantined_hosts = [](const vector<RunManagerPanther::QuarantineVerdict>& v)
     {
-        CHK(L2PhiHandler::upgrade_reg_factor(-1.0) == 1.0, "upgrade reg factor of -1 is 1");
-        CHK(L2PhiHandler::upgrade_reg_factor(0.0) == 0.0, "upgrade reg factor of 0 is 0");
-        CHK(L2PhiHandler::upgrade_reg_factor(0.5) == 0.5, "upgrade reg factor of 0.5 is 0.5");
-        CHK(L2PhiHandler::phi_reg_factor(-1.0) == 0.0, "phi reg factor of -1 is 0");
-        CHK(L2PhiHandler::phi_reg_factor(0.0) == 0.0, "phi reg factor of 0 is 0");
-        CHK(L2PhiHandler::phi_reg_factor(0.5) == 0.5, "phi reg factor of 0.5 is 0.5");
-    }
-    // a different Q must give a different answer, or none of this proves Q is used
+        set<string> s;
+        for (auto& q : v)
+            s.insert(q.host);
+        return s;
+    };
+
+    // the reported run, at the moment the first host went: a model that fails ~13% of its runs
+    // everywhere, a fast host doing 61% of the work with half the agents. its failure RATE is
+    // the lowest of the three (23/183 vs 13/85 and 3/32), so there is nothing to quarantine
     {
-        Eigen::SparseMatrix<double> Qdiag(npar, npar);
-        Qdiag.setIdentity();
-        Qdiag *= 4.0;
-        CHK(rel(solve_new(1, 1.0, 1.0, Q), solve_new(1, 1.0, 1.0, Qdiag)) > 1.0e-4,
-            "a diagonal Q gives a different upgrade than Am Am^T");
-        CHK(solve_new(1, 1.0, 1.0, Qdiag).allFinite(), "the singular ones direction is dropped, not inverted");
+        vector<V> agents;
+        add_agents(agents, "numerix", 60, S::ACTIVE);
+        add_agents(agents, "obelix", 40, S::ACTIVE);
+        add_agents(agents, "localhost", 20, S::ACTIVE);
+        map<string, int> attempts{ {"numerix", 183}, {"obelix", 85}, {"localhost", 32} };
+        map<int, map<string, int>> rf;
+        add_fails(rf, "numerix", 0, 23);
+        add_fails(rf, "obelix", 100, 13);
+        add_fails(rf, "localhost", 200, 3);
+        auto v = RunManagerPanther::decide_quarantine(agents, attempts, rf, {}, 3);
+        CHK(v.empty(), "a fast host with the lowest failure rate is not quarantined for doing more of the work");
     }
+
+    // the cascade: the first host's failed runs were forgiven and requeued, and they failed
+    // again on the next host. a run that fails on two hosts is the model's failure, not either
+    // host's - counted against obelix it took obelix out too (100 against an expected 96.7)
+    {
+        vector<V> agents;
+        add_agents(agents, "numerix", 60, S::QUARANTINED);
+        add_agents(agents, "obelix", 40, S::ACTIVE);
+        add_agents(agents, "localhost", 20, S::ACTIVE);
+        map<string, int> attempts{ {"numerix", 242}, {"obelix", 330}, {"localhost", 105} };
+        map<int, map<string, int>> rf;
+        add_fails(rf, "numerix", 0, 29);
+        add_fails(rf, "obelix", 0, 25);     // the forgiven runs, failing again
+        add_fails(rf, "obelix", 300, 75);
+        add_fails(rf, "localhost", 500, 16);
+        auto v = RunManagerPanther::decide_quarantine(agents, attempts, rf, { "numerix" }, 3);
+        CHK(v.empty(), "runs that also failed on another host are not held against the host they failed on next");
+    }
+
+    // an agent on a quarantined host finishes the run it was on: its state moves to COMPLETE
+    // for a moment. that is not the host coming back into service - it was being judged again
+    // as a one-agent host, quarantined again and its failed runs forgiven again (90 times)
+    {
+        vector<V> agents;
+        add_agents(agents, "numerix", 59, S::QUARANTINED);
+        add_agents(agents, "numerix", 1, S::COMPLETE);
+        add_agents(agents, "obelix", 40, S::ACTIVE);
+        add_agents(agents, "localhost", 20, S::ACTIVE);
+        map<string, int> attempts{ {"numerix", 183}, {"obelix", 85}, {"localhost", 32} };
+        map<int, map<string, int>> rf;
+        add_fails(rf, "numerix", 0, 23);
+        add_fails(rf, "obelix", 100, 13);
+        add_fails(rf, "localhost", 200, 3);
+        auto v = RunManagerPanther::decide_quarantine(agents, attempts, rf, { "numerix" }, 3);
+        CHK(quarantined_hosts(v).count("numerix") == 0, "a host already quarantined is not judged again when one of its agents finishes a run");
+    }
+
+    // what the screen is for: one host fails everything, the other nothing
+    {
+        vector<V> agents;
+        add_agents(agents, "bad", 2, S::ACTIVE);
+        add_agents(agents, "good", 2, S::ACTIVE);
+        map<string, int> attempts{ {"bad", 12}, {"good", 12} };
+        map<int, map<string, int>> rf;
+        add_fails(rf, "bad", 0, 12);
+        auto v = RunManagerPanther::decide_quarantine(agents, attempts, rf, {}, 3);
+        CHK(quarantined_hosts(v) == set<string>{ "bad" }, "a host failing everything while another fails nothing is quarantined");
+        // and the same with the bad host doing most of the work - it fails FASTER, so it gets more
+        attempts = { {"bad", 40}, {"good", 6} };
+        rf.clear();
+        add_fails(rf, "bad", 0, 40);
+        v = RunManagerPanther::decide_quarantine(agents, attempts, rf, {}, 3);
+        CHK(quarantined_hosts(v) == set<string>{ "bad" }, "still caught when it did most of the runs");
+        CHK(RunManagerPanther::decide_quarantine(agents, attempts, rf, {}, 0).empty(), "delta 0 turns the screen off");
+    }
+
+    // the same failure rate everywhere is the model, however unevenly the work is spread
+    {
+        vector<V> agents;
+        add_agents(agents, "fast", 10, S::ACTIVE);
+        add_agents(agents, "slow", 10, S::ACTIVE);
+        map<string, int> attempts{ {"fast", 800}, {"slow", 200} };
+        map<int, map<string, int>> rf;
+        add_fails(rf, "fast", 0, 160);
+        add_fails(rf, "slow", 1000, 40);
+        CHK(RunManagerPanther::decide_quarantine(agents, attempts, rf, {}, 3).empty(),
+            "20% failures on both hosts quarantines neither, whatever the share of the work");
+    }
+
+    // quarantined agents are kept connected so they can be put back to work - which needs them
+    // to be pinged. unpinged, every one of them exited on its no-ping timeout
+    CHK(RunManagerPanther::pingable_state(S::QUARANTINED), "quarantined agents are still pinged");
+    CHK(RunManagerPanther::pingable_state(S::WAITING) && RunManagerPanther::pingable_state(S::ACTIVE),
+        "waiting and active agents are pinged");
 }
 
 static void test_enif_woodbury_step()
@@ -2983,16 +4883,13 @@ static void test_enif_lowrank_step()
     CHK(threw, "a zero noise variance throws");
 }
 
-static void test_enif_supplied_prec_hybrid()
+static void test_enif_supplied_prec()
 {
-    cout << "[enif: supplied prior precision file and the hybrid damping step]" << endl;
+    cout << "[enif: supplied prior precision file]" << endl;
     PO o; o.set_defaults();
     CHK(o.get_ies_enif_prec_file() == "", "ies_enif_prec_file defaults to empty");
-    CHK(!o.get_ies_enif_hybrid_damp(), "ies_enif_hybrid_damp defaults to false");
     CHK(o.assign_value_by_key("IES_ENIF_PREC_FILE", "MyPrec.jcb") == PO::ARG_STATUS::ARG_ACCEPTED, "prec file parses");
     CHK(o.get_ies_enif_prec_file() == "MyPrec.jcb", "and keeps its case");
-    CHK(o.assign_value_by_key("IES_ENIF_HYBRID_DAMP", "true") == PO::ARG_STATUS::ARG_ACCEPTED, "hybrid parses");
-    CHK(o.get_ies_enif_hybrid_damp(), "and is true after 'true'");
 
     // a 4-node chain precision with values, in the pest ascii matrix format
     Eigen::MatrixXd Q(4, 4);
@@ -3007,7 +4904,7 @@ static void test_enif_supplied_prec_hybrid()
         for (int i = 0; i < 4; i++) { for (int j = 0; j < 4; j++) f << " " << Q(i, j); f << "\n"; }
         f << "* row and column names\nP1\nP2\nP3\nP4\n";
     }
-    ofstream frec("selftest_enif_prec_hybrid.rec");
+    ofstream frec("selftest_enif_prec.rec");
     vector<string> names = {"P1", "P2", "P3", "P4"};
     EnifGraph g;
     g.from_file(pf, names, frec);
@@ -3028,19 +4925,9 @@ static void test_enif_supplied_prec_hybrid()
     try { EnifGraph gb; gb.from_file(bf, names, frec); gb.load_precision(bf, frec); } catch (...) { threw = true; }
     CHK(threw, "a non-symmetric precision file throws");
 
-    // hybrid step: Lam_post = Q + lam Qcur + H^T Rinv H against the dense formula
+    // the step with the loaded precision: Lam_post = (1+lam) Q + H^T Rinv H, against the dense formula
     std::mt19937 gen(9);
     std::normal_distribution<double> nd(0.0, 1.0);
-    int N = 40;
-    Eigen::MatrixXd A(4, N);
-    for (int i = 0; i < 4; i++) for (int j = 0; j < N; j++) A(i, j) = 0.3 * nd(gen);
-    for (int j = 0; j < N; j++) { A(1, j) += 0.5 * A(0, j); A(2, j) += 0.5 * A(1, j); A(3, j) += 0.5 * A(2, j); }
-    A = (A.colwise() - A.rowwise().mean()) / sqrt(double(N - 1));
-    g.estimate_precision(A, 1.0e-3, frec, false, true);
-    CHK(g.has_current_precision(), "current-ensemble precision estimated into its own slot");
-    CHK((Eigen::MatrixXd(g.precision()) - Q).cwiseAbs().maxCoeff() < 1e-12, "the prior precision is untouched by it");
-    Eigen::MatrixXd Qcur = Eigen::MatrixXd(g.current_precision());
-    CHK(Qcur.diagonal().minCoeff() > Q.diagonal().maxCoeff(), "contracted ensemble -> current precision larger than the prior's");
     Eigen::MatrixXd Hd(3, 4);
     Hd << 1.0, 0.0, 0.5, 0.0,
           0.0, 2.0, 0.0, 0.0,
@@ -3051,20 +4938,9 @@ static void test_enif_supplied_prec_hybrid()
     for (int i = 0; i < 3; i++) for (int j = 0; j < 2; j++) r(i, j) = nd(gen);
     for (int i = 0; i < 4; i++) e(i, 1) = 0.2 * nd(gen);
     double lam = 3.0;
-    g.set_hybrid_damp(false);
     Eigen::MatrixXd plain = g.information_step(H, rinv, e, r, lam, frec);
     Eigen::MatrixXd want_plain = -((1.0 + lam) * Q + Hd.transpose() * rinv.asDiagonal() * Hd).ldlt().solve(Q * e + Hd.transpose() * (rinv.asDiagonal() * r));
-    CHK((plain - want_plain).cwiseAbs().maxCoeff() < 1e-9, "plain step unchanged: (1+lam) on the prior precision");
-    g.set_hybrid_damp(true);
-    Eigen::MatrixXd hyb = g.information_step(H, rinv, e, r, lam, frec);
-    Eigen::MatrixXd want_hyb = -(Q + lam * Qcur + Hd.transpose() * rinv.asDiagonal() * Hd).ldlt().solve(Q * e + Hd.transpose() * (rinv.asDiagonal() * r));
-    CHK((hyb - want_hyb).cwiseAbs().maxCoeff() < 1e-9, "hybrid step: lam on the current precision, prior in the curvature and gradient");
-    CHK((hyb - plain).cwiseAbs().maxCoeff() > 1e-6, "and it differs from the plain step");
-    // without a current precision the hybrid step refuses
-    EnifGraph g2; g2.from_file(pf, names, frec); g2.load_precision(pf, frec); g2.set_hybrid_damp(true);
-    threw = false;
-    try { g2.information_step(H, rinv, e, r, lam, frec); } catch (...) { threw = true; }
-    CHK(threw, "hybrid damping without a current precision throws");
+    CHK((plain - want_plain).cwiseAbs().maxCoeff() < 1e-9, "step: (1+lam) on the prior precision");
 }
 
 static void test_estimate_sparse_h_divisor()
@@ -3082,8 +4958,8 @@ static void test_estimate_sparse_h_divisor()
     stringstream s1, s2, s3;
     Eigen::VectorXd u1, u2, u3;
     Eigen::SparseMatrix<double> H1 = estimate_sparse_H(A, B, 0.05, 1, u1, s1);
-    Eigen::SparseMatrix<double> H2 = estimate_sparse_H(A, B, 0.05, 1, u2, s2, 0, double(N));
-    Eigen::SparseMatrix<double> H3 = estimate_sparse_H(A, B, 0.05, 2, u3, s3, 0, 2.0 * double(N));
+    Eigen::SparseMatrix<double> H2 = estimate_sparse_H(A, B, 0.05, 1, u2, s2, double(N));
+    Eigen::SparseMatrix<double> H3 = estimate_sparse_H(A, B, 0.05, 2, u3, s3, 2.0 * double(N));
     CHK((Eigen::MatrixXd(H1) - Eigen::MatrixXd(H2)).cwiseAbs().maxCoeff() == 0.0, "divisor N is the default");
     CHK((u1 - u2).cwiseAbs().maxCoeff() < 1e-14, "and gives the same unexplained variance");
     CHK((Eigen::MatrixXd(H1) - Eigen::MatrixXd(H3)).cwiseAbs().maxCoeff() == 0.0, "the divisor does not touch H (two threads either)");
@@ -3095,6 +4971,185 @@ static void test_estimate_sparse_h_divisor()
     CHK(H4.nonZeros() == 0, "lasso fraction 1 zeroes every row");
     Eigen::VectorXd full = B.array().square().rowwise().sum() * double(N - 1) / double(N);
     CHK((u4 - full).cwiseAbs().maxCoeff() < 1e-12, "empty rows report the full output variance as unexplained");
+}
+
+static void test_sparse_h_col_order()
+{
+    cout << "[enif: sparse H in column order (any localizer) matches the row-order fit]" << endl;
+    // p > N, as on the real problems, with a sparse truth and some noise
+    int p = 300, n = 40, N = 50;
+    std::mt19937 gen(7);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    std::uniform_int_distribution<int> pick(0, p - 1);
+    Eigen::MatrixXd A(p, N), B(n, N);
+    for (int i = 0; i < p; i++) for (int j = 0; j < N; j++) A(i, j) = nd(gen) / sqrt(double(N - 1));
+    Eigen::MatrixXd Htrue = Eigen::MatrixXd::Zero(n, p);
+    for (int i = 0; i < n; i++) for (int k = 0; k < 5; k++) Htrue(i, pick(gen)) = nd(gen);
+    B = Htrue * A;
+    for (int i = 0; i < n; i++) for (int j = 0; j < N; j++) B(i, j) += 0.05 * nd(gen) / sqrt(double(N - 1));
+    // a parameter with no spread and an observation with no spread
+    A.row(11).setZero();
+    B.row(3).setZero();
+    // the column-order fit runs whenever a localizer is given; one listing every
+    // parameter changes nothing else
+    Eigen::SparseMatrix<double> LA = Eigen::MatrixXd::Ones(n, p).sparseView();
+
+    auto compare = [&](double frac) {
+        stringstream sr, sc;
+        Eigen::VectorXd ur, uc;
+        Eigen::MatrixXd Hr = Eigen::MatrixXd(estimate_sparse_H(A, B, frac, 1, ur, sr));
+        Eigen::MatrixXd Hc = Eigen::MatrixXd(estimate_sparse_H(A, B, frac, 1, uc, sc, -1.0, &LA));
+        int mismatch = 0;
+        for (int i = 0; i < n; i++) for (int j = 0; j < p; j++)
+            if ((Hr(i, j) != 0.0) != (Hc(i, j) != 0.0)) mismatch++;
+        double hdiff = (Hr - Hc).cwiseAbs().maxCoeff() / max(1.0e-300, Hr.cwiseAbs().maxCoeff());
+        double udiff = (ur - uc).cwiseAbs().maxCoeff() / max(1.0e-300, ur.cwiseAbs().maxCoeff());
+        cout << "  lasso fraction " << frac << ": nnz " << (Hr.array() != 0.0).count()
+             << ", pattern mismatches " << mismatch << ", max rel H diff " << hdiff
+             << ", max rel unexplained diff " << udiff << endl;
+        string tag = " (lasso fraction " + to_string(frac) + ")";
+        CHK(mismatch == 0, "same sparsity pattern" + tag);
+        CHK(hdiff < 1.0e-9, "same coefficients to roundoff" + tag);
+        CHK(udiff < 1.0e-9, "same unexplained variance to roundoff" + tag);
+        CHK(Hc.col(11).cwiseAbs().maxCoeff() == 0.0, "a parameter with no spread stays out" + tag);
+        CHK(Hc.row(3).cwiseAbs().maxCoeff() == 0.0 && uc[3] == 0.0, "an observation with no spread gives an empty row" + tag);
+        CHK(sc.str().find("column order") != string::npos, "the summary says column order" + tag);
+    };
+    compare(0.3);
+    compare(0.05);
+    compare(0.005);
+
+    // threads own blocks of rows; the answer cannot depend on how many
+    Eigen::VectorXd u1, u4, u7;
+    stringstream s1, s4, s7;
+    Eigen::MatrixXd H1 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, u1, s1, -1.0, &LA));
+    Eigen::MatrixXd H4 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 4, u4, s4, -1.0, &LA));
+    Eigen::MatrixXd H7 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 7, u7, s7, -1.0, &LA));
+    CHK((H1 - H4).cwiseAbs().maxCoeff() == 0.0 && (H1 - H7).cwiseAbs().maxCoeff() == 0.0, "1, 4 and 7 threads give bit-identical H");
+    CHK((u1 - u4).cwiseAbs().maxCoeff() == 0.0 && (u1 - u7).cwiseAbs().maxCoeff() == 0.0, "and bit-identical unexplained variance");
+
+    // lasso fraction 1 empties every row and leaves the full variance unexplained
+    Eigen::VectorXd ue; stringstream se;
+    Eigen::SparseMatrix<double> He = estimate_sparse_H(A, B, 1.0, 3, ue, se, -1.0, &LA);
+    Eigen::VectorXd full = B.array().square().rowwise().sum() * double(N - 1) / double(N);
+    CHK(He.nonZeros() == 0, "lasso fraction 1 zeroes every row");
+    CHK((ue - full).cwiseAbs().maxCoeff() < 1e-12, "and reports the full output variance as unexplained");
+
+    // the divisor scales the unexplained variance and nothing else
+    Eigen::VectorXd ud; stringstream sd;
+    Eigen::MatrixXd Hd = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 2, ud, sd, 2.0 * double(N), &LA));
+    CHK((Hd - H1).cwiseAbs().maxCoeff() == 0.0 && (ud * 2.0 - u1).cwiseAbs().maxCoeff() < 1e-12, "the divisor halves the unexplained variance and leaves H alone");
+
+    // one observation, and one parameter
+    {
+        Eigen::MatrixXd B1 = B.topRows(1);
+        Eigen::SparseMatrix<double> LB1 = Eigen::MatrixXd::Ones(1, p).sparseView();
+        Eigen::VectorXd ur, uc; stringstream sr, sc;
+        Eigen::MatrixXd Hr = Eigen::MatrixXd(estimate_sparse_H(A, B1, 0.05, 1, ur, sr));
+        Eigen::MatrixXd Hc = Eigen::MatrixXd(estimate_sparse_H(A, B1, 0.05, 4, uc, sc, -1.0, &LB1));
+        CHK((Hr - Hc).cwiseAbs().maxCoeff() <= 1e-9 * max(1.0e-300, Hr.cwiseAbs().maxCoeff()), "a single observation row matches");
+        Eigen::MatrixXd A1 = A.topRows(1);
+        Eigen::MatrixXd B2 = 2.0 * A1;
+        B2.conservativeResize(3, N);
+        B2.row(1) = -A1.row(0); B2.row(2) = 0.5 * A1.row(0);
+        Eigen::SparseMatrix<double> LA1 = Eigen::MatrixXd::Ones(3, 1).sparseView();
+        Hr = Eigen::MatrixXd(estimate_sparse_H(A1, B2, 0.0, 1, ur, sr));
+        Hc = Eigen::MatrixXd(estimate_sparse_H(A1, B2, 0.0, 2, uc, sc, -1.0, &LA1));
+        CHK((Hr - Hc).cwiseAbs().maxCoeff() < 1e-12, "a single parameter matches");
+        CHK(abs(Hc(0, 0) - 2.0) < 1e-12 && abs(Hc(1, 0) + 1.0) < 1e-12 && abs(Hc(2, 0) - 0.5) < 1e-12, "and with no penalty recovers the exact slopes");
+    }
+}
+
+static void test_sparse_h_localized()
+{
+    cout << "[enif: a localizer limits each lasso H row to its listed parameters]" << endl;
+    int p = 300, n = 40, N = 50;
+    std::mt19937 gen(11);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    std::uniform_int_distribution<int> pick(0, p - 1);
+    Eigen::MatrixXd A(p, N), B(n, N);
+    for (int i = 0; i < p; i++) for (int j = 0; j < N; j++) A(i, j) = nd(gen) / sqrt(double(N - 1));
+    Eigen::MatrixXd Htrue = Eigen::MatrixXd::Zero(n, p);
+    for (int i = 0; i < n; i++) for (int k = 0; k < 5; k++) Htrue(i, pick(gen)) = nd(gen);
+    B = Htrue * A;
+    for (int i = 0; i < n; i++) for (int j = 0; j < N; j++) B(i, j) += 0.05 * nd(gen) / sqrt(double(N - 1));
+    A.row(11).setZero();
+    B.row(3).setZero();
+
+    // each observation gets a random 60 parameters; observation 5 gets none
+    vector<vector<int>> allowed(n);
+    vector<Eigen::Triplet<double>> trips;
+    for (int i = 0; i < n; i++)
+    {
+        if (i == 5) continue;
+        set<int> s;
+        while ((int)s.size() < 60) s.insert(pick(gen));
+        allowed[i].assign(s.begin(), s.end());
+        for (int j : allowed[i]) trips.push_back(Eigen::Triplet<double>(i, j, 1.0));
+    }
+    Eigen::SparseMatrix<double> loc(n, p);
+    loc.setFromTriplets(trips.begin(), trips.end());
+    Eigen::MatrixXd locd = Eigen::MatrixXd(loc);
+    Eigen::SparseMatrix<double> loc_all = Eigen::MatrixXd::Ones(n, p).sparseView();
+
+    for (double frac : {0.05, 0.005})
+    {
+        string tag = " (lasso fraction " + to_string(frac) + ")";
+        Eigen::VectorXd u; stringstream s;
+        Eigen::MatrixXd H = Eigen::MatrixXd(estimate_sparse_H(A, B, frac, 3, u, s, -1.0, &loc));
+        int outside = 0;
+        for (int i = 0; i < n; i++) for (int j = 0; j < p; j++)
+            if ((H(i, j) != 0.0) && (locd(i, j) == 0.0)) outside++;
+        CHK(outside == 0, "no coefficient outside the localizer" + tag);
+        // each row is the plain lasso on just its listed parameters
+        double worst = 0.0;
+        int mismatch = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (allowed[i].empty()) continue;
+            Eigen::MatrixXd Ai(allowed[i].size(), N);
+            for (size_t k = 0; k < allowed[i].size(); k++) Ai.row(k) = A.row(allowed[i][k]);
+            Eigen::VectorXd ui; stringstream si;
+            Eigen::MatrixXd Hi = Eigen::MatrixXd(estimate_sparse_H(Ai, B.row(i), frac, 1, ui, si));
+            for (size_t k = 0; k < allowed[i].size(); k++)
+            {
+                double a = Hi(0, k), b = H(i, allowed[i][k]);
+                if ((a != 0.0) != (b != 0.0)) mismatch++;
+                worst = max(worst, abs(a - b) / max(1.0e-300, Hi.cwiseAbs().maxCoeff()));
+            }
+            worst = max(worst, abs(ui[0] - u[i]) / max(1.0e-300, abs(ui[0])));
+        }
+        cout << "  lasso fraction " << frac << ": nnz " << (H.array() != 0.0).count()
+             << ", pattern mismatches vs per-row subset fits " << mismatch << ", max rel diff " << worst << endl;
+        CHK(mismatch == 0 && worst < 1.0e-9, "each row matches the lasso on its own listed parameters" + tag);
+        Eigen::VectorXd full5 = B.row(5).array().square().matrix().rowwise().sum() * double(N - 1) / double(N);
+        CHK(H.row(5).cwiseAbs().maxCoeff() == 0.0 && abs(u[5] - full5[0]) < 1e-12,
+            "a row with nothing listed is empty and leaves its full variance unexplained" + tag);
+        CHK(s.str().find("localized") != string::npos, "the summary says localized" + tag);
+    }
+
+    // a localizer listing everything matches no localizer to roundoff; threads do not matter
+    {
+        Eigen::VectorXd u0, ua, u1, u4; stringstream s0, sa, s1, s4;
+        Eigen::MatrixXd H0 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, u0, s0));
+        Eigen::MatrixXd Ha = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, ua, sa, -1.0, &loc_all));
+        CHK((H0 - Ha).cwiseAbs().maxCoeff() <= 1e-9 * max(1.0e-300, H0.cwiseAbs().maxCoeff())
+            && (u0 - ua).cwiseAbs().maxCoeff() <= 1e-9 * max(1.0e-300, u0.cwiseAbs().maxCoeff()), "a full localizer matches none to roundoff");
+        Eigen::MatrixXd H1 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 1, u1, s1, -1.0, &loc));
+        Eigen::MatrixXd H4 = Eigen::MatrixXd(estimate_sparse_H(A, B, 0.05, 4, u4, s4, -1.0, &loc));
+        CHK((H1 - H4).cwiseAbs().maxCoeff() == 0.0 && (u1 - u4).cwiseAbs().maxCoeff() == 0.0,
+            "1 vs 4 threads are bit-identical");
+    }
+
+    // a localizer of the wrong shape is an error
+    {
+        Eigen::SparseMatrix<double> bad(n, p + 1);
+        Eigen::VectorXd u; stringstream s;
+        bool threw = false;
+        try { estimate_sparse_H(A, B, 0.05, 1, u, s, -1.0, &bad); }
+        catch (const exception&) { threw = true; }
+        CHK(threw, "a localizer of the wrong shape throws");
+    }
 }
 
 static void test_enif_mm_inflation_csv()
@@ -3244,31 +5299,7 @@ static void test_enif_current_prec()
     A12 = (A12.colwise() - A12.rowwise().mean()) / sqrt(11.0);
     g.estimate_precision(A12, -1.0, frec_tail);
     CHK(Eigen::MatrixXd(g.precision()).allFinite(), "12 realizations: k/(N-1) fallback gives a finite precision");
-    // direct neighbours only: a chain has no fill, so it must reproduce the fill-inclusive result
-    g.estimate_precision(A, 1.0e-3, frec_tail);
-    Eigen::MatrixXd Pf = Eigen::MatrixXd(g.precision());
-    g.estimate_precision(A, 1.0e-3, frec_tail, true);
-    Eigen::MatrixXd Pd = Eigen::MatrixXd(g.precision());
-    CHK((Pf - Pd).cwiseAbs().maxCoeff() == 0.0, "direct-only on a chain (no fill) matches the fill-inclusive estimate");
-    // a 4-cycle has fill (eliminating one node links its two neighbours), so direct-only
-    // uses smaller regressions and gives a different, still finite, precision
-    {
-        ofstream f(gf);
-        f << " 4 4 1\n 0 1 0 1\n 1 0 1 0\n 0 1 0 1\n 1 0 1 0\n* row and column names\nP1\nP2\nP3\nP4\n";
-    }
-    EnifGraph gc;
-    gc.from_file(gf, names, frec_tail);
-    CHK(gc.num_edges() == 4, "4-cycle read: 4 edges");
-    gc.estimate_precision(A, 1.0e-3, frec_tail);
-    Eigen::MatrixXd Pcf = Eigen::MatrixXd(gc.precision());
-    gc.estimate_precision(A, 1.0e-3, frec_tail, true);
-    Eigen::MatrixXd Pcd = Eigen::MatrixXd(gc.precision());
-    CHK(Pcf.allFinite() && Pcd.allFinite(), "4-cycle: both estimates finite");
-    CHK((Pcf - Pcd).cwiseAbs().maxCoeff() > 1e-8, "4-cycle: ignoring the fill changes the estimate");
     frec_tail.close();
-    PO o2; o2.set_defaults();
-    CHK(!o2.get_ies_enif_direct_nbrs(), "ies_enif_direct_nbrs defaults to false");
-    CHK(o2.assign_value_by_key("IES_ENIF_DIRECT_NBRS", "true") == PO::ARG_STATUS::ARG_ACCEPTED && o2.get_ies_enif_direct_nbrs(), "and parses");
     frec.close();
     remove(gf.c_str()); remove("selftest_enif_current_prec.rec");
 }
@@ -3542,6 +5573,181 @@ static void test_cmdline_version_only()
     }
 }
 
+static void test_reinflate_restores_startup_weights()
+{
+    cout << "[ies reinflation: the weights it restores are the ones startup ended with]" << endl;
+    // reinflation puts the weights back from two copies - weights_base for the weight
+    // ensemble and org_obs_info for the control file weights. those copies are taken early
+    // in initialize() and only taken again after startup if a phi factors file is used, so
+    // weights changed in between - conflicts dropped, obscov caps - came back undone at the
+    // first reinflation.
+    //
+    // two pars in [0,1], o1 = p1, o2 = p2, o3 = p1 + p2, o4 = p1, all weight 1
+    auto model = [](Parameters& pars, Observations& obs)
+    {
+        double p1 = pars.get_rec("P1"), p2 = pars.get_rec("P2");
+        obs.update_rec("O1", p1);
+        obs.update_rec("O2", p2);
+        obs.update_rec("O3", p1 + p2);
+        obs.update_rec("O4", p1);
+    };
+    struct Case
+    {
+        string name;
+        double o4_val;
+        vector<string> extra;
+    };
+    // drop_conflicts: o4 is observed at 100 and the model can only make 0 to 1, so it is in
+    // conflict and gets zero weight at startup.
+    // obscov: an sd of 2 on o1 caps its weight at 1/2. the others get an sd of 0.5, which
+    // leaves their weight of 1 alone (the cap is min(1/sd, weight))
+    {
+        ofstream f("selftest_reinfl_obscov.unc");
+        f << "START STANDARD_DEVIATION" << endl
+          << "o1 2.0" << endl << "o2 0.5" << endl << "o3 0.5" << endl << "o4 0.5" << endl
+          << "END STANDARD_DEVIATION" << endl;
+    }
+    vector<Case> cases = {
+        {"selftest_reinfl_conflict", 100.0, {"++ies_drop_conflicts(true)"}},
+        {"selftest_reinfl_obscov", 0.5, {"++obscov(selftest_reinfl_obscov.unc)"}},
+    };
+    for (auto& c : cases)
+    {
+        {
+            ofstream f(c.name + ".pst");
+            f << "pcf" << endl
+              << "* control data" << endl
+              << "restart estimation" << endl
+              << "2 4 1 0 2" << endl
+              << "1 1 single point 1 0 0" << endl
+              << "5.0 2.0 0.3 0.03 10" << endl
+              << "5.0 5.0 0.001" << endl
+              << "0.1" << endl
+              << "1 0.01 3 3 0.01 3" << endl
+              << "0 0 0" << endl
+              << "* parameter groups" << endl
+              << "pg relative 0.01 0.0 switch 2.0 parabolic" << endl
+              << "* parameter data" << endl
+              << "p1 none relative 0.5 0.0 1.0 pg 1.0 0.0 1" << endl
+              << "p2 none relative 0.5 0.0 1.0 pg 1.0 0.0 1" << endl
+              << "* observation groups" << endl
+              << "g1" << endl
+              << "g2" << endl
+              << "* observation data" << endl
+              << "o1 0.5 1.0 g1" << endl
+              << "o2 0.5 1.0 g1" << endl
+              << "o3 1.0 1.0 g1" << endl
+              << "o4 " << c.o4_val << " 1.0 g2" << endl
+              << "* model command line" << endl
+              << "echo" << endl
+              << "* model input/output" << endl
+              << "x.tpl x.dat" << endl
+              << "y.ins y.dat" << endl
+              << "++ies_num_reals(20)" << endl;
+            for (auto& e : c.extra)
+                f << e << endl;
+        }
+        stringstream cap;
+        streambuf* old = cout.rdbuf(cap.rdbuf());
+        string where = "startup";
+        try
+        {
+            ofstream flog(c.name + "_perf.log");
+            PerformanceLog pfm(flog);
+            FileManager fm(c.name);
+            ofstream& frec = fm.open_ofile_ext("rec");
+            Pest p;
+            {
+                ifstream fin(c.name + ".pst");
+                p.process_ctl_file(fin, c.name + ".pst", frec);
+            }
+            p.check_inputs(frec);
+            OutputFileWriter ofw(fm, p);
+            p.get_pestpp_options_ptr()->apply_tool_defaults(PestppOptions::ToolType::IES, frec);
+            InProcessRunManager rm(c.name + ".rns", model);
+            rm.initialize(p.get_base_par_tran_seq().ctl2model_cp(p.get_ctl_parameters()), p.get_ctl_observations());
+            IesWeightProbe ies(p, fm, ofw, &pfm, &rm);
+            ies.initialize();
+
+            // what startup ended with, for every observation
+            map<string, double> ctl_w0;
+            map<string, pair<double, double>> ens_w0;
+            for (string o : {"O1", "O2", "O3", "O4"})
+            {
+                ctl_w0[o] = p.get_observation_info_ptr()->get_weight(o);
+                ens_w0[o] = ies.ens_weight(o);
+            }
+            where = "reinflation";
+            ies.reinflate_par_ensemble(1.0, 0, 0);
+            cout.rdbuf(old);
+
+            if (c.name == "selftest_reinfl_conflict")
+            {
+                CHK(ctl_w0["O4"] == 0.0 && ens_w0["O4"].second == 0.0,
+                    "drop_conflicts: o4 is in conflict and has zero weight after startup");
+                auto bw = ies.base_weight("O4");
+                CHK(bw.first == 0.0 && bw.second == 0.0,
+                    "drop_conflicts: o4 is zero in weights_base after startup too (" +
+                    to_string(bw.first) + " to " + to_string(bw.second) + ")");
+            }
+            else
+            {
+                CHK(ctl_w0["O1"] == 0.5 && ens_w0["O1"].first == 0.5 && ens_w0["O1"].second == 0.5,
+                    "obscov: o1 is capped at 1/sd = 0.5 after startup, in the control file weights and the weight ensemble");
+            }
+            for (string o : {"O1", "O2", "O3", "O4"})
+            {
+                double w = p.get_observation_info_ptr()->get_weight(o);
+                auto ew = ies.ens_weight(o);
+                stringstream ss;
+                ss << c.name.substr(16) << ": " << o << " control file weight after reinflation is "
+                   << w << ", startup ended with " << ctl_w0[o];
+                CHK(w == ctl_w0[o], ss.str());
+                ss.str("");
+                ss << c.name.substr(16) << ": " << o << " weight ensemble after reinflation is "
+                   << ew.first << " to " << ew.second << ", startup ended with "
+                   << ens_w0[o].first << " to " << ens_w0[o].second;
+                CHK(ew == ens_w0[o], ss.str());
+            }
+        }
+        catch (const exception& e)
+        {
+            cout.rdbuf(old);
+            CHK(false, c.name + ": threw during " + where + ": " + e.what());
+        }
+    }
+}
+
+static void test_startup_report_precision()
+{
+    cout << "[command line: the startup report leaves the stream's number format as it found it]" << endl;
+    // startup_report is handed the rec file and cout, and both are used for the rest of
+    // the run.  it used to leave them at precision 1, so every later number in the rec
+    // came out as one digit - 17244.3 as 2e+04
+    vector<string> args = {"pestpp-ies", "pest.pst"};
+    vector<char*> argv;
+    for (auto& a : args) argv.push_back(&a[0]);
+    stringstream cap;
+    streambuf* old = cout.rdbuf(cap.rdbuf());
+    pest_utils::CmdLine cl((int)argv.size(), argv.data());
+    cout.rdbuf(old);
+
+    for (streamsize prec : {streamsize(6), streamsize(10)})
+    {
+        stringstream s;
+        s.precision(prec);
+        ios_base::fmtflags flags = s.flags();
+        cl.startup_report(s, "now");
+        CHK(s.precision() == prec, "precision " + to_string(prec) + " is the same after the report");
+        CHK(s.flags() == flags, "and so are the format flags");
+    }
+    stringstream s;
+    cl.startup_report(s, "now");
+    s.str("");
+    s << 17244.3 << " " << 0.0546282;
+    CHK(s.str() == "17244.3 0.0546282", "a number written after the report keeps its digits: " + s.str());
+}
+
 // a test that throws should count as a failure that names itself, not take the
 // whole selftest down with it - which is what happened on the windows ci runners,
 // where an uncaught exception is a silent exit 127.  every test goes through here
@@ -3614,13 +5820,23 @@ int main()
     signal(SIGILL, on_signal);
     run_test(test_registry_equivalence, "test_registry_equivalence");
     run_test(test_cmdline_version_only, "test_cmdline_version_only");
+    run_test(test_startup_report_precision, "test_startup_report_precision");
+    run_test(test_reinflate_restores_startup_weights, "test_reinflate_restores_startup_weights");
     run_test(test_irls_reweight, "test_irls_reweight");
     run_test(test_irls_max_dev, "test_irls_max_dev");
     run_test(test_enif_inflation_report, "test_enif_inflation_report");
+    run_test(test_local_writeback, "test_local_writeback");
+    run_test(test_svd_pack_bdcsvd, "test_svd_pack_bdcsvd");
+    run_test(test_zero_obs_diff_trap, "test_zero_obs_diff_trap");
+    run_test(test_localizer_combine_common, "test_localizer_combine_common");
+    run_test(test_overdue_decision, "test_overdue_decision");
+    run_test(test_quarantine_screen, "test_quarantine_screen");
     run_test(test_enif_woodbury_step, "test_enif_woodbury_step");
     run_test(test_enif_lowrank_step, "test_enif_lowrank_step");
-    run_test(test_enif_supplied_prec_hybrid, "test_enif_supplied_prec_hybrid");
+    run_test(test_enif_supplied_prec, "test_enif_supplied_prec");
     run_test(test_estimate_sparse_h_divisor, "test_estimate_sparse_h_divisor");
+    run_test(test_sparse_h_col_order, "test_sparse_h_col_order");
+    run_test(test_sparse_h_localized, "test_sparse_h_localized");
     run_test(test_enif_mm_inflation_csv, "test_enif_mm_inflation_csv");
     run_test(test_enif_current_prec, "test_enif_current_prec");
     run_test(test_generic_access, "test_generic_access");
@@ -3629,12 +5845,23 @@ int main()
     run_test(test_tool_defaults, "test_tool_defaults");
     run_test(test_constraints_live, "test_constraints_live");
     run_test(test_ies_reinflate_reset, "test_ies_reinflate_reset");
+    run_test(test_reinflate_multimodal_alpha_schedule, "test_reinflate_multimodal_alpha_schedule");
+    run_test(test_reinflate_structnoise_frac_schedule, "test_reinflate_structnoise_frac_schedule");
+    run_test(test_structnoise_draws, "test_structnoise_draws");
+    run_test(test_structnoise_recapture, "test_structnoise_recapture");
+    run_test(test_ensemble_dup_real_names, "test_ensemble_dup_real_names");
+    run_test(test_structnoise_em, "test_structnoise_em");
+    run_test(test_structnoise_deweight, "test_structnoise_deweight");
+    run_test(test_structnoise_phi_factors, "test_structnoise_phi_factors");
     run_test(test_ies_ensemble_reset, "test_ies_ensemble_reset");
     run_test(test_ies_iteration_controls, "test_ies_iteration_controls");
     run_test(test_mou_generation_controls, "test_mou_generation_controls");
     run_test(test_sqp_controls, "test_sqp_controls");
     run_test(test_tool_objects_track_live_options, "test_tool_objects_track_live_options");
     run_test(test_ensemble_zero_copy_view, "test_ensemble_zero_copy_view");
+    run_test(test_ensemble_keep_rows_empty, "test_ensemble_keep_rows_empty");
+    run_test(test_ensemble_shared_names, "test_ensemble_shared_names");
+    run_test(test_external_file_read_cols, "test_external_file_read_cols");
     run_test(test_run_map_survives_resize, "test_run_map_survives_resize");
     run_test(test_subset_names_survive_membership_change, "test_subset_names_survive_membership_change");
     run_test(test_read_file_tail, "test_read_file_tail");
@@ -3646,6 +5873,10 @@ int main()
     run_test(test_partial_capability_handshake, "test_partial_capability_handshake");
     run_test(test_instruction_file_partial_reads_are_never_wrong, "test_instruction_file_partial_reads_are_never_wrong");
     run_test(test_model_interface_partial_across_files, "test_model_interface_partial_across_files");
+#ifndef _WIN32
+    run_test(test_failed_exec_does_not_clone, "test_failed_exec_does_not_clone");
+#endif
+    run_test(test_model_interface_obs_mismatch_messages, "test_model_interface_obs_mismatch_messages");
     run_test(test_instruction_file_partial_real_case, "test_instruction_file_partial_real_case");
     run_test(test_instruction_file_partial_remaining_branches, "test_instruction_file_partial_remaining_branches");
     run_test(test_quit_file_tokens, "test_quit_file_tokens");
@@ -3654,11 +5885,11 @@ int main()
     run_test(test_external_values_are_results, "test_external_values_are_results");
     run_test(test_partial_read_refuses_stale_outputs, "test_partial_read_refuses_stale_outputs");
     run_test(test_violation_single_run_matches_ensemble, "test_violation_single_run_matches_ensemble");
+    run_test(test_mou_all_infeasible_nondom, "test_mou_all_infeasible_nondom");
     run_test(test_regul_weight_search_edges, "test_regul_weight_search_edges");
     run_test(test_ies_prior_scaling_is_neutral, "test_ies_prior_scaling_is_neutral");
     run_test(test_prior_anomaly_scaling, "test_prior_anomaly_scaling");
     run_test(test_prior_inv_sqrt_diag, "test_prior_inv_sqrt_diag");
-    run_test(test_ies_prior_prec_reduces_to_am, "test_ies_prior_prec_reduces_to_am");
     cout << "\npestpp-selftest: " << (g_fail == 0 ? "PASS" : "FAIL")
          << " (" << (g_total - g_fail) << "/" << g_total << " checks)" << endl;
     return g_fail == 0 ? 0 : 1;

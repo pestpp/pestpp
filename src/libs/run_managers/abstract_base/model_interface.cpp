@@ -703,7 +703,7 @@ void ModelInterface::read_output_files(Observations *obs)
 	if (diff.size() > 0)
 	{
 		stringstream ss;
-		ss << "ModelInterace error: the following instruction observations are not in the control file:";
+		ss << "ModelInterace error: the following control file observations are not in the instruction files:";
 		for (auto d : diff)
 			ss << d << ",";
 		throw_mio_error(ss.str());
@@ -717,7 +717,7 @@ void ModelInterface::read_output_files(Observations *obs)
 	if (diff.size() > 0)
 	{
 		stringstream ss;
-		ss << "ModelInterace error: the following control file observations are not in the instruction files:";
+		ss << "ModelInterace error: the following instruction observations are not in the control file:";
 		for (auto d : diff)
 			ss << d << ",";
 		throw_mio_error(ss.str());

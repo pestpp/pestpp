@@ -129,7 +129,7 @@ void SVD_REDSVD::solve_ip(Eigen::MatrixXd& A, Eigen::MatrixXd &Sigma, Eigen::Mat
 		}
 	}
 	std::stringstream ss;
-	ss << "trimming REDSVD components to " << num_sing_used << "elements";
+	ss << "trimming " << description << " components to " << num_sing_used << " elements";
 	if (performance_log)
 		performance_log->log_event(ss.str());
 	//std::cout << Sigma_full << std::endl;
@@ -157,7 +157,7 @@ void SVD_REDSVD::solve_ip(Eigen::MatrixXd& A, Eigen::MatrixXd &Sigma, Eigen::Mat
 
 	}
 	if (performance_log)
-		performance_log->log_event("done REDSVD");
+		performance_log->log_event("done " + description);
 	return;
 }
 
@@ -174,7 +174,7 @@ void SVD_REDSVD::solve_ip(Eigen::MatrixXd& A, Eigen::MatrixXd &Sigma, Eigen::Mat
 	V = red_svd.matrixV();
 	Sigma = red_svd.singularValues();
 	if (performance_log)
-		performance_log->log_event("done REDSVD");
+		performance_log->log_event("done " + description);
 	return;
 }
 
@@ -208,7 +208,7 @@ void SVD_REDSVD::solve_ip(Eigen::SparseMatrix<double>& A, Eigen::VectorXd &Sigma
 		}
 	}
 	std::stringstream ss;
-	ss << "trimming REDSVD components to " << num_sing_used << "elements";
+	ss << "trimming " << description << " components to " << num_sing_used << " elements";
 	if (performance_log)
 		performance_log->log_event(ss.str());
 
@@ -218,7 +218,7 @@ void SVD_REDSVD::solve_ip(Eigen::SparseMatrix<double>& A, Eigen::VectorXd &Sigma
 	VT = Eigen::SparseMatrix<double>(VT.topRows(num_sing_used));
 	U = Eigen::SparseMatrix<double>(U.leftCols(num_sing_used));
 	if (performance_log)
-		performance_log->log_event("done REDSVD");
+		performance_log->log_event("done " + description);
 	return;
 
 }
@@ -235,15 +235,23 @@ void SVD_EIGEN::solve_ip(Eigen::MatrixXd& A, Eigen::MatrixXd &Sigma, Eigen::Matr
 	Eigen::MatrixXd& V, double _eigen_thres, double _max_sing)
 {
 
-	JacobiSVD<MatrixXd> svd_fac(A, ComputeFullU | ComputeFullV);
-
-	performance_log->log_event("starting REDSVD");
-
-	//RedSVD::RedSVD<MatrixXd> red_svd(A);
-	performance_log->log_event("retrieving REDSVD components");
-	U = svd_fac.matrixU();
-	V = svd_fac.matrixV();
-	VectorXd Sigma_full = svd_fac.singularValues();
+	VectorXd Sigma_full;
+	//thin factors: only the leading num_sing_used columns are kept below, and full ones for a
+	//tall ensemble matrix would be nobs x nobs
+	if (use_bdc)
+	{
+		BDCSVD<MatrixXd> svd_fac(A, ComputeThinU | ComputeThinV);
+		U = svd_fac.matrixU();
+		V = svd_fac.matrixV();
+		Sigma_full = svd_fac.singularValues();
+	}
+	else
+	{
+		JacobiSVD<MatrixXd> svd_fac(A, ComputeThinU | ComputeThinV);
+		U = svd_fac.matrixU();
+		V = svd_fac.matrixV();
+		Sigma_full = svd_fac.singularValues();
+	}
 
 	int kmax = (Sigma_full.size() < n_max_sing) ? Sigma_full.size() : n_max_sing;
 	int num_sing_used = 0;
@@ -261,8 +269,9 @@ void SVD_EIGEN::solve_ip(Eigen::MatrixXd& A, Eigen::MatrixXd &Sigma, Eigen::Matr
 		}
 	}
 	std::stringstream ss;
-	ss << "trimming REDSVD components to " << num_sing_used << "elements";
-	performance_log->log_event(ss.str());
+	ss << "trimming " << description << " components to " << num_sing_used << " elements";
+	if (performance_log)
+		performance_log->log_event(ss.str());
 	//std::cout << Sigma_full << std::endl;
 	Sigma = Sigma_full.head(num_sing_used);
 	//std::cout << Sigma << std::endl;
@@ -287,7 +296,8 @@ void SVD_EIGEN::solve_ip(Eigen::MatrixXd& A, Eigen::MatrixXd &Sigma, Eigen::Matr
 
 
 	}
-	performance_log->log_event("done REDSVD");
+	if (performance_log)
+		performance_log->log_event("done " + description);
 	return;
 }
 
@@ -295,10 +305,21 @@ void SVD_EIGEN::solve_ip(Eigen::SparseMatrix<double>& A, Eigen::VectorXd &Sigma,
 	Eigen::SparseMatrix<double>& Vt, Eigen::VectorXd &Sigma_trunc,  double _eigen_thres)
 {
 
-	JacobiSVD<MatrixXd> svd_fac(A,  ComputeThinU |  ComputeThinV);
-	VectorXd Sigma_full = svd_fac.singularValues();
-	U = svd_fac.matrixU().sparseView();
-	Vt = svd_fac.matrixV().transpose().sparseView();
+	VectorXd Sigma_full;
+	if (use_bdc)
+	{
+		BDCSVD<MatrixXd> svd_fac(A, ComputeThinU | ComputeThinV);
+		Sigma_full = svd_fac.singularValues();
+		U = svd_fac.matrixU().sparseView();
+		Vt = svd_fac.matrixV().transpose().sparseView();
+	}
+	else
+	{
+		JacobiSVD<MatrixXd> svd_fac(A, ComputeThinU | ComputeThinV);
+		Sigma_full = svd_fac.singularValues();
+		U = svd_fac.matrixU().sparseView();
+		Vt = svd_fac.matrixV().transpose().sparseView();
+	}
 
 	//Compute number of singular values to be used in the solution
 	int num_sing_used = 0;

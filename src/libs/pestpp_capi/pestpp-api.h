@@ -75,7 +75,7 @@ extern "C" {
  * while major is still 0, a breaking change might show up as a minor bump too - that is what
  * 0.x means. pin to a commit if that matters to you. */
 #define PESTPP_API_VERSION_MAJOR 0
-#define PESTPP_API_VERSION_MINOR 5
+#define PESTPP_API_VERSION_MINOR 6
 #define PESTPP_API_VERSION_PATCH 0
 
 /* Opaque session handle. Owns the scenario, file manager, run manager and tool object. */
@@ -141,7 +141,12 @@ typedef enum {
        one decision-variable vector rather than a population, so the ensemble and
        phi-over-realizations calls refuse; unlike glm it has the chance machinery, so the stack
        and risk calls work as they do for mou and sqp. */
-    PESTPP_OPT = 5
+    PESTPP_OPT = 5,
+    /* no tool at all - just the control file's model interface, for running the model
+       yourself with pestpp_run_model(). nothing to initialize, iterate or finalize, and every
+       tool call refuses with PESTPP_NOT_SUPPORTED. serial run manager only, because the model
+       runs right here in this process's working directory. */
+    PESTPP_MODEL = 6
 } pestpp_tool;
 
 /* Which ensemble to look at. The raw parameter ensemble is in whatever transform space the
@@ -576,10 +581,19 @@ PESTPP_API pestpp_status pestpp_broadcast_weights(pestpp_handle h);
  *               what the new spread is centred on. -1 follows 'ies_n_iter_reinflate' the way
  *               the built-in loop does (a negative entry there means min-phi), 0 forces the
  *               ensemble mean, 1 forces the minimum-phi realization - the aggressive form.
+ *   structnoise_frac
+ *               this reinflation's 'ies_reinflate_structnoise_frac' entry - the same value
+ *               the built-in loop passes for each reinflation. 0 adds no structural noise (and
+ *               puts the user's noise back if the residuals were captured at an earlier
+ *               reinflation); positive captures the residuals at the first nonzero call and
+ *               adds that fraction of them as structural noise; negative recaptures the
+ *               residuals now and uses the magnitude. 'ies_structnoise_deweight' and
+ *               'ies_structnoise_em' apply as they do in the built-in loop.
  *
  * ies and da only. */
 PESTPP_API pestpp_status pestpp_reinflate_ensemble(pestpp_handle h, double factor,
-                                                   int num_reals, int center_on_min_phi);
+                                                   int num_reals, int center_on_min_phi,
+                                                   double structnoise_frac);
 
 /* Recompute phi from the current ensembles and weights.
  *
@@ -934,6 +948,41 @@ PESTPP_API pestpp_status pestpp_set_run_values(pestpp_handle h, int run_id,
 /* Mark this run failed - the model did not produce usable output. Distinct from simply not
    writing it: this is recorded as a failure, and counts as one wherever failures are counted. */
 PESTPP_API pestpp_status pestpp_set_run_failed(pestpp_handle h, int run_id);
+
+/* ---- one model run, no tool ------------------------------------------------------------
+ *
+ * on a PESTPP_MODEL handle: write the model input files from the template files, run the
+ * model command(s), read the outputs through the instruction files, and hand back the
+ * simulated values. one run, right here, blocking - no run manager, no run storage, no
+ * ensemble. the files are real files in the working directory and the next call overwrites
+ * them, same as the serial run manager.
+ *
+ *     h = pestpp_create(&{.tool = PESTPP_MODEL, .ctl_file = "pest.pst", ...})
+ *     pestpp_run_model(h, NULL, 0, NULL, NULL, 0, NULL, 0, &nobs);     // size it, no run
+ *     pestpp_run_model(h, pars, npar, par_names, obs, nobs, obs_names, nobs * PESTPP_NAME_LEN, &nobs);
+ *
+ * `pars` are control-file values, matched BY NAME, so you only pass what you want changed -
+ * everything else keeps its control-file value. npars=0 runs the control-file values as they
+ * are. the usual transforms happen on the way to the files: tied parameters follow their
+ * parents, fixed ones keep their control-file value, then scale and offset. passing a value
+ * for a fixed or tied parameter is refused unless it is the value that would be used anyway,
+ * because quietly running something other than what you passed is how a wrong answer gets
+ * believed. a value of zero or less for a log parameter is refused too - it would go to the
+ * model as nan.
+ *
+ * `obs` come back in control-file order, and `obs_names` (packed PESTPP_NAME_LEN wide, may be
+ * NULL) says which is which. `nobs` is the count. with obs=NULL nothing is run - that is the
+ * sizing call, and obs_names can be filled on it too.
+ *
+ * a run fails - PESTPP_ERROR, with the message in pestpp_last_error() - when the model command
+ * cannot be started, an output file is missing, or an instruction file cannot find what it is
+ * looking for. the model's exit code is NOT checked, the same as in the tools' run managers: a
+ * model that exits with an error but leaves readable outputs is not caught. the output files
+ * are deleted before each run, so a run that writes nothing never returns the last run's values. */
+PESTPP_API pestpp_status pestpp_run_model(pestpp_handle h,
+                                          const double* pars, int npars, const char* par_names,
+                                          double* obs, int max_nobs,
+                                          char* obs_names, int obs_names_len, int* nobs);
 
 /* Aggregate counts for the batch in flight. Any out-param may be NULL. */
 PESTPP_API pestpp_status pestpp_get_run_time_stats(pestpp_handle h, double* avg_run_sec,

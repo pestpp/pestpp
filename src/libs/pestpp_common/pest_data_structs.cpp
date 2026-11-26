@@ -412,6 +412,8 @@ PestppOptions::ARG_STATUS PestppOptions::assign_value_by_key_legacy(string key, 
 			svd_pack = REDSVD;
 		else if ((value == "EIGEN") || (value == "JACOBI"))
 			svd_pack = EIGEN;
+		else if (value == "BDCSVD")
+			svd_pack = BDCSVD;
 		else
 		{
 			//throw PestParsingError(line, "Invalid ++svd_pack: \"" + value + "\"");
@@ -1211,19 +1213,9 @@ bool PestppOptions::assign_ies_value_by_key(const string& key, const string& val
         convert_ip(value,ies_enif_h_lasso);
         return true;
     }
-    else if (key == "IES_ENIF_H_CV_FOLDS")
-    {
-        convert_ip(value,ies_enif_h_cv_folds);
-        return true;
-    }
     else if (key == "IES_ENIF_CURRENT_PREC")
     {
         ies_enif_current_prec = pest_utils::parse_string_arg_to_bool(value);
-        return true;
-    }
-    else if (key == "IES_ENIF_DIRECT_NBRS")
-    {
-        ies_enif_direct_nbrs = pest_utils::parse_string_arg_to_bool(value);
         return true;
     }
     else if (key == "IES_ENIF_PREC_FILE")
@@ -1232,9 +1224,9 @@ bool PestppOptions::assign_ies_value_by_key(const string& key, const string& val
         ies_enif_prec_file = org_value;
         return true;
     }
-    else if (key == "IES_ENIF_HYBRID_DAMP")
+    else if (key == "IES_LOCALIZER_COMBINE_COMMON")
     {
-        ies_enif_hybrid_damp = pest_utils::parse_string_arg_to_bool(value);
+        ies_localizer_combine_common = pest_utils::parse_string_arg_to_bool(value);
         return true;
     }
     else if (key == "IES_ENIF_SHRINK")
@@ -1242,20 +1234,9 @@ bool PestppOptions::assign_ies_value_by_key(const string& key, const string& val
         convert_ip(value,ies_enif_shrink);
         return true;
     }
-    else if (key == "IES_ENIF_ORDER")
-    {
-        //'amd' or 'natural'; the graph code lower-cases whatever arrives here
-        ies_enif_order = value;
-        return true;
-    }
     else if (key == "IES_ENIF_SAVE_H")
     {
         ies_enif_save_h = pest_utils::parse_string_arg_to_bool(value);
-        return true;
-    }
-    else if (key == "IES_USE_PRIOR_PREC")
-    {
-        ies_use_prior_prec = pest_utils::parse_string_arg_to_bool(value);
         return true;
     }
     else if (key == "IES_MULTIMODAL_ALPHA")
@@ -1325,6 +1306,40 @@ bool PestppOptions::assign_ies_value_by_key(const string& key, const string& val
         {
             ies_reinflate_solver.push_back(lower_cp(strip_cp(s)));
         }
+        return true;
+    }
+    else if (key == "IES_REINFLATE_MULTIMODAL_ALPHA")
+    {
+        //checked against [0,1] at initialize, with the rest of the setup errors
+        vector<string> tok;
+        tokenize(value, tok, ",");
+        ies_reinflate_multimodal_alpha.clear();
+        for (const auto& a : tok)
+        {
+            ies_reinflate_multimodal_alpha.push_back(convert_cp<double>(a));
+        }
+        return true;
+    }
+    else if (key == "IES_REINFLATE_STRUCTNOISE_FRAC")
+    {
+        //checked (< 0 error, > 1 warning) at initialize, with the rest of the setup errors
+        vector<string> tok;
+        tokenize(value, tok, ",");
+        ies_reinflate_structnoise_frac.clear();
+        for (const auto& f : tok)
+        {
+            ies_reinflate_structnoise_frac.push_back(convert_cp<double>(f));
+        }
+        return true;
+    }
+    else if (key == "IES_STRUCTNOISE_DEWEIGHT")
+    {
+        ies_structnoise_deweight = pest_utils::parse_string_arg_to_bool(value);
+        return true;
+    }
+    else if (key == "IES_STRUCTNOISE_EM")
+    {
+        ies_structnoise_em = pest_utils::parse_string_arg_to_bool(value);
         return true;
     }
     else if (key == "IES_UPDATE_BY_REALS")
@@ -2096,6 +2111,8 @@ void PestppOptions::summary_legacy(ostream& os) const
 		os << "redsvd" << endl;
 	if (svd_pack == EIGEN)
 		os << "eigen" << endl;
+	if (svd_pack == BDCSVD)
+		os << "bdcsvd" << endl;
 	os << "lambda_scale_fac: ";
 	for (auto s : lambda_scale_vec)
 		os << s << ",";
@@ -2378,15 +2395,11 @@ os << endl << "...pestpp-swp options:" << endl;
 	os << "ies_enif_resid_inflate: " << ies_enif_resid_inflate << endl;
 	os << "ies_enif_graph: " << ies_enif_graph << endl;
 	os << "ies_enif_h_lasso: " << ies_enif_h_lasso << endl;
-	os << "ies_enif_h_cv_folds: " << ies_enif_h_cv_folds << endl;
 	os << "ies_enif_shrink: " << ies_enif_shrink << endl;
 	os << "ies_enif_current_prec: " << ies_enif_current_prec << endl;
-	os << "ies_enif_direct_nbrs: " << ies_enif_direct_nbrs << endl;
 	os << "ies_enif_prec_file: " << ies_enif_prec_file << endl;
-	os << "ies_enif_hybrid_damp: " << ies_enif_hybrid_damp << endl;
-	os << "ies_enif_order: " << ies_enif_order << endl;
+	os << "ies_localizer_combine_common: " << ies_localizer_combine_common << endl;
 	os << "ies_enif_save_h: " << ies_enif_save_h << endl;
-	os << "ies_use_prior_prec: " << ies_use_prior_prec << endl;
 	os << "ies_multimodal_alpha: " << ies_multimodal_alpha << endl;
 	os << "ies_multimodal_weight_exponent: " << ies_multimodal_weight_exponent << endl;
 	os << "ies_multimodal_phi_weight: " << ies_multimodal_phi_weight << endl;
@@ -2405,6 +2418,16 @@ os << endl << "...pestpp-swp options:" << endl;
     for (auto v : ies_reinflate_solver)
         os << v << ",";
     os << endl;
+    os << "ies_reinflate_multimodal_alpha: " << endl;
+    for (auto v : ies_reinflate_multimodal_alpha)
+        os << v << ",";
+    os << endl;
+    os << "ies_reinflate_structnoise_frac: " << endl;
+    for (auto v : ies_reinflate_structnoise_frac)
+        os << v << ",";
+    os << endl;
+    os << "ies_structnoise_deweight: " << ies_structnoise_deweight << endl;
+    os << "ies_structnoise_em: " << ies_structnoise_em << endl;
     os << "ies_updatebyreals: " << ies_updatebyreals << endl;
 
     os << "ies_autoadaloc_indicator_pars: " << endl;
@@ -2444,7 +2467,7 @@ os << endl << "...pestpp-swp options:" << endl;
 void PestppOptions::set_defaults_legacy()
 {
 
-	set_svd_pack(PestppOptions::SVD_PACK::REDSVD);
+	set_svd_pack(PestppOptions::SVD_PACK::BDCSVD);
 
 	
 	set_iter_summary_flag(true);
@@ -2531,7 +2554,7 @@ void PestppOptions::set_defaults_legacy()
 	set_sqp_scale_down_factor(1.0);
 	set_sqp_hess_max_cond_num(1E+8);
 	set_sqp_save_cov_every(-1);
-	set_sqp_enforce_bounds(false);
+	set_sqp_enforce_bounds(true);
 	set_sqp_viol_pad(1E-4);
 	set_sqp_reset_hessian_every(-1);
 	set_sqp_use_ensemble_approx_hessian(true);
@@ -2644,15 +2667,11 @@ void PestppOptions::set_defaults_legacy()
     set_ies_enif_resid_inflate(true);
     set_ies_enif_graph("");
     set_ies_enif_h_lasso(0.0);
-    set_ies_enif_h_cv_folds(0);
     set_ies_enif_shrink(-1.0);   //automatic: per-node ridge by cross-validation
     set_ies_enif_current_prec(false);
-    set_ies_enif_direct_nbrs(false);
     set_ies_enif_prec_file("");
-    set_ies_enif_hybrid_damp(false);
-    set_ies_enif_order("amd");
+    set_ies_localizer_combine_common(false);
     set_ies_enif_save_h(false);
-    set_ies_use_prior_prec(false);
     set_ies_multimodal_alpha(0.0);
     set_ies_multimodal_weight_exponent(0.0);
     set_ies_multimodal_phi_weight(0.5);
@@ -2663,6 +2682,10 @@ void PestppOptions::set_defaults_legacy()
     set_ies_n_iter_reinflate(vector < int > {0});
     set_ies_reinflate_factor(vector < double > {1.0});
     set_ies_reinflate_solver(vector<string>());
+    set_ies_reinflate_multimodal_alpha(vector<double>());
+    set_ies_reinflate_structnoise_frac(vector<double>{0.0});
+    set_ies_structnoise_deweight(false);
+    set_ies_structnoise_em(false);
     set_ies_run_realname("");
 	set_ies_reinflate_num_reals(vector<int>{0});
 	set_ies_use_phi_lambda_iters(false);
@@ -2712,7 +2735,7 @@ void PestppOptions::set_defaults_legacy()
 	set_panther_worker_status_file("");
 	set_reg_use_achievable_target(true);
 	set_panther_agent_no_ping_timeout_secs(-1);
-	set_panther_agent_max_failed_run_delta(3);
+	set_panther_agent_max_failed_run_delta(0);
 	set_panther_debug_loop(false);
 	set_debug_check_par_en_consistency(false);
 	set_panther_debug_fail_freeze(false);
